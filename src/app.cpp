@@ -17,6 +17,7 @@
 #include <fpdf_doc.h>
 #include <fpdf_annot.h>
 #include <fpdf_transformpage.h>
+#include <fpdf_text.h>
 #pragma warning(pop)
 
 #include <cstdio>
@@ -64,6 +65,7 @@ enum
   ID_PAGE_EXTRACT,
   ID_PAGE_SPLIT,
   ID_PAGE_CROP,
+  ID_EXPORT_TEXT,
 };
 
 enum
@@ -355,6 +357,97 @@ static bool DocToFile(FPDF_DOCUMENT d, const std::wstring& target)
     return false;
   }
   return true;
+}
+
+static std::wstring PageTextRaw(FPDF_PAGE page)
+{
+  std::wstring out;
+  FPDF_TEXTPAGE tp = FPDFText_LoadPage(page);
+  if (!tp) return out;
+  const int n = FPDFText_CountChars(tp);
+  if (n > 0)
+  {
+    out.resize(static_cast<size_t>(n) + 1);
+    const int got = FPDFText_GetText(tp, 0, n,
+                                     reinterpret_cast<unsigned short*>(&out[0]));
+    if (got > 0) out.resize(static_cast<size_t>(got));
+    else out.clear();
+  }
+  FPDFText_ClosePage(tp);
+  return out;
+}
+
+static std::wstring DocTextRaw(FPDF_DOCUMENT d)
+{
+  std::wstring all;
+  if (!d) return all;
+  const int np = FPDF_GetPageCount(d);
+  for (int i = 0; i < np; i++)
+  {
+    FPDF_PAGE p = FPDF_LoadPage(d, i);
+    if (!p) continue;
+    std::wstring t = PageTextRaw(p);
+    FPDF_ClosePage(p);
+    if (!all.empty() || !t.empty()) all += L"\r\n";
+    all += t;
+  }
+  return all;
+}
+
+static bool ExportTextToFile(FPDF_DOCUMENT d, const std::wstring& target)
+{
+  std::wstring all = DocTextRaw(d);
+  if (all.empty()) return false;
+  const int sz = WideCharToMultiByte(CP_UTF8, 0, all.c_str(), (int)all.size(),
+                                     nullptr, 0, nullptr, nullptr);
+  if (sz <= 0) return false;
+  std::vector<unsigned char> buf(static_cast<size_t>(sz) + 3);
+  buf[0] = 0xEF; buf[1] = 0xBB; buf[2] = 0xBF;
+  WideCharToMultiByte(CP_UTF8, 0, all.c_str(), (int)all.size(),
+                      reinterpret_cast<char*>(&buf[3]), sz, nullptr, nullptr);
+  FILE* f = nullptr;
+  if (_wfopen_s(&f, target.c_str(), L"wb") != 0) return false;
+  bool ok = fwrite(buf.data(), 1, buf.size(), f) == buf.size();
+  fclose(f);
+  return ok;
+}
+
+static void ExportTextAll()
+{
+  if (!g.doc)
+  {
+    MessageBoxW(g.frame, L"No document open.", L"Export Text", MB_OK | MB_ICONINFORMATION);
+    return;
+  }
+  std::wstring all = DocTextRaw(g.doc);
+  if (all.empty())
+  {
+    MessageBoxW(g.frame, L"No extractable text in this document.",
+                L"Export Text", MB_OK | MB_ICONINFORMATION);
+    return;
+  }
+  std::wstring target = g.path;
+  const size_t dot = target.find_last_of(L'.');
+  if (dot != std::wstring::npos) target.resize(dot);
+  target += L".txt";
+  wchar_t buf[MAX_PATH];
+  wcscpy_s(buf, target.c_str());
+  OPENFILENAMEW ofn{};
+  ofn.lStructSize = sizeof(ofn);
+  ofn.hwndOwner = g.frame;
+  ofn.lpstrFilter = L"Text Files (*.txt)\0*.txt\0All Files\0*.*\0\0";
+  ofn.lpstrDefExt = L"txt";
+  ofn.lpstrFile = buf;
+  ofn.nMaxFile = MAX_PATH;
+  ofn.Flags = OFN_OVERWRITEPROMPT | OFN_PATHMUSTEXIST;
+  if (GetSaveFileNameW(&ofn))
+  {
+    if (ExportTextToFile(g.doc, buf))
+      MessageBoxW(g.frame, (std::wstring(L"Exported text to:\n") + buf).c_str(),
+                  L"Export Text", MB_OK | MB_ICONINFORMATION);
+    else
+      MessageBoxW(g.frame, L"Export failed.", L"Export Text", MB_OK | MB_ICONERROR);
+  }
 }
 
 static bool SaveDocTo(const std::wstring& target)
@@ -1932,6 +2025,7 @@ static void DoCommand(int id)
     case ID_PAGE_EXTRACT: ExtractCurrentPage(); break;
     case ID_PAGE_SPLIT:   SplitAllPages(); break;
     case ID_PAGE_CROP:    CropCurrentPageToContent(); break;
+    case ID_EXPORT_TEXT:  ExportTextAll(); break;
     case ID_ABOUT:
       MessageBoxW(g.frame,
         L"Stitchup PDF Editor\n\nPortable PDF viewer/editor\n"
@@ -1963,6 +2057,7 @@ static HMENU BuildMenu()
   addItem(file, ID_SAVE, L"Save\tCtrl+S");
   addItem(file, ID_SAVEAS, L"Save As...\tCtrl+Shift+S");
   addItem(file, ID_IMPORT, L"Import PDF...");
+  addItem(file, ID_EXPORT_TEXT, L"Export Text...");
   AppendMenuW(file, MF_SEPARATOR, 0, nullptr);
   addItem(file, ID_EXIT, L"Exit");
   AppendMenuW(bar, MF_POPUP, (UINT_PTR)file, L"&File");
@@ -2272,6 +2367,38 @@ static std::string MakeLinkedPdf()
     out += line;
   }
   out += "trailer\n<< /Size 7 /Root 1 0 R >>\nstartxref\n";
+  out += std::to_string(xref);
+  out += "\n%%EOF\n";
+  return out;
+}
+
+static std::string MakeTextPdf()
+{
+  const std::string txt = "BT /F1 12 Tf 72 700 Td (Hello, World! Export me.) Tj ET";
+  std::string out = "%PDF-1.4\n";
+  std::vector<size_t> offs;
+  auto emit = [&](const std::string& obj) {
+    offs.push_back(out.size());
+    out += obj;
+    out += "\n";
+  };
+  emit("1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj");
+  emit("2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj");
+  emit("3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] "
+       "/Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R >>\nendobj");
+  emit("4 0 obj\n<< /Length " + std::to_string(txt.size()) +
+       " >>\nstream\n" + txt + "\nendstream\nendobj");
+  emit("5 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>\nendobj");
+  size_t xref = out.size();
+  out += "xref\n0 6\n";
+  out += "0000000000 65535 f \n";
+  for (size_t o : offs)
+  {
+    char line[32];
+    std::snprintf(line, sizeof(line), "%010zu 00000 n \n", o);
+    out += line;
+  }
+  out += "trailer\n<< /Size 6 /Root 1 0 R >>\nstartxref\n";
   out += std::to_string(xref);
   out += "\n%%EOF\n";
   return out;
@@ -2705,6 +2832,53 @@ check("saved %PDF header", bytes.size() > 8 &&
         FPDF_CloseDocument(sd);
       }
       FPDF_CloseDocument(d);
+    }
+  }
+
+  {
+    // text export
+    std::string tpdf = MakeTextPdf();
+    FPDF_DOCUMENT td = FPDF_LoadMemDocument(tpdf.data(), (int)tpdf.size(), nullptr);
+    check("tx: load text pdf", td != nullptr);
+    if (td)
+    {
+      checkEq("tx: text page count", FPDF_GetPageCount(td), 1);
+      std::wstring raw = DocTextRaw(td);
+      check("tx: raw text contains run",
+            raw.find(L"Hello, World! Export me.") != std::wstring::npos);
+      wchar_t tp2[MAX_PATH];
+      GetTempPathW(MAX_PATH, tp2);
+      std::wstring f = std::wstring(tp2) + L"stitchup_export_test.txt";
+      check("tx: export to file", ExportTextToFile(td, f));
+      bool bom = false, text = false;
+      FILE* fx = nullptr;
+      if (_wfopen_s(&fx, f.c_str(), L"rb") == 0 && fx)
+      {
+        unsigned char hdr[3] = {0, 0, 0};
+        if (fread(hdr, 1, 3, fx) == 3)
+          bom = hdr[0] == 0xEF && hdr[1] == 0xBB && hdr[2] == 0xBF;
+        std::string rest;
+        int c;
+        while ((c = fgetc(fx)) != EOF) rest.push_back((char)c);
+        text = rest.find("Hello, World! Export me.") != std::string::npos;
+        fclose(fx);
+      }
+      check("tx: UTF-8 BOM written", bom);
+      check("tx: exported text present", text);
+      DeleteFileW(f.c_str());
+      FPDF_CloseDocument(td);
+    }
+    FPDF_DOCUMENT blank = FPDF_CreateNewDocument();
+    if (blank)
+    {
+      FPDF_PAGE bp = FPDFPage_New(blank, 0, 612.0, 792.0);
+      if (bp) FPDF_ClosePage(bp);
+      wchar_t tp3[MAX_PATH];
+      GetTempPathW(MAX_PATH, tp3);
+      std::wstring bf = std::wstring(tp3) + L"stitchup_export_blank.txt";
+      check("tx: blank doc export is false", !ExportTextToFile(blank, bf));
+      check("tx: blank doc writes no file", GetFileAttributesW(bf.c_str()) == INVALID_FILE_ATTRIBUTES);
+      FPDF_CloseDocument(blank);
     }
   }
 
