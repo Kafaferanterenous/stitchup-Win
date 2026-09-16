@@ -1,0 +1,6 @@
+build/
+dist/
+build.log
+test_result.txt
+*.user
+.vs/
