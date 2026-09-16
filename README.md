@@ -47,6 +47,8 @@ Produces `dist\Stitchup.exe` + `dist\pdfium.dll`.
 - Page management (Home > Pages): Extract the current page into its own PDF,
   Split a document into one file per page, and Auto-Crop the current page to
   its content (white margins trimmed via an ink-bounding-box render pass)
+- Export Text (File > Export Text): saves every page's extractable text as a
+  UTF-8 (BOM) .txt file
 - Drag & drop a PDF onto the window to open it; open via command-line argument
 - Shortcuts: Ctrl+N/O/S, Ctrl+Shift+S, Ctrl+R (rotate), Ctrl+[/Ctrl+], Delete,
   Ctrl+0/1/2 (100%/fit width/fit page), PgUp/PgDn, Ctrl+wheel to zoom
@@ -66,8 +68,8 @@ project (github.com/bblanchon/pdfium-binaries). Non-GPL build.
   single-exe build is planned but first requires building PDFium with the
   static CRT from source (the prebuilt import lib is not static).
 - Shell + annotations + link activation + page management (extract/split/
-  auto-crop) done; security (password-protected files, encrypt-save), export
-  (text/CSV) and watermarks are the next milestones. Rendering, page model,
+  auto-crop done; text export added; security (password-protected files,
+encrypt-save), CSV export and watermarks are the next milestones. Rendering, page model,
   editing operations, ribbon navigation, the bookmarks pane, annotation
   creation/persistence, link navigation and page extract/split/crop are
   functional.
