@@ -20,7 +20,7 @@ user rejected as a product (no GUI).
 
 Command: `Stitchup.exe --self-test`
 
-Result: **105 passed, 0 failed** (exit code 0).
+Result: **117 passed, 0 failed** (exit code 0).
 
 Coverage: PDFium init; create doc + add page; save to buffer (PDF header and
 `%%EOF` trailer checks); reopen roundtrip; page count; load sample PDF (612x792);
@@ -51,11 +51,18 @@ hand-built standard-security-handler fixture (padded `/O`+`/U` of the real
 per-object key `MD5(K || objnum || gen)` truncated to `min(keylen+5, 16)`)
 proves the revision-2 40-bit variant opens with the correct password
 (`FPDF_GetLastError` = `FPDF_ERR_PASSWORD` for wrong/empty passwords), and the
-on-disk fixture reopens with the same password via `FPDF_LoadDocument`.
+on-disk fixture reopens with the same password via `FPDF_LoadDocument`. CSV
+export: a text-bearing fixture produces the expected per-page row
+`1,612.0,792.0,25,0` (pdfium appends the trailing line break to the 24-character
+run), the file carries a UTF-8 BOM byte-for-byte with the header line
+`Page,Width (pt),Height (pt),Text chars,Annotations`, a 2-page doc yields one
+row per page, an empty doc makes `ExportCsvToFile` return false and writes no
+file, and a doc with a highlight annotation reports `0,1` in the annotation
+column.
 
 `test_result.txt` (SHA-256 of the run captured in the report):
 ```
--- enter -- ... SUMMARY 105 passed, 0 failed
+-- enter -- ... SUMMARY 117 passed, 0 failed
 ```
 
 GUI verification (programmatic, window handles + messages):
@@ -90,6 +97,10 @@ GUI verification (programmatic, window handles + messages):
   `stitchup_enc_test.pdf - Stitchup PDF Editor`); a wrong password re-prompts
   twice and then shows the "The password was incorrect (3 attempts)." box, after
   which no document is loaded (title stays `Stitchup PDF Editor`).
+- CSV export (File > Export CSV, menu id 4034): with a PDF loaded the command
+  opens the Save As dialog (owned by the app process, title "Save As")
+  prefilled with `<name>.csv` (verified via UI Automation on the filename
+  field); the engine writes a UTF-8 BOM CSV (verified headless).
 
 ## Bug fixed during this session
 
@@ -118,7 +129,7 @@ No CRT DLLs (static `/MT` linked). Portable package = `Stitchup.exe` +
 
 | File           | Size     | SHA-256                                                           |
 |----------------|----------|-------------------------------------------------------------------|
-| Stitchup.exe   | 341,504 B | 63F2852A01EC8975F1F904DA1ACBFDE3300942F08ED68CEEB2162E7ACE6CCFD4 |
+| Stitchup.exe   | 356,864 B | 2AE80240680CC1FCBE7C727103CD4E79045C665C5C27AED521A2B31095DD2DB3 |
 | pdfium.dll     | 7,375,360 B | 55E7EBEF29A1EC9523D1ADB8B260A73E7DFB0F64D3F0285121D20ECD6148EF18 |
 | example.pdf    | 1,034 B   | B276682EFD75780E462C17489176D710AD1339D84E69C6218AD3C2F8E60FC132 |
 
@@ -141,10 +152,12 @@ navigates or opens a URI, hand cursor); page management done (extract current
 page to its own PDF, split a document into one file per page, auto-crop the
 current page to its ink bounding box via the InkBounds render pass); text
 export added (File > Export Text writes a BOM'd UTF-8 .txt of every page's
-extractable text); security started (password-protected PDFs are detected and
+extractable text); CSV export added (File > Export CSV writes a BOM'd UTF-8
+`.csv` with one `Page,Width (pt),Height (pt),Text chars,Annotations` row per
+page); security started (password-protected PDFs are detected and
 unlocked through a modal password dialog, up to 3 attempts before an error
-box); the Save-in-place file-replace bug is fixed. Remaining Phase C: export
-(CSV), watermarks, and encrypt-on-save.
-Self-test 105/105. User verdict pending — open `dist\Stitchup.exe file.pdf` and
+box); the Save-in-place file-replace bug is fixed. Remaining Phase C:
+watermarks and encrypt-on-save.
+Self-test 117/117. User verdict pending — open `dist\Stitchup.exe file.pdf` and
 try Home > Annotate, click any PDF link, Home > Pages (Extract / Split /
-Auto-Crop), File > Export Text, and open a password-protected PDF.
+Auto-Crop), File > Export Text / Export CSV, and open a password-protected PDF.

@@ -66,6 +66,7 @@ enum
   ID_PAGE_SPLIT,
   ID_PAGE_CROP,
   ID_EXPORT_TEXT,
+  ID_EXPORT_CSV,
 };
 
 enum
@@ -571,6 +572,84 @@ static void ExportTextAll()
                   L"Export Text", MB_OK | MB_ICONINFORMATION);
     else
       MessageBoxW(g.frame, L"Export failed.", L"Export Text", MB_OK | MB_ICONERROR);
+  }
+}
+
+static std::wstring DocCsv(FPDF_DOCUMENT d)
+{
+  std::wstring csv = L"Page,Width (pt),Height (pt),Text chars,Annotations\r\n";
+  if (!d) return csv;
+  const int np = FPDF_GetPageCount(d);
+  for (int i = 0; i < np; i++)
+  {
+    FPDF_PAGE p = FPDF_LoadPage(d, i);
+    if (!p) continue;
+    float L, B, R2, T;
+    FPDFPage_GetMediaBox(p, &L, &B, &R2, &T);
+    const float w = R2 - L, h = T - B;
+    const int tchars = (int)PageTextRaw(p).size();
+    const int anns = FPDFPage_GetAnnotCount(p);
+    FPDF_ClosePage(p);
+    wchar_t row[96];
+    swprintf_s(row, L"%d,%.1f,%.1f,%d,%d\r\n",
+               i + 1, (double)w, (double)h, tchars, anns);
+    csv += row;
+  }
+  return csv;
+}
+
+static bool ExportCsvToFile(FPDF_DOCUMENT d, const std::wstring& target)
+{
+  if (!d || FPDF_GetPageCount(d) < 1) return false;
+  std::wstring csv = DocCsv(d);
+  if (csv.empty()) return false;
+  const int sz = WideCharToMultiByte(CP_UTF8, 0, csv.c_str(), (int)csv.size(),
+                                     nullptr, 0, nullptr, nullptr);
+  if (sz <= 0) return false;
+  std::vector<unsigned char> buf(static_cast<size_t>(sz) + 3);
+  buf[0] = 0xEF; buf[1] = 0xBB; buf[2] = 0xBF;
+  WideCharToMultiByte(CP_UTF8, 0, csv.c_str(), (int)csv.size(),
+                      reinterpret_cast<char*>(&buf[3]), sz, nullptr, nullptr);
+  FILE* f = nullptr;
+  if (_wfopen_s(&f, target.c_str(), L"wb") != 0) return false;
+  bool ok = fwrite(buf.data(), 1, buf.size(), f) == buf.size();
+  fclose(f);
+  return ok;
+}
+
+static void ExportCsvAll()
+{
+  if (!g.doc)
+  {
+    MessageBoxW(g.frame, L"No document open.", L"Export CSV", MB_OK | MB_ICONINFORMATION);
+    return;
+  }
+  if (FPDF_GetPageCount(g.doc) < 1)
+  {
+    MessageBoxW(g.frame, L"No pages to export.", L"Export CSV", MB_OK | MB_ICONINFORMATION);
+    return;
+  }
+  std::wstring target = g.path;
+  const size_t dot = target.find_last_of(L'.');
+  if (dot != std::wstring::npos) target.resize(dot);
+  target += L".csv";
+  wchar_t buf[MAX_PATH];
+  wcscpy_s(buf, target.c_str());
+  OPENFILENAMEW ofn{};
+  ofn.lStructSize = sizeof(ofn);
+  ofn.hwndOwner = g.frame;
+  ofn.lpstrFilter = L"CSV Files (*.csv)\0*.csv\0All Files\0*.*\0\0";
+  ofn.lpstrDefExt = L"csv";
+  ofn.lpstrFile = buf;
+  ofn.nMaxFile = MAX_PATH;
+  ofn.Flags = OFN_OVERWRITEPROMPT | OFN_PATHMUSTEXIST;
+  if (GetSaveFileNameW(&ofn))
+  {
+    if (ExportCsvToFile(g.doc, buf))
+      MessageBoxW(g.frame, (std::wstring(L"Exported CSV to:\n") + buf).c_str(),
+                  L"Export CSV", MB_OK | MB_ICONINFORMATION);
+    else
+      MessageBoxW(g.frame, L"Export failed.", L"Export CSV", MB_OK | MB_ICONERROR);
   }
 }
 
@@ -2150,6 +2229,7 @@ static void DoCommand(int id)
     case ID_PAGE_SPLIT:   SplitAllPages(); break;
     case ID_PAGE_CROP:    CropCurrentPageToContent(); break;
     case ID_EXPORT_TEXT:  ExportTextAll(); break;
+    case ID_EXPORT_CSV:   ExportCsvAll(); break;
     case ID_ABOUT:
       MessageBoxW(g.frame,
         L"Stitchup PDF Editor\n\nPortable PDF viewer/editor\n"
@@ -2182,6 +2262,7 @@ static HMENU BuildMenu()
   addItem(file, ID_SAVEAS, L"Save As...\tCtrl+Shift+S");
   addItem(file, ID_IMPORT, L"Import PDF...");
   addItem(file, ID_EXPORT_TEXT, L"Export Text...");
+  addItem(file, ID_EXPORT_CSV, L"Export CSV...");
   AppendMenuW(file, MF_SEPARATOR, 0, nullptr);
   addItem(file, ID_EXIT, L"Exit");
   AppendMenuW(bar, MF_POPUP, (UINT_PTR)file, L"&File");
@@ -3247,6 +3328,86 @@ check("saved %PDF header", bytes.size() > 8 &&
       check("tx: blank doc export is false", !ExportTextToFile(blank, bf));
       check("tx: blank doc writes no file", GetFileAttributesW(bf.c_str()) == INVALID_FILE_ATTRIBUTES);
       FPDF_CloseDocument(blank);
+    }
+  }
+
+  {
+    // CSV export
+    std::string cpdf = MakeTextPdf();
+    FPDF_DOCUMENT cd = FPDF_LoadMemDocument(cpdf.data(), (int)cpdf.size(), nullptr);
+    check("csv: load text pdf", cd != nullptr);
+    if (cd)
+    {
+      wchar_t tp5[MAX_PATH];
+      GetTempPathW(MAX_PATH, tp5);
+      std::wstring cf = std::wstring(tp5) + L"stitchup_export_test.csv";
+      check("csv: export to file", ExportCsvToFile(cd, cf));
+      bool cBom = false;
+      bool cHdr = false, cRow = false;
+      FILE* fc = nullptr;
+      if (_wfopen_s(&fc, cf.c_str(), L"rb") == 0 && fc)
+      {
+        unsigned char hdr[3] = {0, 0, 0};
+        if (fread(hdr, 1, 3, fc) == 3)
+          cBom = hdr[0] == 0xEF && hdr[1] == 0xBB && hdr[2] == 0xBF;
+        std::string all;
+        int c;
+        while ((c = fgetc(fc)) != EOF) all.push_back((char)c);
+        cHdr = all.find("Page,Width (pt),Height (pt),Text chars,Annotations") != std::string::npos;
+        cRow = all.find("1,612.0,792.0,25,0") != std::string::npos;
+        fclose(fc);
+      }
+      check("csv: UTF-8 BOM written", cBom);
+      check("csv: header line present", cHdr);
+      check("csv: per-page row (page,size,text,anns)", cRow);
+      DeleteFileW(cf.c_str());
+      FPDF_CloseDocument(cd);
+    }
+    {
+      // two-page blank doc: one row per page; empty doc: no file
+      FPDF_DOCUMENT two = FPDF_CreateNewDocument();
+      check("csv: create 2-page doc", two != nullptr);
+      if (two)
+      {
+        FPDF_PAGE p0 = FPDFPage_New(two, 0, 612.0, 792.0);
+        if (p0) FPDF_ClosePage(p0);
+        FPDF_PAGE p1 = FPDFPage_New(two, 1, 700.0, 500.0);
+        if (p1) FPDF_ClosePage(p1);
+        std::wstring csv = DocCsv(two);
+        check("csv: one row per page", csv.find(L"1,612.0,792.0,0,0") != std::wstring::npos &&
+                                      csv.find(L"2,700.0,500.0,0,0") != std::wstring::npos);
+        FPDF_CloseDocument(two);
+      }
+      FPDF_DOCUMENT zero = FPDF_CreateNewDocument();
+      wchar_t tp6[MAX_PATH];
+      GetTempPathW(MAX_PATH, tp6);
+      std::wstring zf = std::wstring(tp6) + L"stitchup_export_empty.csv";
+      if (zero)
+      {
+        check("csv: no pages -> export false", !ExportCsvToFile(zero, zf));
+        check("csv: no pages -> no file",
+              GetFileAttributesW(zf.c_str()) == INVALID_FILE_ATTRIBUTES);
+        FPDF_CloseDocument(zero);
+      }
+      {
+        FPDF_DOCUMENT ann = FPDF_CreateNewDocument();
+        check("csv: create annot doc", ann != nullptr);
+        if (ann)
+        {
+          FPDF_PAGE ap2 = FPDFPage_New(ann, 0, 612.0, 792.0);
+          if (ap2)
+          {
+            FPDF_ANNOTATION ha = FPDFPage_CreateAnnot(ap2, FPDF_ANNOT_HIGHLIGHT);
+            check("csv: create annot for count", ha != nullptr);
+            if (ha) FPDFPage_CloseAnnot(ha);
+            std::wstring csvA = DocCsv(ann);
+            check("csv: annotation count in row",
+                  csvA.find(L"1,612.0,792.0,0,1") != std::wstring::npos);
+            FPDF_ClosePage(ap2);
+          }
+          FPDF_CloseDocument(ann);
+        }
+      }
     }
   }
 
