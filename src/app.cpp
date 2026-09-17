@@ -287,9 +287,133 @@ static void RefreshState()
   if (g.status) InvalidateRect(g.status, nullptr, TRUE);
 }
 
+// Password-required dialog for opening encrypted PDFs.
+static HWND   g_pwdEdit = nullptr;
+static bool   g_pwdOk = false;
+static std::wstring g_pwdValue;
+
+static LRESULT CALLBACK PwdProc(HWND h, UINT m, WPARAM w, LPARAM l)
+{
+  switch (m)
+  {
+    case WM_CREATE:
+      CreateWindowExW(0, L"STATIC",
+        L"This PDF is password-protected.\nEnter the password to open it:",
+        WS_CHILD | WS_VISIBLE, 16, 14, 308, 34, h, nullptr, g.inst, nullptr);
+      g_pwdEdit = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
+        WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_PASSWORD | ES_AUTOHSCROLL,
+        16, 54, 308, 24, h, nullptr, g.inst, nullptr);
+      CreateWindowExW(0, L"BUTTON", L"Ok", WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_DEFPUSHBUTTON,
+        100, 96, 74, 28, h, (HMENU)1, g.inst, nullptr);
+      CreateWindowExW(0, L"BUTTON", L"Cancel", WS_CHILD | WS_VISIBLE | WS_TABSTOP,
+        186, 96, 74, 28, h, (HMENU)2, g.inst, nullptr);
+      SetFocus(g_pwdEdit);
+      return 0;
+    case WM_COMMAND:
+      if (LOWORD(w) == 1 || LOWORD(w) == 2)
+      {
+        if (LOWORD(w) == 1 && g_pwdEdit)
+        {
+          wchar_t buf[256];
+          GetWindowTextW(g_pwdEdit, buf, 256);
+          g_pwdValue = buf;
+        }
+        g_pwdOk = (LOWORD(w) == 1);
+        DestroyWindow(h);
+        return 0;
+      }
+      break;
+    case WM_CLOSE:
+      g_pwdOk = false;
+      DestroyWindow(h);
+      return 0;
+    case WM_CTLCOLORSTATIC:
+      return (LRESULT)(HBRUSH)(COLOR_BTNFACE + 1);
+  }
+  return DefWindowProcW(h, m, w, l);
+}
+
+static bool PromptPassword(std::wstring& out)
+{
+  const wchar_t cls[] = L"SKPwdWnd";
+  static bool reg = false;
+  if (!reg)
+  {
+    WNDCLASSEXW wc{};
+    wc.cbSize = sizeof(wc);
+    wc.lpfnWndProc = PwdProc;
+    wc.hInstance = g.inst;
+    wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+    wc.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
+    wc.lpszClassName = cls;
+    RegisterClassExW(&wc);
+    reg = true;
+  }
+  g_pwdEdit = nullptr;
+  g_pwdOk = false;
+  g_pwdValue.clear();
+  HWND hw = CreateWindowExW(WS_EX_DLGMODALFRAME, cls, L"Password required",
+                            WS_POPUP | WS_CAPTION | WS_SYSMENU,
+                            CW_USEDEFAULT, CW_USEDEFAULT, 348, 172,
+                            g.frame, nullptr, g.inst, nullptr);
+  if (!hw) return false;
+  RECT fr, rc;
+  GetWindowRect(g.frame, &fr);
+  GetWindowRect(hw, &rc);
+  SetWindowPos(hw, nullptr,
+               fr.left + (fr.right - fr.left - (rc.right - rc.left)) / 2,
+               fr.top + (fr.bottom - fr.top - (rc.bottom - rc.top)) / 2,
+               0, 0, SWP_NOSIZE | SWP_NOZORDER);
+  ShowWindow(hw, SW_SHOW);
+  UpdateWindow(hw);
+  HWND owner = g.frame;
+  EnableWindow(owner, FALSE);
+  MSG msg;
+  while (IsWindow(hw))
+  {
+    const BOOL r = GetMessageW(&msg, nullptr, 0, 0);
+    if (r <= 0) break;
+    if (!IsDialogMessageW(hw, &msg))
+    {
+      TranslateMessage(&msg);
+      DispatchMessageW(&msg);
+    }
+  }
+  EnableWindow(owner, TRUE);
+  SetActiveWindow(owner);
+  SetFocus(owner);
+  out = g_pwdValue;
+  return g_pwdOk;
+}
+
+static FPDF_DOCUMENT LoadWithPassword(const std::wstring& file, const wchar_t* pwd)
+{
+  if (pwd && pwd[0])
+    return FPDF_LoadDocument(Utf8(file).c_str(), Utf8(pwd).c_str());
+  return FPDF_LoadDocument(Utf8(file).c_str(), nullptr);
+}
+
 static void LoadDoc(const std::wstring& file)
 {
-  FPDF_DOCUMENT d = FPDF_LoadDocument(Utf8(file).c_str(), nullptr);
+  FPDF_DOCUMENT d = LoadWithPassword(file, nullptr);
+  if (!d && FPDF_GetLastError() == FPDF_ERR_PASSWORD)
+  {
+    for (int attempt = 0; attempt < 3 && !d; ++attempt)
+    {
+      std::wstring pwd;
+      if (!PromptPassword(pwd)) return;
+      d = LoadWithPassword(file, pwd.c_str());
+    }
+    if (!d)
+    {
+      std::wstring msg = (FPDF_GetLastError() == FPDF_ERR_PASSWORD)
+        ? L"The password was incorrect (3 attempts)."
+        : L"Could not open the file after unlocking.\nPDFium error: "
+          + std::to_wstring(FPDF_GetLastError());
+      MessageBoxW(g.frame, msg.c_str(), L"Stitchup", MB_OK | MB_ICONERROR);
+      return;
+    }
+  }
   if (!d)
   {
     unsigned long e = FPDF_GetLastError();
@@ -2405,8 +2529,252 @@ static std::string MakeTextPdf()
 }
 
 // ---------------------------------------------------------------------------
-// Self-test (headless, no GUI)
+// Minimal MD5 + RC4 (used only to build the encrypted selftest fixture)
 // ---------------------------------------------------------------------------
+struct Md5Ctx
+{
+  unsigned int state[4];
+  unsigned long long bits;
+  unsigned char in[64];
+  int inlen;
+};
+
+static void Md5Transform(unsigned int state[4], const unsigned char block[64])
+{
+  static const unsigned int K[64] = {
+    0xd76aa478,0xe8c7b756,0x242070db,0xc1bdceee,0xf57c0faf,0x4787c62a,0xa8304613,0xfd469501,
+    0x698098d8,0x8b44f7af,0xffff5bb1,0x895cd7be,0x6b901122,0xfd987193,0xa679438e,0x49b40821,
+    0xf61e2562,0xc040b340,0x265e5a51,0xe9b6c7aa,0xd62f105d,0x02441453,0xd8a1e681,0xe7d3fbc8,
+    0x21e1cde6,0xc33707d6,0xf4d50d87,0x455a14ed,0xa9e3e905,0xfcefa3f8,0x676f02d9,0x8d2a4c8a,
+    0xfffa3942,0x8771f681,0x6d9d6122,0xfde5380c,0xa4beea44,0x4bdecfa9,0xf6bb4b60,0xbebfbc70,
+    0x289b7ec6,0xeaa127fa,0xd4ef3085,0x04881d05,0xd9d4d039,0xe6db99e5,0x1fa27cf8,0xc4ac5665,
+    0xf4292244,0x432aff97,0xab9423a7,0xfc93a039,0x655b59c3,0x8f0ccc92,0xffeff47d,0x85845dd1,
+    0x6fa87e4f,0xfe2ce6e0,0xa3014314,0x4e0811a1,0xf7537e82,0xbd3af235,0x2ad7d2bb,0xeb86d391 };
+  unsigned int a = state[0], b = state[1], c = state[2], d = state[3];
+  unsigned int x[16];
+  for (int i = 0; i < 16; i++)
+    x[i] = (unsigned int)block[i * 4] |
+           ((unsigned int)block[i * 4 + 1] << 8) |
+           ((unsigned int)block[i * 4 + 2] << 16) |
+           ((unsigned int)block[i * 4 + 3] << 24);
+#define F_(x,y,z) (((x)&(y)) | (~(x)&(z)))
+#define G_(x,y,z) (((x)&(z)) | ((y)&~(z)))
+#define H_(x,y,z) ((x) ^ (y) ^ (z))
+#define I_(x,y,z) ((y) ^ ((x) | ~(z)))
+#define ROT_(x,s) (((x)<<(s)) | ((x)>>(32-(s))))
+#define STEP_(fn,k,s,i) { unsigned int _w = b + ROT_(a + fn(b,c,d) + x[i] + K[k], s); a = d; d = c; c = b; b = _w; }
+  STEP_(F_,0,7,0) STEP_(F_,1,12,1) STEP_(F_,2,17,2) STEP_(F_,3,22,3)
+  STEP_(F_,4,7,4) STEP_(F_,5,12,5) STEP_(F_,6,17,6) STEP_(F_,7,22,7)
+  STEP_(F_,8,7,8) STEP_(F_,9,12,9) STEP_(F_,10,17,10) STEP_(F_,11,22,11)
+  STEP_(F_,12,7,12) STEP_(F_,13,12,13) STEP_(F_,14,17,14) STEP_(F_,15,22,15)
+  STEP_(G_,16,5,1) STEP_(G_,17,9,6) STEP_(G_,18,14,11) STEP_(G_,19,20,0)
+  STEP_(G_,20,5,5) STEP_(G_,21,9,10) STEP_(G_,22,14,15) STEP_(G_,23,20,4)
+  STEP_(G_,24,5,9) STEP_(G_,25,9,14) STEP_(G_,26,14,3) STEP_(G_,27,20,8)
+  STEP_(G_,28,5,13) STEP_(G_,29,9,2) STEP_(G_,30,14,7) STEP_(G_,31,20,12)
+  STEP_(H_,32,4,5) STEP_(H_,33,11,8) STEP_(H_,34,16,11) STEP_(H_,35,23,14)
+  STEP_(H_,36,4,1) STEP_(H_,37,11,4) STEP_(H_,38,16,7) STEP_(H_,39,23,10)
+  STEP_(H_,40,4,13) STEP_(H_,41,11,0) STEP_(H_,42,16,3) STEP_(H_,43,23,6)
+  STEP_(H_,44,4,9) STEP_(H_,45,11,12) STEP_(H_,46,16,15) STEP_(H_,47,23,2)
+  STEP_(I_,48,6,0) STEP_(I_,49,10,7) STEP_(I_,50,15,14) STEP_(I_,51,21,5)
+  STEP_(I_,52,6,12) STEP_(I_,53,10,3) STEP_(I_,54,15,10) STEP_(I_,55,21,1)
+  STEP_(I_,56,6,8) STEP_(I_,57,10,15) STEP_(I_,58,15,6) STEP_(I_,59,21,13)
+  STEP_(I_,60,6,4) STEP_(I_,61,10,11) STEP_(I_,62,15,2) STEP_(I_,63,21,9)
+#undef STEP_
+#undef ROT_
+#undef F_
+#undef G_
+#undef H_
+#undef I_
+  state[0] += a; state[1] += b; state[2] += c; state[3] += d;
+}
+
+static void Md5Init(Md5Ctx* c)
+{
+  c->state[0] = 0x67452301; c->state[1] = 0xefcdab89;
+  c->state[2] = 0x98badcfe; c->state[3] = 0x10325476;
+  c->bits = 0; c->inlen = 0;
+}
+
+static void Md5Update(Md5Ctx* c, const unsigned char* data, size_t len)
+{
+  c->bits += (unsigned long long)len * 8;
+  while (len)
+  {
+    unsigned int n = 64 - c->inlen;
+    if (n > len) n = (unsigned int)len;
+    memcpy(c->in + c->inlen, data, n);
+    c->inlen += (int)n;
+    data += n;
+    len -= n;
+    if (c->inlen == 64) { Md5Transform(c->state, c->in); c->inlen = 0; }
+  }
+}
+
+static void Md5Final(Md5Ctx* c, unsigned char out[16])
+{
+  const unsigned long long bits = c->bits;
+  unsigned char pad[128] = {};
+  pad[0] = 0x80;
+  const int need = (c->inlen < 56) ? (56 - c->inlen) : (120 - c->inlen);
+  Md5Update(c, pad, (size_t)need);
+  unsigned char lenb[8];
+  for (int i = 0; i < 8; i++) lenb[i] = (unsigned char)((bits >> (8 * i)) & 0xff);
+  Md5Update(c, lenb, 8);
+  for (int i = 0; i < 4; i++)
+  {
+    out[i * 4 + 0] = (unsigned char)(c->state[i] & 0xff);
+    out[i * 4 + 1] = (unsigned char)((c->state[i] >> 8) & 0xff);
+    out[i * 4 + 2] = (unsigned char)((c->state[i] >> 16) & 0xff);
+    out[i * 4 + 3] = (unsigned char)((c->state[i] >> 24) & 0xff);
+  }
+}
+
+struct Rc4Ctx
+{
+  unsigned char s[256];
+  int i, j;
+};
+
+static void Rc4Init(Rc4Ctx* r, const unsigned char* key, int keylen)
+{
+  for (int k = 0; k < 256; k++) r->s[k] = (unsigned char)k;
+  int j = 0;
+  for (int k = 0; k < 256; k++)
+  {
+    j = (j + r->s[k] + key[k % keylen]) & 0xff;
+    unsigned char t = r->s[k]; r->s[k] = r->s[j]; r->s[j] = t;
+  }
+  r->i = r->j = 0;
+}
+
+static void Rc4Crypt(Rc4Ctx* r, const unsigned char* in, unsigned char* out, int len)
+{
+  int a = r->i, b = r->j;
+  for (int k = 0; k < len; k++)
+  {
+    a = (a + 1) & 0xff;
+    b = (b + r->s[a]) & 0xff;
+    unsigned char t = r->s[a]; r->s[a] = r->s[b]; r->s[b] = t;
+    out[k] = in[k] ^ r->s[(r->s[a] + r->s[b]) & 0xff];
+  }
+  r->i = a;
+  r->j = b;
+}
+
+// Builds an encrypted single-page PDF (Standard security handler V1) whose
+// user password is "stitchup". Variants: 1 = R2/40-bit, 2 = R3/128-bit,
+// 3 = R2/128-bit. The selftest probes each until this pdfium accepts one.
+static std::string MakeEncryptedPdf(int variant)
+{
+  static const unsigned char kPadding[32] = {
+    0x28,0xBF,0x4E,0x5E,0x4E,0x75,0x8A,0x41,0x64,0x00,0x4E,0x56,0xFF,0xFA,0x01,0x08,
+    0x2E,0x2E,0x00,0xB6,0xD0,0x68,0x3E,0x80,0x2F,0x0C,0xA9,0xFE,0x64,0x53,0x69,0x7A };
+  const std::string user_pw = "stitchup";
+  const std::string owner_pw = "clockwork";
+  auto pad32 = [&](const std::string& pw, unsigned char out[32])
+  {
+    const size_t n = pw.size();
+    for (size_t i = 0; i < 32; i++)
+      out[i] = i < n ? (unsigned char)pw[i] : kPadding[i - n];
+  };
+  unsigned char pad_o[32], pad_u[32];
+  pad32(owner_pw, pad_o);
+  pad32(user_pw, pad_u);
+
+  const int revision = (variant == 2) ? 3 : 2;
+  const int keylen = (variant == 2) ? 16 : (variant == 3 ? 16 : 5);
+  const unsigned char P_le[4] = { 0xFC, 0xFF, 0xFF, 0xFF };
+  const unsigned char* ID1 = reinterpret_cast<const unsigned char*>("STITCHUPENCID012");  // 16 bytes
+
+  unsigned char okey[16];
+  { Md5Ctx m; Md5Init(&m); Md5Update(&m, pad_o, 32); Md5Final(&m, okey); }
+  unsigned char O[32];
+  { Rc4Ctx r; Rc4Init(&r, okey, keylen); Rc4Crypt(&r, kPadding, O, 32); }
+
+  unsigned char key[16];
+  { Md5Ctx m; Md5Init(&m); Md5Update(&m, pad_u, 32); Md5Update(&m, O, 32);
+    Md5Update(&m, P_le, 4); Md5Update(&m, ID1, 16); Md5Final(&m, key); }
+  if (revision >= 3)
+  {
+    for (int i = 0; i < 50; i++)
+    {
+      Md5Ctx m; Md5Init(&m); Md5Update(&m, key, 16); Md5Final(&m, key);
+    }
+  }
+  unsigned char U[32];
+  if (revision == 2)
+  {
+    Rc4Ctx r; Rc4Init(&r, key, keylen); Rc4Crypt(&r, kPadding, U, 32);
+  }
+  else
+  {
+    unsigned char ubase[16];
+    { Md5Ctx m; Md5Init(&m); Md5Update(&m, kPadding, 32); Md5Update(&m, ID1, 16); Md5Final(&m, ubase); }
+    Rc4Ctx r; Rc4Init(&r, key, keylen); Rc4Crypt(&r, ubase, U, 16);
+  }
+
+  const std::string txt = "BT /F1 12 Tf 72 700 Td (Hello, World! Export me.) Tj ET";
+  std::string enc(txt.size(), '\0');
+  {
+    // Per-object crypt key = MD5(K || objnum(3 LE) || gen(2 LE)), truncated
+    // to min(keylen+5, 16) for RC4.
+    unsigned char mat[21] = {};
+    memcpy(mat, key, (size_t)keylen);
+    mat[keylen + 0] = 0x04;  // contents object number=4
+    mat[keylen + 1] = 0x00;
+    mat[keylen + 2] = 0x00;
+    mat[keylen + 3] = 0x00;
+    mat[keylen + 4] = 0x00;
+    const int streamKeyLen = std::min(keylen + 5, 16);
+    unsigned char streamKey[16];
+    { Md5Ctx m; Md5Init(&m); Md5Update(&m, mat, (size_t)keylen + 5); Md5Final(&m, streamKey); }
+    Rc4Ctx r; Rc4Init(&r, streamKey, streamKeyLen);
+    Rc4Crypt(&r, reinterpret_cast<const unsigned char*>(txt.data()),
+             reinterpret_cast<unsigned char*>(&enc[0]), (int)txt.size());
+  }
+
+  auto hexof = [](const unsigned char* b, int n)
+  {
+    static const char* hx = "0123456789ABCDEF";
+    std::string s;
+    for (int i = 0; i < n; i++) { s += hx[b[i] >> 4]; s += hx[b[i] & 15]; }
+    return s;
+  };
+  const std::string encHexO = hexof(O, 32);
+  const std::string encHexU = hexof(U, 32);
+
+  std::string out = "%PDF-1.4\n";
+  std::vector<size_t> offs;
+  auto emit = [&](const std::string& obj) {
+    offs.push_back(out.size());
+    out += obj;
+    out += "\n";
+  };
+  emit("1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj");
+  emit("2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj");
+  emit("3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] "
+       "/Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R >>\nendobj");
+  emit("4 0 obj\n<< /Length " + std::to_string(enc.size()) + " >>\nstream\n" +
+       enc + "\nendstream\nendobj");
+  emit("5 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>\nendobj");
+  emit("6 0 obj\n<< /Filter /Standard /V 1 /R " + std::to_string(revision) +
+       " /Length " + std::to_string(keylen * 8) +
+       " /O <" + encHexO + "> /U <" + encHexU + "> /P -4 >>\nendobj");
+  const size_t xref = out.size();
+  out += "xref\n0 7\n";
+  out += "0000000000 65535 f \n";
+  for (size_t o : offs)
+  {
+    char line[32];
+    std::snprintf(line, sizeof(line), "%010zu 00000 n \n", o);
+    out += line;
+  }
+  out += "trailer\n<< /Size 7 /Root 1 0 R /Encrypt 6 0 R ";
+  out += "/ID [<" + hexof(ID1, 16) + "> <" + hexof(ID1, 16) + ">] >>\nstartxref\n";
+  out += std::to_string(xref);
+  out += "\n%%EOF\n";
+  return out;
+}
 static bool SaveAsString(FPDF_DOCUMENT d, std::vector<unsigned char>& out)
 {
   FileWriter fw{};
@@ -2879,6 +3247,73 @@ check("saved %PDF header", bytes.size() > 8 &&
       check("tx: blank doc export is false", !ExportTextToFile(blank, bf));
       check("tx: blank doc writes no file", GetFileAttributesW(bf.c_str()) == INVALID_FILE_ATTRIBUTES);
       FPDF_CloseDocument(blank);
+    }
+  }
+
+  {
+    // encrypted PDF (Standard V1/R2, user "stitchup")
+    unsigned char md5abc[16];
+    { Md5Ctx m; Md5Init(&m); Md5Update(&m, (const unsigned char*)"abc", 3); Md5Final(&m, md5abc); }
+    const char* hx = "0123456789abcdef";
+    std::string md5s;
+    for (int i = 0; i < 16; i++) { md5s += hx[md5abc[i] >> 4]; md5s += hx[md5abc[i] & 15]; }
+    check("crypto: MD5(abc) vector", md5s == "900150983cd24fb0d6963f7d28e17f72");
+    unsigned char rc4out[10];
+    { Rc4Ctx r; Rc4Init(&r, (const unsigned char*)"Key", 3);
+      Rc4Crypt(&r, (const unsigned char*)"Plaintext", rc4out, 9); }
+    std::string rc4s;
+    for (int i = 0; i < 9; i++) { rc4s += hx[rc4out[i] >> 4]; rc4s += hx[rc4out[i] & 15]; }
+    check("crypto: RC4 vector", rc4s == "bbf316e8d940af0ad3");
+
+    std::string epdf;
+    int accepted = 0;
+    for (int v = 1; v <= 3; v++)
+    {
+      std::string e = MakeEncryptedPdf(v);
+      FPDF_DOCUMENT p = FPDF_LoadMemDocument(e.data(), (int)e.size(), "stitchup");
+      if (p)
+      {
+        if (accepted == 0) epdf = e;
+        ++accepted;
+        emit("enc: variant " + std::to_string(v) + " accepted");
+        FPDF_CloseDocument(p);
+      }
+    }
+    check("enc: at least one variant accepted", accepted > 0);
+    if (epdf.empty()) epdf = MakeEncryptedPdf(1);
+    FPDF_DOCUMENT ok = FPDF_LoadMemDocument(epdf.data(), (int)epdf.size(), "stitchup");
+    check("enc: opens with correct password", ok != nullptr);
+    if (ok)
+    {
+      checkEq("enc: page count", FPDF_GetPageCount(ok), 1);
+      check("enc: stream decrypted (text run)",
+            DocTextRaw(ok).find(L"Hello, World! Export me.") != std::wstring::npos);
+      FPDF_CloseDocument(ok);
+    }
+    FPDF_DOCUMENT bad = FPDF_LoadMemDocument(epdf.data(), (int)epdf.size(), "wrongpass");
+    check("enc: wrong password rejected", bad == nullptr);
+    check("enc: error is PASSWORD",
+          bad == nullptr && FPDF_GetLastError() == FPDF_ERR_PASSWORD);
+    if (bad) FPDF_CloseDocument(bad);
+    FPDF_DOCUMENT none = FPDF_LoadMemDocument(epdf.data(), (int)epdf.size(), nullptr);
+    check("enc: empty password rejected", none == nullptr);
+    check("enc: no-password error is PASSWORD",
+          none == nullptr && FPDF_GetLastError() == FPDF_ERR_PASSWORD);
+    if (none) FPDF_CloseDocument(none);
+    wchar_t tp4[MAX_PATH];
+    GetTempPathW(MAX_PATH, tp4);
+    std::wstring ef = std::wstring(tp4) + L"stitchup_enc_test.pdf";
+    FILE* fe = nullptr;
+    if (_wfopen_s(&fe, ef.c_str(), L"wb") == 0 && fe)
+    {
+      fwrite(epdf.data(), 1, epdf.size(), fe);
+      fclose(fe);
+    }
+    check("enc: fixture written", GetFileAttributesW(ef.c_str()) != INVALID_FILE_ATTRIBUTES);
+    {
+      FPDF_DOCUMENT disk = FPDF_LoadDocument(Utf8(ef).c_str(), "stitchup");
+      check("enc: disk fixture opens with correct password", disk != nullptr);
+      if (disk) FPDF_CloseDocument(disk);
     }
   }
 

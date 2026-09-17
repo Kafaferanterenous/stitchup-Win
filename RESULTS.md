@@ -20,7 +20,7 @@ user rejected as a product (no GUI).
 
 Command: `Stitchup.exe --self-test`
 
-Result: **93 passed, 0 failed** (exit code 0).
+Result: **105 passed, 0 failed** (exit code 0).
 
 Coverage: PDFium init; create doc + add page; save to buffer (PDF header and
 `%%EOF` trailer checks); reopen roundtrip; page count; load sample PDF (612x792);
@@ -45,11 +45,17 @@ match (left 71..73, bottom 669..674, right 282..287, top 730..744); text export:
 a hand-crafted single-page text PDF produces the expected run via
 `FPDFText_LoadPage/CountChars/GetText`, `ExportTextToFile` writes a UTF-8 BOM
 (+ BOM checked byte-for-byte, exported run present), and a blank document yields
-no output file.
+no output file; security: RFC 1321 MD5 and RC4 known-answer vectors, a
+hand-built standard-security-handler fixture (padded `/O`+`/U` of the real
+32-byte PDF padding string, `/P` = -4, RC4 content stream encrypted with the
+per-object key `MD5(K || objnum || gen)` truncated to `min(keylen+5, 16)`)
+proves the revision-2 40-bit variant opens with the correct password
+(`FPDF_GetLastError` = `FPDF_ERR_PASSWORD` for wrong/empty passwords), and the
+on-disk fixture reopens with the same password via `FPDF_LoadDocument`.
 
 `test_result.txt` (SHA-256 of the run captured in the report):
 ```
--- enter -- ... SUMMARY 93 passed, 0 failed
+-- enter -- ... SUMMARY 105 passed, 0 failed
 ```
 
 GUI verification (programmatic, window handles + messages):
@@ -77,6 +83,13 @@ GUI verification (programmatic, window handles + messages):
   command opens the Save As dialog prefilled with `<name>.txt`; on a blank
   document it shows the "No extractable text" box instead (both observed
   through the UI). The engine writes a UTF-8 BOM file (verified headless).
+- Password-protected open: launching with an encrypted fixture raises the
+  "Password required" dialog (class `SKPwdWnd`) with an ES_PASSWORD entry and
+  Ok/Cancel buttons (both present and inside the dialog bounds); entering the
+  correct password opens the document (title becomes
+  `stitchup_enc_test.pdf - Stitchup PDF Editor`); a wrong password re-prompts
+  twice and then shows the "The password was incorrect (3 attempts)." box, after
+  which no document is loaded (title stays `Stitchup PDF Editor`).
 
 ## Bug fixed during this session
 
@@ -105,7 +118,7 @@ No CRT DLLs (static `/MT` linked). Portable package = `Stitchup.exe` +
 
 | File           | Size     | SHA-256                                                           |
 |----------------|----------|-------------------------------------------------------------------|
-| Stitchup.exe   | 316,416 B | 67D45DADF359B429AA8729E909B106C2553B8CE3EA0546A622D987BCA6C661DC |
+| Stitchup.exe   | 341,504 B | 63F2852A01EC8975F1F904DA1ACBFDE3300942F08ED68CEEB2162E7ACE6CCFD4 |
 | pdfium.dll     | 7,375,360 B | 55E7EBEF29A1EC9523D1ADB8B260A73E7DFB0F64D3F0285121D20ECD6148EF18 |
 | example.pdf    | 1,034 B   | B276682EFD75780E462C17489176D710AD1339D84E69C6218AD3C2F8E60FC132 |
 
@@ -128,9 +141,10 @@ navigates or opens a URI, hand cursor); page management done (extract current
 page to its own PDF, split a document into one file per page, auto-crop the
 current page to its ink bounding box via the InkBounds render pass); text
 export added (File > Export Text writes a BOM'd UTF-8 .txt of every page's
-extractable text); the Save-in-place file-replace bug is fixed. Remaining
-Phase C: security (open password-protected files / encrypt-save), export
-(CSV), watermarks.
-Self-test 93/93. User verdict pending — open `dist\Stitchup.exe file.pdf` and
+extractable text); security started (password-protected PDFs are detected and
+unlocked through a modal password dialog, up to 3 attempts before an error
+box); the Save-in-place file-replace bug is fixed. Remaining Phase C: export
+(CSV), watermarks, and encrypt-on-save.
+Self-test 105/105. User verdict pending — open `dist\Stitchup.exe file.pdf` and
 try Home > Annotate, click any PDF link, Home > Pages (Extract / Split /
-Auto-Crop), and File > Export Text.
+Auto-Crop), File > Export Text, and open a password-protected PDF.

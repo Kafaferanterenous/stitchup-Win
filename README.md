@@ -49,6 +49,9 @@ Produces `dist\Stitchup.exe` + `dist\pdfium.dll`.
   its content (white margins trimmed via an ink-bounding-box render pass)
 - Export Text (File > Export Text): saves every page's extractable text as a
   UTF-8 (BOM) .txt file
+- Security: password-protected PDFs are detected and unlocked through a modal
+  password dialog (up to 3 attempts, then an error box); wrong passwords are
+  rejected by PDFium
 - Drag & drop a PDF onto the window to open it; open via command-line argument
 - Shortcuts: Ctrl+N/O/S, Ctrl+Shift+S, Ctrl+R (rotate), Ctrl+[/Ctrl+], Delete,
   Ctrl+0/1/2 (100%/fit width/fit page), PgUp/PgDn, Ctrl+wheel to zoom
@@ -68,8 +71,8 @@ project (github.com/bblanchon/pdfium-binaries). Non-GPL build.
   single-exe build is planned but first requires building PDFium with the
   static CRT from source (the prebuilt import lib is not static).
 - Shell + annotations + link activation + page management (extract/split/
-  auto-crop done; text export added; security (password-protected files,
-encrypt-save), CSV export and watermarks are the next milestones. Rendering, page model,
+  auto-crop) + text export + password-unlock are done; CSV export, watermarks
+  and encrypt-on-save are the next milestones. Rendering, page model,
   editing operations, ribbon navigation, the bookmarks pane, annotation
   creation/persistence, link navigation and page extract/split/crop are
   functional.
