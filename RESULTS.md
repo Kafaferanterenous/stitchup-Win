@@ -13,6 +13,7 @@ user rejected as a product (no GUI).
 - `src\app.cpp` - single-file Win32 GUI + PDFium integration (GUI, editing
   operations, demo/self-test modes)
 - `CMakeLists.txt`, `Build.cmd` - build scripts (MSVC/CMake/NMake)
+- `resources\app.ico` + `resources\app.rc` - embedded multi-size app icon
 - `third_party\pdfium\` - PDFium headers, import lib, licenses, version info
 - `example.pdf` - sample 5-page demo document (via `--demo`)
 
@@ -101,6 +102,14 @@ GUI verification (programmatic, window handles + messages):
   opens the Save As dialog (owned by the app process, title "Save As")
   prefilled with `<name>.csv` (verified via UI Automation on the filename
   field); the engine writes a UTF-8 BOM CSV (verified headless).
+- Theme: View > Dark Mode (`Ctrl+D` on the menu, checkbox state toggles)
+  repaints every surface and persists to `HKCU\Software\StitchupPDFEditor`.
+  A pixel probe of the toolbar (window DC, `GetPixel`) confirms both palettes
+  render: light = accent strip `0B6CE0` / ribbon `F7F8FA` / card `EFF0F3`,
+  dark = accent strip `4CA0FF` / ribbon `202020` / card `282828`).
+- App icon: `ExtractAssociatedIcon` on the built exe yields the embedded
+  multi-size icon (16/24/32/48/256, generated programmatically as
+  `resources/app.ico`, compiled via `resources/app.rc`).
 
 ## Bug fixed during this session
 
@@ -129,9 +138,10 @@ No CRT DLLs (static `/MT` linked). Portable package = `Stitchup.exe` +
 
 | File           | Size     | SHA-256                                                           |
 |----------------|----------|-------------------------------------------------------------------|
-| Stitchup.exe   | 356,864 B | 2AE80240680CC1FCBE7C727103CD4E79045C665C5C27AED521A2B31095DD2DB3 |
+| Stitchup.exe   | 380,416 B | F79697582C067726AEFBF5B441BC8B665559A58B810098F323964DD3AFA4D778 |
 | pdfium.dll     | 7,375,360 B | 55E7EBEF29A1EC9523D1ADB8B260A73E7DFB0F64D3F0285121D20ECD6148EF18 |
 | example.pdf    | 1,034 B   | B276682EFD75780E462C17489176D710AD1339D84E69C6218AD3C2F8E60FC132 |
+| app.ico        | 20,597 B  | 5FB009C7A83254FBCD81C205492E03A683EDB0BA65B6E44962614B06A240CA44 |
 
 ## Notes
 
@@ -154,7 +164,9 @@ current page to its ink bounding box via the InkBounds render pass); text
 export added (File > Export Text writes a BOM'd UTF-8 .txt of every page's
 extractable text); CSV export added (File > Export CSV writes a BOM'd UTF-8
 `.csv` with one `Page,Width (pt),Height (pt),Text chars,Annotations` row per
-page); security started (password-protected PDFs are detected and
+page); UI restyled (modern flat ribbon with accent brand strip, labelled group
+cards, hover/pressed button states, and a light/dark theme with an embedded
+app icon); security started (password-protected PDFs are detected and
 unlocked through a modal password dialog, up to 3 attempts before an error
 box); the Save-in-place file-replace bug is fixed. Remaining Phase C:
 watermarks and encrypt-on-save.

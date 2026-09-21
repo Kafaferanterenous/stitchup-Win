@@ -36,7 +36,11 @@ Produces `dist\Stitchup.exe` + `dist\pdfium.dll`.
 - File menu: New, Open, Save (atomic: temp file + replace), Save As, Import PDF
 - Edit: rotate page CW/CCW, delete page, add blank page (Letter/A4), drag pages
   in the thumbnails panel to reorder
-- View: zoom in/out, 100%, fit width, fit page, previous/next page
+- View: zoom in/out, 100%, fit width, fit page, previous/next page, and a
+  Dark Mode toggle (View > Dark Mode, `Ctrl+D`, remembered between runs)
+- Modern flat UI: flat ribbon (hover/pressed states, accent brand strip,
+  labelled group cards), Segoe UI text, embedded multi-size app icon, and a
+  light/dark color theme
 - Bookmarks pane lists the PDF outline (nested); clicking a bookmark jumps to
   its page
 - Annotate (Home > Annotate group or Edit > Annotate menu): insert highlight,
@@ -56,7 +60,8 @@ Produces `dist\Stitchup.exe` + `dist\pdfium.dll`.
   rejected by PDFium
 - Drag & drop a PDF onto the window to open it; open via command-line argument
 - Shortcuts: Ctrl+N/O/S, Ctrl+Shift+S, Ctrl+R (rotate), Ctrl+[/Ctrl+], Delete,
-  Ctrl+0/1/2 (100%/fit width/fit page), PgUp/PgDn, Ctrl+wheel to zoom
+  Ctrl+0/1/2 (100%/fit width/fit page), Ctrl+D (dark mode), PgUp/PgDn,
+  Ctrl+wheel to zoom
 
 ## Third-party components
 

@@ -67,6 +67,7 @@ enum
   ID_PAGE_CROP,
   ID_EXPORT_TEXT,
   ID_EXPORT_CSV,
+  ID_THEME,
 };
 
 enum
@@ -155,6 +156,133 @@ struct App
 };
 
 static App g;
+
+// ---------------------------------------------------------------------------
+// Theme (light / dark) - flat modern palette
+// ---------------------------------------------------------------------------
+struct Theme
+{
+  COLORREF ribbonBg;    // toolbar background
+  COLORREF card;        // ribbon group card fill
+  COLORREF cardBorder;  // ribbon group card border
+  COLORREF accent;      // accent (selection, active tab, frames)
+  COLORREF accentDeep;  // pressed accent
+  COLORREF text;        // primary text
+  COLORREF textDim;     // captions / secondary text
+  COLORREF btnHover;    // button hover fill
+  COLORREF btnDown;     // button pressed fill
+  COLORREF btnBorder;   // button resting border
+  COLORREF thumbBg;     // thumbnails panel background
+  COLORREF canvasBg;    // canvas background
+  COLORREF pageFrame;   // page frame on canvas
+  COLORREF split;       // splitter / chrome
+  COLORREF statusBg;    // status bar background
+  COLORREF statusTxt;   // status bar text
+  COLORREF treeBg;      // pane tree background
+  COLORREF treeTxt;     // pane tree text
+};
+
+static bool g_dark = false;
+
+static Theme LightTheme()
+{
+  Theme t{};
+  t.ribbonBg   = RGB(0xF7, 0xF8, 0xFA);
+  t.card       = RGB(0xEF, 0xF0, 0xF3);
+  t.cardBorder = RGB(0xD8, 0xDA, 0xDE);
+  t.accent     = RGB(0x0B, 0x6C, 0xE0);
+  t.accentDeep = RGB(0x0B, 0x3E, 0x77);
+  t.text       = RGB(0x20, 0x20, 0x20);
+  t.textDim    = RGB(0x80, 0x80, 0x80);
+  t.btnHover   = RGB(0xE6, 0xEF, 0xFB);
+  t.btnDown    = RGB(0xC8, 0xDC, 0xF2);
+  t.btnBorder  = RGB(0xD5, 0xD5, 0xD5);
+  t.thumbBg    = RGB(0xEC, 0xEC, 0xEC);
+  t.canvasBg   = RGB(0xE2, 0xE2, 0xE2);
+  t.pageFrame  = RGB(0x99, 0x99, 0x99);
+  t.split      = RGB(0xD8, 0xDA, 0xDE);
+  t.statusBg   = RGB(0x2B, 0x2B, 0x2B);
+  t.statusTxt  = RGB(0xE8, 0xE8, 0xE8);
+  t.treeBg     = RGB(0xFF, 0xFF, 0xFF);
+  t.treeTxt    = RGB(0x20, 0x20, 0x20);
+  return t;
+}
+
+static Theme DarkTheme()
+{
+  Theme t{};
+  t.ribbonBg   = RGB(0x20, 0x20, 0x20);
+  t.card       = RGB(0x28, 0x28, 0x28);
+  t.cardBorder = RGB(0x3A, 0x3A, 0x3A);
+  t.accent     = RGB(0x4C, 0xA0, 0xFF);
+  t.accentDeep = RGB(0x1E, 0x6F, 0xC9);
+  t.text       = RGB(0xE8, 0xE8, 0xE8);
+  t.textDim    = RGB(0x9A, 0x9A, 0x9A);
+  t.btnHover   = RGB(0x33, 0x39, 0x43);
+  t.btnDown    = RGB(0x3D, 0x46, 0x54);
+  t.btnBorder  = RGB(0x3A, 0x3A, 0x3A);
+  t.thumbBg    = RGB(0x23, 0x23, 0x23);
+  t.canvasBg   = RGB(0x1B, 0x1B, 0x1B);
+  t.pageFrame  = RGB(0x6A, 0x6A, 0x6A);
+  t.split      = RGB(0x2E, 0x2E, 0x2E);
+  t.statusBg   = RGB(0x16, 0x16, 0x16);
+  t.statusTxt  = RGB(0xC9, 0xC9, 0xC9);
+  t.treeBg     = RGB(0x20, 0x20, 0x20);
+  t.treeTxt    = RGB(0xE0, 0xE0, 0xE0);
+  return t;
+}
+
+static Theme ThemeNow() { return g_dark ? DarkTheme() : LightTheme(); }
+
+static void ApplyTreeTheme()
+{
+  if (!g.bookmarks) return;
+  const Theme& th = ThemeNow();
+  SendMessageW(g.bookmarks, TVM_SETBKCOLOR, 0, (LPARAM)th.treeBg);
+  SendMessageW(g.bookmarks, TVM_SETTEXTCOLOR, 0, (LPARAM)th.treeTxt);
+  SendMessageW(g.bookmarks, TVM_SETLINECOLOR, 0, (LPARAM)th.treeTxt);
+  InvalidateRect(g.bookmarks, nullptr, TRUE);
+}
+
+static void ToggleTheme()
+{
+  g_dark = !g_dark;
+  if (g.toolbar)  InvalidateRect(g.toolbar, nullptr, TRUE);
+  if (g.thumbs)   InvalidateRect(g.thumbs, nullptr, TRUE);
+  if (g.split)    InvalidateRect(g.split, nullptr, TRUE);
+  if (g.canvas)   InvalidateRect(g.canvas, nullptr, TRUE);
+  if (g.status)   InvalidateRect(g.status, nullptr, TRUE);
+  for (int i = 0; i < 3 && g.tabBtns[i]; ++i)
+    InvalidateRect(g.tabBtns[i], nullptr, TRUE);
+  for (HWND hw : g.ribbonBtns)
+    InvalidateRect(hw, nullptr, TRUE);
+  ApplyTreeTheme();
+  HKEY key = nullptr;
+  if (RegCreateKeyExW(HKEY_CURRENT_USER,
+                      L"Software\\StitchupPDFEditor", 0, nullptr, 0,
+                      KEY_SET_VALUE, nullptr, &key, nullptr) == ERROR_SUCCESS)
+  {
+    DWORD v = g_dark ? 1 : 0;
+    RegSetValueExW(key, L"Dark", 0, REG_DWORD, (const BYTE*)&v, sizeof(v));
+    RegCloseKey(key);
+  }
+  CheckMenuItem(GetMenu(g.frame), ID_THEME,
+                MF_BYCOMMAND | (g_dark ? MF_CHECKED : MF_UNCHECKED));
+}
+
+static void ApplyInitialThemePref()
+{
+  HKEY key = nullptr;
+  if (RegOpenKeyExW(HKEY_CURRENT_USER, L"Software\\StitchupPDFEditor",
+                    0, KEY_QUERY_VALUE, &key) == ERROR_SUCCESS)
+  {
+    DWORD v = 0, sz = sizeof(v);
+    if (RegQueryValueExW(key, L"Dark", nullptr, nullptr,
+                         (LPBYTE)&v, &sz) == ERROR_SUCCESS && v)
+      g_dark = true;
+    RegCloseKey(key);
+  }
+}
 
 static std::string Utf8(const std::wstring& w)
 {
@@ -1077,11 +1205,12 @@ static LRESULT CALLBACK StatusProc(HWND hw, UINT msg, WPARAM wp, LPARAM lp,
       HDC dc = BeginPaint(hw, &ps);
       RECT rc;
       GetClientRect(hw, &rc);
-      HBRUSH bg = CreateSolidBrush(RGB(0x2B, 0x2B, 0x2B));
+      const Theme& th = ThemeNow();
+      HBRUSH bg = CreateSolidBrush(th.statusBg);
       FillRect(dc, &rc, bg);
       DeleteObject(bg);
       SetBkMode(dc, TRANSPARENT);
-      SetTextColor(dc, RGB(0xE8, 0xE8, 0xE8));
+      SetTextColor(dc, th.statusTxt);
       std::wstring left = g.name.empty() ? L"Stitchup PDF Editor"
                                          : g.name + (g.dirty ? L"  *" : L"");
       RECT lrc = rc;
@@ -1175,13 +1304,14 @@ static LRESULT CALLBACK ThumbsProc(HWND hw, UINT msg, WPARAM wp, LPARAM lp)
       HDC dc = BeginPaint(hw, &ps);
       RECT rc;
       GetClientRect(hw, &rc);
-      HBRUSH bgb = CreateSolidBrush(RGB(0xEC, 0xEC, 0xEC));
+      const Theme& thm = ThemeNow();
+      HBRUSH bgb = CreateSolidBrush(thm.thumbBg);
       FillRect(dc, &rc, bgb);
       DeleteObject(bgb);
 
       RECT hr{rc.left + 10, 6, rc.right - 10, 26};
       SetBkMode(dc, TRANSPARENT);
-      SetTextColor(dc, RGB(0x33, 0x33, 0x33));
+      SetTextColor(dc, thm.textDim);
       DrawTextW(dc, L"Pages", -1, &hr, DT_SINGLELINE);
 
       int w = rc.right - rc.left;
@@ -1198,7 +1328,7 @@ static LRESULT CALLBACK ThumbsProc(HWND hw, UINT msg, WPARAM wp, LPARAM lp)
 
       if (g.dragPage >= 0 && g.dragCursor == 0)
       {
-        HPEN pn = CreatePen(PS_SOLID, 2, RGB(0x0B, 0x6C, 0xE0));
+        HPEN pn = CreatePen(PS_SOLID, 2, thm.accent);
         SelectObject(dc, pn);
         MoveToEx(dc, x, yc - 4, nullptr);
         LineTo(dc, x + thumbW, yc - 4);
@@ -1223,25 +1353,25 @@ static LRESULT CALLBACK ThumbsProc(HWND hw, UINT msg, WPARAM wp, LPARAM lp)
           bool sel = (i == g.selected);
           if (g.dragPage >= 0 && i == g.dragPage)
           {
-            HBRUSH dim = CreateSolidBrush(RGB(0xD8, 0xE4, 0xF5));
+            HBRUSH dim = CreateSolidBrush(thm.btnHover);
             RECT dr{x + 2, yc - 2, x + 4 + tw, yc + th + 6};
             FillRect(dc, &dr, dim);
             DeleteObject(dim);
           }
           RECT pr{x + 2, yc - 2, x + 4 + tw, yc + th + 6};
-          HBRUSH phb = CreateSolidBrush(sel ? RGB(0x0B, 0x6C, 0xE0)
-                                            : RGB(0xAA, 0xAA, 0xAA));
+          HBRUSH phb = CreateSolidBrush(sel ? thm.accent
+                                            : thm.pageFrame);
           FrameRect(dc, &pr, phb);
           DeleteObject(phb);
           std::wstring num = std::to_wstring(i + 1);
           RECT nr{x + 4, yc + th + 4, x + thumbW, yc + th + 14};
-          SetTextColor(dc, sel ? RGB(0x0B, 0x6C, 0xE0) : RGB(0x55, 0x55, 0x55));
+          SetTextColor(dc, sel ? thm.accent : thm.textDim);
           DrawTextW(dc, num.c_str(), -1, &nr, DT_SINGLELINE);
         }
         yc += th + 16;
         if (g.dragPage >= 0 && i + 1 == g.dragCursor)
         {
-          HPEN pn = CreatePen(PS_SOLID, 2, RGB(0x0B, 0x6C, 0xE0));
+          HPEN pn = CreatePen(PS_SOLID, 2, thm.accent);
           SelectObject(dc, pn);
           MoveToEx(dc, x, yc - 4, nullptr);
           LineTo(dc, x + thumbW, yc - 4);
@@ -1356,7 +1486,8 @@ static LRESULT CALLBACK ThumbsProc(HWND hw, UINT msg, WPARAM wp, LPARAM lp)
 // ---------------------------------------------------------------------------
 static void CanvasPaint(HDC dc, int cw, int ch)
 {
-  HBRUSH bg = CreateSolidBrush(RGB(0xE2, 0xE2, 0xE2));
+  const Theme& th = ThemeNow();
+  HBRUSH bg = CreateSolidBrush(th.canvasBg);
   RECT rc{0, 0, cw, ch};
   FillRect(dc, &rc, bg);
   DeleteObject(bg);
@@ -1381,8 +1512,11 @@ static void CanvasPaint(HDC dc, int cw, int ch)
     {
       int key;
       int rx = x, ry = yc, rw = w, rh = h;
-      // shadow
-      HBRUSH sh = CreateSolidBrush(RGB(0xBF, 0xBF, 0xBF));
+      // shadow (canvas dimmed ~30%)
+      COLORREF shC = RGB((GetRValue(th.canvasBg) * 7) / 10,
+                         (GetGValue(th.canvasBg) * 7) / 10,
+                         (GetBValue(th.canvasBg) * 7) / 10);
+      HBRUSH sh = CreateSolidBrush(shC);
       RECT sr{x + 4, yc + 4, x + w + 4, yc + h + 4};
       FillRect(dc, &sr, sh);
       DeleteObject(sh);
@@ -1414,8 +1548,8 @@ static void CanvasPaint(HDC dc, int cw, int ch)
           BitBlt(dc, rx, ry, rw, rh, mem, 0, 0, SRCCOPY);
         DeleteDC(mem);
       }
-      HBRUSH fb = CreateSolidBrush(g.selected == i ? RGB(0x0B, 0x6C, 0xE0)
-                                                   : RGB(0x99, 0x99, 0x99));
+      HBRUSH fb = CreateSolidBrush(g.selected == i ? th.accent
+                                                   : th.pageFrame);
       FrameRect(dc, &r, fb);
       DeleteObject(fb);
     }
@@ -1566,6 +1700,20 @@ static LRESULT CALLBACK SplitProc(HWND hw, UINT msg, WPARAM wp, LPARAM lp)
 {
   switch (msg)
   {
+    case WM_ERASEBKGND:
+      return 1;
+    case WM_PAINT:
+    {
+      PAINTSTRUCT ps;
+      HDC dc = BeginPaint(hw, &ps);
+      RECT rc;
+      GetClientRect(hw, &rc);
+      HBRUSH cl = CreateSolidBrush(ThemeNow().split);
+      FillRect(dc, &rc, cl);
+      DeleteObject(cl);
+      EndPaint(hw, &ps);
+      return 0;
+    }
     case WM_SETCURSOR:
       SetCursor(LoadCursorW(nullptr, IDC_SIZEWE));
       return TRUE;
@@ -1618,41 +1766,65 @@ static void BtnPaint(HWND hw)
   HDC dc = BeginPaint(hw, &ps);
   RECT rc;
   GetClientRect(hw, &rc);
+  const Theme& th = ThemeNow();
+  const int R = 6;  // corner diameter for rounded 3px radius
   if (b->tab)
   {
-    HBRUSH bg = CreateSolidBrush(b->pressed ? RGB(0xFF, 0xFF, 0xFF)
-                                 : b->hover   ? RGB(0xE9, 0xEF, 0xFA)
-                                              : RGB(0xF0, 0xF1, 0xF4));
-    FillRect(dc, &rc, bg);
-    DeleteObject(bg);
-    SetBkMode(dc, TRANSPARENT);
+    if (b->hover)
+    {
+      HBRUSH hb = CreateSolidBrush(th.btnHover);
+      HPEN nopen = (HPEN)GetStockObject(NULL_PEN);
+      HBRUSH wasb = (HBRUSH)SelectObject(dc, hb);
+      HPEN wasp = (HPEN)SelectObject(dc, nopen);
+      RoundRect(dc, rc.left, rc.top, rc.right, rc.bottom, R, R);
+      SelectObject(dc, wasb);
+      SelectObject(dc, wasp);
+      DeleteObject(hb);
+    }
     if (b->pressed)
     {
-      HBRUSH acc = CreateSolidBrush(RGB(0x0B, 0x6C, 0xE0));
-      RECT ar{rc.left + 4, rc.bottom - 3, rc.right - 4, rc.bottom};
-      FillRect(dc, &ar, acc);
+      HBRUSH acc = CreateSolidBrush(th.accent);
+      HPEN unob = (HPEN)GetStockObject(NULL_PEN);
+      HBRUSH wasb2 = (HBRUSH)SelectObject(dc, acc);
+      HPEN waspp = (HPEN)SelectObject(dc, unob);
+      RECT ar{rc.left + 10, rc.bottom - 3, rc.right - 10, rc.bottom - 1};
+      RoundRect(dc, ar.left, ar.top, ar.right, ar.bottom, 2, 2);
+      SelectObject(dc, wasb2);
+      SelectObject(dc, waspp);
       DeleteObject(acc);
     }
+    SetBkMode(dc, TRANSPARENT);
     HFONT was = (HFONT)SelectObject(dc, g.font);
-    SetTextColor(dc, b->pressed ? RGB(0x0B, 0x3E, 0x77) : RGB(0x40, 0x40, 0x40));
-    DrawTextW(dc, b->label.c_str(), -1, &rc, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+    SetTextColor(dc, b->pressed ? th.accent : (b->hover ? th.text : th.textDim));
+    DrawTextW(dc, b->label.c_str(), -1, &rc,
+              DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
     SelectObject(dc, was);
   }
   else
   {
-    HBRUSH bg = CreateSolidBrush(b->down   ? RGB(0xC8, 0xDC, 0xF2)
-                                 : b->hover ? RGB(0xE6, 0xEF, 0xFB)
-                                            : RGB(0xF7, 0xF8, 0xFA));
-    FillRect(dc, &rc, bg);
-    DeleteObject(bg);
-    HPEN pen = CreatePen(PS_SOLID, 1, RGB(0xD5, 0xD5, 0xD5));
-    SelectObject(dc, pen);
-    MoveToEx(dc, 0, rc.bottom - 1, nullptr);
-    LineTo(dc, rc.right, rc.bottom - 1);
-    DeleteObject(pen);
+    BOOL active = b->hover || b->down;
+    if (!b->hover && !b->down)
+    {
+      HBRUSH bg = CreateSolidBrush(th.card);
+      FillRect(dc, &rc, bg);
+      DeleteObject(bg);
+    }
+    if (active)
+    {
+      HBRUSH fill = CreateSolidBrush(b->down ? th.btnDown : th.btnHover);
+      HPEN pen = CreatePen(PS_SOLID, 1, b->down ? th.accent : th.btnBorder);
+      HBRUSH wasb = (HBRUSH)SelectObject(dc, fill);
+      HPEN wasp = (HPEN)SelectObject(dc, pen);
+      RoundRect(dc, rc.left, rc.top, rc.right, rc.bottom, R, R);
+      SelectObject(dc, wasb);
+      SelectObject(dc, wasp);
+      DeleteObject(fill);
+      DeleteObject(pen);
+    }
     SetBkMode(dc, TRANSPARENT);
-    SetTextColor(dc, RGB(0x20, 0x20, 0x20));
-    DrawTextW(dc, b->label.c_str(), -1, &rc, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+    SetTextColor(dc, b->down ? th.accent : th.text);
+    DrawTextW(dc, b->label.c_str(), -1, &rc,
+              DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
   }
   EndPaint(hw, &ps);
 }
@@ -2230,6 +2402,7 @@ static void DoCommand(int id)
     case ID_PAGE_CROP:    CropCurrentPageToContent(); break;
     case ID_EXPORT_TEXT:  ExportTextAll(); break;
     case ID_EXPORT_CSV:   ExportCsvAll(); break;
+    case ID_THEME:        ToggleTheme(); break;
     case ID_ABOUT:
       MessageBoxW(g.frame,
         L"Stitchup PDF Editor\n\nPortable PDF viewer/editor\n"
@@ -2301,6 +2474,8 @@ static HMENU BuildMenu()
   AppendMenuW(view, MF_SEPARATOR, 0, nullptr);
   addItem(view, ID_PANE_THUMBS, L"Page Thumbnails");
   addItem(view, ID_PANE_BOOKMARKS, L"Bookmarks");
+  AppendMenuW(view, MF_SEPARATOR, 0, nullptr);
+  addItem(view, ID_THEME, L"Dark Mode\tCtrl+D");
   AppendMenuW(bar, MF_POPUP, (UINT_PTR)view, L"&View");
 
   HMENU help = CreatePopupMenu();
@@ -2313,6 +2488,8 @@ static LRESULT CALLBACK FrameProc(HWND hw, UINT msg, WPARAM wp, LPARAM lp)
 {
   switch (msg)
   {
+    case WM_GETICON:
+      return (LRESULT)LoadIconW(g.inst, MAKEINTRESOURCEW(101));
     case WM_CREATE:
     {
       g.toolbar = CreateWindowExW(0, L"SKToolbar", nullptr, WS_CHILD | WS_VISIBLE,
@@ -3558,19 +3735,33 @@ static LRESULT CALLBACK ToolbarProc(HWND hw, UINT msg, WPARAM wp, LPARAM lp)
       HDC dc = BeginPaint(hw, &ps);
       RECT rc;
       GetClientRect(hw, &rc);
-      HBRUSH bg = CreateSolidBrush(RGB(0xF7, 0xF8, 0xFA));
+      const Theme& th = ThemeNow();
+      HBRUSH bg = CreateSolidBrush(th.ribbonBg);
       FillRect(dc, &rc, bg);
       DeleteObject(bg);
 
+      // brand accent strip across the very top
+      HBRUSH strip = CreateSolidBrush(th.accent);
+      RECT sr{0, 0, rc.right, 2};
+      FillRect(dc, &sr, strip);
+      DeleteObject(strip);
+
       for (const App::GroupBox& gb : g.groups)
       {
-        RECT gr{gb.rc.left, RIB_BTN_Y - 8, gb.rc.right, gb.rc.bottom};
-        HBRUSH gbbr = CreateSolidBrush(RGB(0xEF, 0xF0, 0xF3));
-        FillRect(dc, &gr, gbbr);
-        DeleteObject(gbbr);
-        RECT cap{gb.rc.left + 2, gb.rc.top, gb.rc.right - 2, gb.rc.bottom};
+        RECT card{gb.rc.left + 2, RIB_BTN_Y - 6, gb.rc.right - 2, RIB_H - 2};
+        HBRUSH fill = CreateSolidBrush(th.card);
+        HPEN pen = CreatePen(PS_SOLID, 1, th.cardBorder);
+        HBRUSH wasb = (HBRUSH)SelectObject(dc, fill);
+        HPEN wasp = (HPEN)SelectObject(dc, pen);
+        RoundRect(dc, card.left, card.top, card.right, card.bottom, 10, 10);
+        SelectObject(dc, wasb);
+        SelectObject(dc, wasp);
+        DeleteObject(fill);
+        DeleteObject(pen);
+
+        RECT cap{card.left + 4, RIB_CAP_Y, card.right - 4, RIB_H - 2};
         SetBkMode(dc, TRANSPARENT);
-        SetTextColor(dc, RGB(0x40, 0x40, 0x40));
+        SetTextColor(dc, th.textDim);
         HFONT small = CreateFontW(-MulDiv(8, g.dpi, 72), 0, 0, 0, FW_NORMAL,
                                   FALSE, FALSE, FALSE, DEFAULT_CHARSET,
                                   OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
@@ -3578,7 +3769,7 @@ static LRESULT CALLBACK ToolbarProc(HWND hw, UINT msg, WPARAM wp, LPARAM lp)
                                   L"Segoe UI");
         HFONT was = (HFONT)SelectObject(dc, small);
         DrawTextW(dc, gb.name.c_str(), -1, &cap,
-                  DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+                  DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
         SelectObject(dc, was);
         DeleteObject(small);
       }
@@ -3586,7 +3777,7 @@ static LRESULT CALLBACK ToolbarProc(HWND hw, UINT msg, WPARAM wp, LPARAM lp)
       if (GroupCount(g.ribbonTab) == 0)
       {
         SetBkMode(dc, TRANSPARENT);
-        SetTextColor(dc, RGB(0x80, 0x80, 0x80));
+        SetTextColor(dc, th.textDim);
         RECT trc{8, RIB_BTN_Y, rc.right - 8, RIB_CAP_Y};
         DrawTextW(dc,
                   L"Annotations, forms, security and advanced tools arrive in "
@@ -3594,7 +3785,7 @@ static LRESULT CALLBACK ToolbarProc(HWND hw, UINT msg, WPARAM wp, LPARAM lp)
                   -1, &trc, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
       }
 
-      HPEN pen = CreatePen(PS_SOLID, 1, RGB(0xD0, 0xD0, 0xD0));
+      HPEN pen = CreatePen(PS_SOLID, 1, th.cardBorder);
       SelectObject(dc, pen);
       MoveToEx(dc, 0, rc.bottom - 1, nullptr);
       LineTo(dc, rc.right, rc.bottom - 1);
@@ -3635,6 +3826,8 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int)
   INITCOMMONCONTROLSEX iccex{sizeof(iccex), ICC_TREEVIEW_CLASSES};
   InitCommonControlsEx(&iccex);
 
+  ApplyInitialThemePref();
+
   HWND hidden = CreateWindowExW(0, L"STATIC", L"", WS_POPUP, 0, 0, 0, 0,
                                 nullptr, nullptr, inst, nullptr);
   HDC hdc = GetDC(hidden);
@@ -3649,7 +3842,8 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int)
   wc.lpfnWndProc = FrameProc;
   wc.hInstance = inst;
   wc.lpszClassName = L"SKFrame";
-  wc.hIcon = LoadIconW(nullptr, IDI_APPLICATION);
+  wc.hIcon = LoadIconW(inst, MAKEINTRESOURCEW(101));
+  wc.hIconSm = LoadIconW(inst, MAKEINTRESOURCEW(101));
   RegisterClassExW(&wc);
 
   wc.lpfnWndProc = ToolbarProc;
@@ -3694,6 +3888,10 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int)
     return 1;
   }
   g.frame = frame;
+
+  ApplyTreeTheme();
+  CheckMenuItem(GetMenu(g.frame), ID_THEME,
+                MF_BYCOMMAND | (g_dark ? MF_CHECKED : MF_UNCHECKED));
 
   if (openFile.empty()) NewDoc();
   else LoadDoc(openFile);
