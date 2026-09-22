@@ -62,6 +62,11 @@ Produces `dist\Stitchup.exe` + `dist\pdfium.dll`.
 - Security: password-protected PDFs are detected and unlocked through a modal
   password dialog (up to 3 attempts, then an error box); wrong passwords are
   rejected by PDFium
+- Security: Save As Encrypted (File > Save As Encrypted...) writes a
+  password-protected copy of the open document (PDF revision 3 / 128-bit RC4
+  standard security handler, user + optional owner password). The saved file
+  re-opens against the bundled PDFium only with the correct password; the open
+  document is left unchanged
 - Drag & drop a PDF onto the window to open it; open via command-line argument
 - Shortcuts: Ctrl+N/O/S, Ctrl+Shift+S, Ctrl+R (rotate), Ctrl+[/Ctrl+], Delete,
   Ctrl+0/1/2 (100%/fit width/fit page), Ctrl+D (dark mode), PgUp/PgDn,
@@ -82,8 +87,8 @@ project (github.com/bblanchon/pdfium-binaries). Non-GPL build.
   single-exe build is planned but first requires building PDFium with the
   static CRT from source (the prebuilt import lib is not static).
 - Shell + annotations + link activation + page management (extract/split/
-  auto-crop) + text export + CSV export + password-unlock + watermarks are
-  done; encrypt-on-save is the next milestone. Rendering, page model,
+  auto-crop) + text export + CSV export + password-unlock + watermarks +
+  encrypt-on-save are done. Rendering, page model,
   editing operations, ribbon navigation, the bookmarks pane, annotation
   creation/persistence, link navigation and page extract/split/crop are
   functional.

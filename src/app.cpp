@@ -70,6 +70,7 @@ enum
   ID_EXPORT_CSV,
   ID_THEME,
   ID_WATERMARK,
+  ID_SAVEENC,
 };
 
 enum
@@ -1138,6 +1139,208 @@ static void SaveInPlace()
   g.dirty = false;
   LoadDoc(target);
   InvalidateRect(g.status, nullptr, TRUE);
+}
+
+static bool SaveAsString(FPDF_DOCUMENT d, std::vector<unsigned char>& out);
+static std::vector<unsigned char> EncryptPdfBytes(
+    const std::vector<unsigned char>& plain,
+    const std::string& userPw, const std::string& ownerPw);
+
+// Password-setting dialog for "Save As Encrypted...".
+static HWND g_epwEdit1 = nullptr;
+static HWND g_epwEdit2 = nullptr;
+static HWND g_epwEdit3 = nullptr;
+static bool g_epwOk = false;
+static std::wstring g_epwUser, g_epwOwner;
+
+static LRESULT CALLBACK EpwProc(HWND h, UINT m, WPARAM w, LPARAM l)
+{
+  switch (m)
+  {
+    case WM_CREATE:
+      CreateWindowExW(0, L"STATIC",
+        L"Save a password-protected copy of this PDF.",
+        WS_CHILD | WS_VISIBLE, 16, 12, 312, 18, h, nullptr, g.inst, nullptr);
+      CreateWindowExW(0, L"STATIC", L"User password:",
+        WS_CHILD | WS_VISIBLE, 16, 38, 128, 18, h, nullptr, g.inst, nullptr);
+      g_epwEdit1 = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
+        WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_PASSWORD | ES_AUTOHSCROLL,
+        150, 36, 178, 24, h, nullptr, g.inst, nullptr);
+      CreateWindowExW(0, L"STATIC", L"Confirm password:",
+        WS_CHILD | WS_VISIBLE, 16, 68, 128, 18, h, nullptr, g.inst, nullptr);
+      g_epwEdit2 = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
+        WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_PASSWORD | ES_AUTOHSCROLL,
+        150, 66, 178, 24, h, nullptr, g.inst, nullptr);
+      CreateWindowExW(0, L"STATIC", L"Owner password (optional):",
+        WS_CHILD | WS_VISIBLE, 16, 98, 128, 18, h, nullptr, g.inst, nullptr);
+      g_epwEdit3 = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
+        WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_PASSWORD | ES_AUTOHSCROLL,
+        150, 96, 178, 24, h, nullptr, g.inst, nullptr);
+      CreateWindowExW(0, L"BUTTON", L"Ok", WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_DEFPUSHBUTTON,
+        100, 136, 74, 28, h, (HMENU)1, g.inst, nullptr);
+      CreateWindowExW(0, L"BUTTON", L"Cancel", WS_CHILD | WS_VISIBLE | WS_TABSTOP,
+        186, 136, 74, 28, h, (HMENU)2, g.inst, nullptr);
+      SetFocus(g_epwEdit1);
+      return 0;
+    case WM_COMMAND:
+      if (LOWORD(w) == 1 || LOWORD(w) == 2)
+      {
+        if (LOWORD(w) == 1)
+        {
+          wchar_t b1[256], b2[256], b3[256];
+          GetWindowTextW(g_epwEdit1, b1, 256);
+          GetWindowTextW(g_epwEdit2, b2, 256);
+          GetWindowTextW(g_epwEdit3, b3, 256);
+          if (b1[0] == 0)
+          {
+            MessageBoxW(h, L"User password cannot be empty.", L"Stitchup",
+                        MB_OK | MB_ICONINFORMATION);
+            return 0;
+          }
+          if (wcscmp(b1, b2) != 0)
+          {
+            MessageBoxW(h, L"Passwords do not match.", L"Stitchup",
+                        MB_OK | MB_ICONINFORMATION);
+            return 0;
+          }
+          g_epwUser = b1;
+          g_epwOwner = b3;
+        }
+        g_epwOk = (LOWORD(w) == 1);
+        DestroyWindow(h);
+        return 0;
+      }
+      break;
+    case WM_CLOSE:
+      g_epwOk = false;
+      DestroyWindow(h);
+      return 0;
+    case WM_CTLCOLORSTATIC:
+      return (LRESULT)(HBRUSH)(COLOR_BTNFACE + 1);
+  }
+  return DefWindowProcW(h, m, w, l);
+}
+
+static bool PromptSetPassword(std::wstring& userOut, std::wstring& ownerOut)
+{
+  const wchar_t cls[] = L"SKEpwWnd";
+  static bool reg = false;
+  if (!reg)
+  {
+    WNDCLASSEXW wc{};
+    wc.cbSize = sizeof(wc);
+    wc.lpfnWndProc = EpwProc;
+    wc.hInstance = g.inst;
+    wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+    wc.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
+    wc.lpszClassName = cls;
+    RegisterClassExW(&wc);
+    reg = true;
+  }
+  g_epwEdit1 = g_epwEdit2 = g_epwEdit3 = nullptr;
+  g_epwOk = false;
+  g_epwUser.clear();
+  g_epwOwner.clear();
+  HWND hw = CreateWindowExW(WS_EX_DLGMODALFRAME, cls, L"Set password",
+                            WS_POPUP | WS_CAPTION | WS_SYSMENU,
+                            CW_USEDEFAULT, CW_USEDEFAULT, 348, 200,
+                            g.frame, nullptr, g.inst, nullptr);
+  if (!hw) return false;
+  RECT fr, rc;
+  GetWindowRect(g.frame, &fr);
+  GetWindowRect(hw, &rc);
+  SetWindowPos(hw, nullptr,
+               fr.left + (fr.right - fr.left - (rc.right - rc.left)) / 2,
+               fr.top + (fr.bottom - fr.top - (rc.bottom - rc.top)) / 2,
+               0, 0, SWP_NOSIZE | SWP_NOZORDER);
+  ShowWindow(hw, SW_SHOW);
+  UpdateWindow(hw);
+  HWND owner = g.frame;
+  EnableWindow(owner, FALSE);
+  MSG msg;
+  while (IsWindow(hw))
+  {
+    const BOOL r = GetMessageW(&msg, nullptr, 0, 0);
+    if (r <= 0) break;
+    if (!IsDialogMessageW(hw, &msg))
+    {
+      TranslateMessage(&msg);
+      DispatchMessageW(&msg);
+    }
+  }
+  EnableWindow(owner, TRUE);
+  SetActiveWindow(owner);
+  SetFocus(owner);
+  userOut = g_epwUser;
+  ownerOut = g_epwOwner;
+  return g_epwOk;
+}
+
+static void SaveAsEncrypted()
+{
+  if (!g.doc)
+  {
+    MessageBoxW(g.frame, L"No document open.", L"Stitchup", MB_OK | MB_ICONINFORMATION);
+    return;
+  }
+  std::wstring userPw, ownerPw;
+  if (!PromptSetPassword(userPw, ownerPw)) return;
+  wchar_t file[MAX_PATH] = L"";
+  OPENFILENAMEW ofn{};
+  ofn.lStructSize = sizeof(ofn);
+  ofn.hwndOwner = g.frame;
+  ofn.lpstrFilter = L"PDF Files (*.pdf)\0*.pdf\0\0";
+  ofn.lpstrFile = file;
+  ofn.nMaxFile = MAX_PATH;
+  ofn.lpstrDefExt = L"pdf";
+  ofn.Flags = OFN_OVERWRITEPROMPT | OFN_PATHMUSTEXIST | OFN_HIDEREADONLY;
+  if (!GetSaveFileNameW(&ofn)) return;
+  if (file == g.path)
+  {
+    MessageBoxW(g.frame,
+                L"Choose a different file name: the open document is not replaced.\n"
+                L"The encrypted copy is saved separately.",
+                L"Stitchup", MB_OK | MB_ICONINFORMATION);
+    return;
+  }
+  std::vector<unsigned char> buf;
+  if (!SaveAsString(g.doc, buf))
+  {
+    MessageBoxW(g.frame, L"Encrypted save failed: the document could not be serialized.",
+                L"Stitchup", MB_OK | MB_ICONWARNING);
+    return;
+  }
+  std::vector<unsigned char> enc = EncryptPdfBytes(buf, Utf8(userPw), Utf8(ownerPw));
+  if (enc.empty())
+  {
+    MessageBoxW(g.frame, L"Encrypted save failed: could not build the encrypted copy.",
+                L"Stitchup", MB_OK | MB_ICONWARNING);
+    return;
+  }
+  std::wstring tmp = std::wstring(file) + L".tmp";
+  FILE* f = nullptr;
+  if (_wfopen_s(&f, tmp.c_str(), L"wb") != 0)
+  {
+    MessageBoxW(g.frame, L"Encrypted save failed: could not write the file.",
+                L"Stitchup", MB_OK | MB_ICONWARNING);
+    return;
+  }
+  bool ok = fwrite(enc.data(), 1, enc.size(), f) == enc.size();
+  fclose(f);
+  if (!ok) { DeleteFileW(tmp.c_str()); MessageBoxW(g.frame, L"Encrypted save failed: disk write error.", L"Stitchup", MB_OK | MB_ICONWARNING); return; }
+  if (!MoveFileExW(tmp.c_str(), file, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH))
+  {
+    DWORD err = GetLastError();
+    std::wstring msg = L"Encrypted save failed: could not finalize the file.\n"
+                       L"A recovery copy was kept at:\n" + tmp;
+    if (err != ERROR_FILE_NOT_FOUND) DeleteFileW(tmp.c_str());
+    MessageBoxW(g.frame, msg.c_str(), L"Stitchup", MB_OK | MB_ICONWARNING);
+    return;
+  }
+  MessageBoxW(g.frame,
+              L"Saved encrypted PDF.\nThe open document is unchanged; reopening this "
+              L"file will ask for the password.",
+              L"Stitchup", MB_OK | MB_ICONINFORMATION);
 }
 
 static void ImportPdf()
@@ -2623,6 +2826,7 @@ static void DoCommand(int id)
     }
     case ID_SAVE:   SaveInPlace(); break;
     case ID_SAVEAS: SaveAs(); break;
+    case ID_SAVEENC: SaveAsEncrypted(); break;
     case ID_IMPORT: ImportPdf(); break;
     case ID_DELETE: DeletePage(); break;
     case ID_ADD:    AddPage(); break;
@@ -2683,6 +2887,7 @@ static HMENU BuildMenu()
   addItem(file, ID_OPEN, L"Open...\tCtrl+O");
   addItem(file, ID_SAVE, L"Save\tCtrl+S");
   addItem(file, ID_SAVEAS, L"Save As...\tCtrl+Shift+S");
+  addItem(file, ID_SAVEENC, L"Save As Encrypted...");
   addItem(file, ID_IMPORT, L"Import PDF...");
   addItem(file, ID_EXPORT_TEXT, L"Export Text...");
   addItem(file, ID_EXPORT_CSV, L"Export CSV...");
@@ -3170,14 +3375,17 @@ static void Rc4Crypt(Rc4Ctx* r, const unsigned char* in, unsigned char* out, int
   r->j = b;
 }
 
+// The 32-byte padding the Standard security handler appends to passwords
+// (ISO 32000-1, 7.6.3.3).
+static const unsigned char kPadding[32] = {
+  0x28,0xBF,0x4E,0x5E,0x4E,0x75,0x8A,0x41,0x64,0x00,0x4E,0x56,0xFF,0xFA,0x01,0x08,
+  0x2E,0x2E,0x00,0xB6,0xD0,0x68,0x3E,0x80,0x2F,0x0C,0xA9,0xFE,0x64,0x53,0x69,0x7A };
+
 // Builds an encrypted single-page PDF (Standard security handler V1) whose
 // user password is "stitchup". Variants: 1 = R2/40-bit, 2 = R3/128-bit,
 // 3 = R2/128-bit. The selftest probes each until this pdfium accepts one.
 static std::string MakeEncryptedPdf(int variant)
 {
-  static const unsigned char kPadding[32] = {
-    0x28,0xBF,0x4E,0x5E,0x4E,0x75,0x8A,0x41,0x64,0x00,0x4E,0x56,0xFF,0xFA,0x01,0x08,
-    0x2E,0x2E,0x00,0xB6,0xD0,0x68,0x3E,0x80,0x2F,0x0C,0xA9,0xFE,0x64,0x53,0x69,0x7A };
   const std::string user_pw = "stitchup";
   const std::string owner_pw = "clockwork";
   auto pad32 = [&](const std::string& pw, unsigned char out[32])
@@ -3284,6 +3492,354 @@ static std::string MakeEncryptedPdf(int variant)
   out += "\n%%EOF\n";
   return out;
 }
+
+// ---------------------------------------------------------------------------
+// Encrypt-on-save: rewrites a serialized PDF into a password-protected copy
+// using the Standard security handler (V2/R3, 128-bit RC4). The byte layout
+// mirrors what pdfium's own SetPassword produces, so this pdfium build can
+// reopen the file with FPDF_LoadDocument(userPassword). RC4 preserves stream
+// length, so existing /Length values remain valid after encryption.
+// ---------------------------------------------------------------------------
+
+static void Md5Once(const void* data, size_t len, unsigned char out[16])
+{
+  Md5Ctx m;
+  Md5Init(&m);
+  Md5Update(&m, static_cast<const unsigned char*>(data), len);
+  Md5Final(&m, out);
+}
+
+static void Rc4One(const unsigned char key[16], unsigned char* data, size_t len)
+{
+  Rc4Ctx r;
+  Rc4Init(&r, key, 16);
+  Rc4Crypt(&r, data, data, (int)len);
+}
+
+static void PadPassword(const std::string& pw, unsigned char out[32])
+{
+  const size_t n = pw.size();
+  for (size_t i = 0; i < 32; i++)
+    out[i] = i < n ? (unsigned char)pw[i] : kPadding[i - n];
+}
+
+static void RandomFileId(unsigned char id[16])
+{
+  // xorshift64* seeded from timer/process state (nondeterministic enough for a
+  // file identifier; the encryption itself does not rely on this value).
+  FILETIME ft;
+  GetSystemTimeAsFileTime(&ft);
+  unsigned long long x =
+      ((unsigned long long)ft.dwHighDateTime << 32) | ft.dwLowDateTime;
+  x ^= (unsigned long long)GetTickCount64();
+  x ^= (unsigned long long)GetCurrentProcessId() << 32;
+  x ^= reinterpret_cast<unsigned long long>(&x) >> 3;
+  if (!x) x = 1ULL;
+  auto next = [&]() {
+    x ^= x >> 12; x ^= x << 25; x ^= x >> 27;
+    return x * 0x2545F4914F6CDD1DULL;
+  };
+  for (int i = 0; i < 16; i++)
+    id[i] = (unsigned char)(next() >> ((i & 7) * 8));
+}
+
+// Builds the R3 file key and the O/U entries. The U entry follows the chained
+// RC4 algorithm (ISO 32000-1 7.6.3.4) that pdfium's CheckUserPassword expects.
+static bool BuildR3Keys(const std::string& userPw, const std::string& ownerPw,
+                        const unsigned char id[16], unsigned char fileKey[16],
+                        unsigned char O[32], unsigned char U[32])
+{
+  const std::string owner = ownerPw.empty() ? userPw : ownerPw;
+  unsigned char pad_o[32], pad_u[32];
+  PadPassword(owner, pad_o);
+  PadPassword(userPw, pad_u);
+
+  // O (Algorithm 3.3): 50x MD5(pad_owner), then RC4(key, pad_owner).
+  unsigned char F[16];
+  Md5Once(pad_o, 32, F);
+  for (int i = 0; i < 50; i++) Md5Once(F, 16, F);
+  Rc4One(F, pad_o, 32);
+  memcpy(O, pad_o, 32);
+
+  // File key (Algorithm 3.4): MD5(pad_user || O || P_le || ID), then 50x MD5.
+  const unsigned char P_le[4] = { 0xFC, 0xFF, 0xFF, 0xFF };
+  {
+    Md5Ctx m;
+    Md5Init(&m);
+    Md5Update(&m, pad_u, 32);
+    Md5Update(&m, O, 32);
+    Md5Update(&m, P_le, 4);
+    Md5Update(&m, id, 16);
+    Md5Final(&m, fileKey);
+  }
+  for (int i = 0; i < 50; i++) Md5Once(fileKey, 16, fileKey);
+
+  // U (Algorithm 3.5): start with MD5(pad || ID), then RC4 passes over the
+  // first 16 bytes: first with the file key, then with key XOR 1..19. The
+  // trailing 16 bytes are MD5 of the transformed first 16 (pdfium style).
+  {
+    Md5Ctx m;
+    Md5Init(&m);
+    Md5Update(&m, kPadding, 32);
+    Md5Update(&m, id, 16);
+    Md5Final(&m, U);
+  }
+  Rc4One(fileKey, U, 16);
+  for (int i = 1; i <= 19; i++)
+  {
+    unsigned char k2[16];
+    for (int j = 0; j < 16; j++) k2[j] = fileKey[j] ^ (unsigned char)i;
+    Rc4One(k2, U, 16);
+  }
+  Md5Once(U, 16, U + 16);
+  return true;
+}
+
+static bool BytesAt(const std::vector<unsigned char>& b, size_t at, const char* w)
+{
+  for (size_t i = 0; w[i]; i++)
+    if (at + i >= b.size() || b[at + i] != (unsigned char)w[i]) return false;
+  return true;
+}
+
+static size_t SearchToken(const std::vector<unsigned char>& b, size_t from, const char* w)
+{
+  const size_t n = strlen(w);
+  for (size_t i = from; i + n <= b.size(); i++)
+    if (BytesAt(b, i, w)) return i;
+  return (size_t)-1;
+}
+
+static bool ParseRef(const std::vector<unsigned char>& b, size_t from, const char* key,
+                     unsigned int* numOut)
+{
+  size_t k = SearchToken(b, from, key);
+  if (k == (size_t)-1) return false;
+  size_t p = k + strlen(key);
+  while (p < b.size() && (b[p] == ' ' || b[p] == '\t' || b[p] == '\r' || b[p] == '\n')) p++;
+  unsigned int num = 0;
+  size_t d = p;
+  while (d < b.size() && b[d] >= '0' && b[d] <= '9') { num = num * 10 + (b[d] - '0'); d++; }
+  if (d == p) return false;
+  *numOut = num;
+  return true;
+}
+
+// Rewrites the object body [body, end) into 'out', encrypting every literal
+// string, hex string and stream with the object key (RC4, length preserving).
+static void EmitEncryptedBody(const std::vector<unsigned char>& plain, size_t body,
+                              size_t end, const unsigned char objKey[16],
+                              std::vector<unsigned char>& out)
+{
+  size_t p = body;
+  const size_t n = end;
+  while (p < n)
+  {
+    const unsigned char c = plain[p];
+    if (c == '(')
+    {
+      int depth = 1;
+      size_t q = p + 1;
+      for (; q < n && depth; q++)
+      {
+        if (plain[q] == '\\' && q + 1 < n) { q++; continue; }
+        if (plain[q] == '(') depth++;
+        else if (plain[q] == ')') depth--;
+      }
+      out.push_back('(');
+      std::vector<unsigned char> tmp(plain.begin() + p + 1, plain.begin() + std::min(q, n));
+      Rc4One(objKey, tmp.data(), tmp.size());
+      out.insert(out.end(), tmp.begin(), tmp.end());
+      out.push_back(')');
+      p = q;
+      continue;
+    }
+    if (c == '<' && p + 1 < n && plain[p + 1] == '<') { out.push_back('<'); out.push_back('<'); p += 2; continue; }
+    if (c == '>' && p + 1 < n && plain[p + 1] == '>') { out.push_back('>'); out.push_back('>'); p += 2; continue; }
+    if (c == '<')
+    {
+      size_t q = p + 1;
+      while (q < n && plain[q] != '>') q++;
+      if (q >= n) { out.push_back('<'); p++; continue; }
+      std::vector<unsigned char> bytes;
+      int hi = -1;
+      for (size_t k2 = p + 1; k2 < q; k2++)
+      {
+        const unsigned char h = plain[k2];
+        int v = -1;
+        if (h >= '0' && h <= '9') v = h - '0';
+        else if (h >= 'A' && h <= 'F') v = h - 'A' + 10;
+        else if (h >= 'a' && h <= 'f') v = h - 'a' + 10;
+        if (v < 0) continue;
+        if (hi < 0) hi = v;
+        else { bytes.push_back((unsigned char)((hi << 4) | v)); hi = -1; }
+      }
+      if (hi >= 0) bytes.push_back((unsigned char)(hi << 4));
+      Rc4One(objKey, bytes.data(), bytes.size());
+      out.push_back('<');
+      static const char* hx = "0123456789ABCDEF";
+      for (unsigned char b : bytes) { out.push_back((unsigned char)hx[b >> 4]); out.push_back((unsigned char)hx[b & 15]); }
+      out.push_back('>');
+      p = q + 1;
+      continue;
+    }
+    if (c == 's' && BytesAt(plain, p, "stream"))
+    {
+      // A real stream keyword is a bare token: preceded by EOL / '>>' / space
+      // (so names like /FileStream are not matched), followed optionally by an
+      // EOL whose presence is not required (pdfium sometimes emits the data
+      // directly after the keyword).
+      const bool prevOk = p == body ||
+          plain[p - 1] == '\n' || plain[p - 1] == '\r' ||
+          plain[p - 1] == '>' || plain[p - 1] == ' ';
+      if (!prevOk) { out.push_back('s'); p++; continue; }
+      size_t q = p + 6;
+      if (q < n && (plain[q] == '\r' || plain[q] == '\n'))
+      {
+        if (plain[q] == '\r') q++;
+        if (q < n && plain[q] == '\n') q++;
+      }
+      size_t es = SearchToken(plain, q, "endstream");
+      if (es == (size_t)-1) { out.insert(out.end(), plain.begin() + p, plain.begin() + n); break; }
+      out.insert(out.end(), plain.begin() + p, plain.begin() + q);
+      std::vector<unsigned char> tmp(plain.begin() + q, plain.begin() + es);
+      Rc4One(objKey, tmp.data(), tmp.size());
+      out.insert(out.end(), tmp.begin(), tmp.end());
+      const size_t esEnd = std::min(n, es + 9);
+      out.insert(out.end(), plain.begin() + es, plain.begin() + esEnd);
+      p = esEnd;
+      continue;
+    }
+    out.push_back(c);
+    p++;
+  }
+}
+
+// Returns an empty vector on failure.
+static std::vector<unsigned char> EncryptPdfBytes(
+    const std::vector<unsigned char>& plain,
+    const std::string& userPw, const std::string& ownerPw)
+{
+  std::vector<unsigned char> out;
+  const size_t n = plain.size();
+  if (n < 16) return out;
+
+  // File ID + encryption keys.
+  unsigned char id[16];
+  RandomFileId(id);
+  unsigned char fileKey[16], O[32], U[32];
+  if (!BuildR3Keys(userPw, ownerPw, id, fileKey, O, U)) return out;
+
+  size_t hdr = 0;
+  while (hdr < n && plain[hdr] != '\n') hdr++;
+  if (hdr >= n) return out;
+  out.insert(out.end(), plain.begin(), plain.begin() + std::min(n, hdr + 1));
+
+  // Collect object spans: "N G obj\n ... \nendobj".
+  struct ObjSpan { size_t num; size_t gen; size_t body; size_t end; };
+  std::vector<ObjSpan> objs;
+  std::map<size_t, size_t> offByNum;
+  size_t pos = hdr + 1;
+  size_t maxNum = 0;
+  while (pos < n)
+  {
+    while (pos < n && (plain[pos] == ' ' || plain[pos] == '\t' || plain[pos] == '\r' || plain[pos] == '\n')) pos++;
+    if (pos < n && plain[pos] == '%') { while (pos < n && plain[pos] != '\n') pos++; continue; }
+    if (pos >= n || plain[pos] < '0' || plain[pos] > '9') break;
+    size_t num = 0, q = pos;
+    while (q < n && plain[q] >= '0' && plain[q] <= '9') { num = num * 10 + (plain[q] - '0'); q++; }
+    while (q < n && (plain[q] == ' ' || plain[q] == '\t' || plain[q] == '\r' || plain[q] == '\n')) q++;
+    size_t gen = 0;
+    while (q < n && plain[q] >= '0' && plain[q] <= '9') { gen = gen * 10 + (plain[q] - '0'); q++; }
+    while (q < n && (plain[q] == ' ' || plain[q] == '\t' || plain[q] == '\r' || plain[q] == '\n')) q++;
+    if (!BytesAt(plain, q, "obj")) break;
+    size_t body = q + 3;
+    while (body < n && plain[body] == '\r') body++;
+    if (body < n && plain[body] == '\n') body++;
+    size_t e = SearchToken(plain, body, "endobj");
+    if (e == (size_t)-1) break;
+    objs.push_back({ num, gen, body, e });
+    if (num > maxNum) maxNum = num;
+    pos = e + 6;
+  }
+  if (objs.empty()) return out;
+  const size_t tail = pos;
+
+  // Rebuild root/info object references from the original trailer.
+  unsigned int rootNum = 1, infoNum = 0;
+  if (!ParseRef(plain, tail, "/Root", &rootNum)) return out;
+  ParseRef(plain, tail, "/Info", &infoNum);
+
+  const size_t encNum = maxNum + 1;
+  const size_t objCount = encNum + 1;  // objects 0..encNum inclusive
+
+  for (size_t i = 0; i < objs.size(); i++)
+  {
+    const ObjSpan& s = objs[i];
+    const size_t objNo = s.num, genNo = s.gen;
+    offByNum[objNo] = out.size();
+    char head[40];
+    std::snprintf(head, sizeof(head), "%zu %zu obj\n", objNo, genNo);
+    const char* hh = head;
+    out.insert(out.end(), hh, hh + strlen(head));
+
+    unsigned char mat[21];
+    memcpy(mat, fileKey, 16);
+    mat[16] = (unsigned char)(objNo & 0xff);
+    mat[17] = (unsigned char)((objNo >> 8) & 0xff);
+    mat[18] = (unsigned char)((objNo >> 16) & 0xff);
+    mat[19] = (unsigned char)(genNo & 0xff);
+    mat[20] = (unsigned char)((genNo >> 8) & 0xff);
+    unsigned char objKey[16];
+    Md5Once(mat, 21, objKey);  // truncated to min(16+5, 16) = 16 bytes
+
+    EmitEncryptedBody(plain, s.body, s.end, objKey, out);
+    static const char kEndObj[] = "endobj\n";
+    out.insert(out.end(), kEndObj, kEndObj + sizeof(kEndObj) - 1);
+  }
+
+  // The /Encrypt dictionary itself is never encrypted.
+  offByNum[encNum] = out.size();
+  char encHead[32];
+  std::snprintf(encHead, sizeof(encHead), "%zu 0 obj\n", encNum);
+  const char* eh = encHead;
+  out.insert(out.end(), eh, eh + strlen(encHead));
+
+  auto hexRow = [](const unsigned char* b, size_t len) {
+    static const char* hx = "0123456789ABCDEF";
+    std::string s;
+    for (size_t i = 0; i < len; i++) { s += hx[b[i] >> 4]; s += hx[b[i] & 15]; }
+    return s;
+  };
+  std::string encDict = "<< /Filter /Standard /V 2 /R 3 /Length 128 "
+                        "/O <" + hexRow(O, 32) + "> /U <" + hexRow(U, 32) + "> /P -4 >>\nendobj\n";
+  out.insert(out.end(), encDict.begin(), encDict.end());
+
+  // Fresh xref + trailer.
+  const size_t xrefOff = out.size();
+  std::string xref = "xref\n0 " + std::to_string(objCount) + "\n0000000000 65535 f \n";
+  for (size_t i = 1; i <= encNum; i++)
+  {
+    auto it2 = offByNum.find(i);
+    char line[32];
+    if (it2 != offByNum.end())
+      std::snprintf(line, sizeof(line), "%010zu 00000 n \n", it2->second);
+    else
+      std::snprintf(line, sizeof(line), "%010zu 00000 n \n", (size_t)0);
+    xref += line;
+  }
+  std::string trailer = "trailer\n<< /Size " + std::to_string(objCount) +
+                        " /Root " + std::to_string(rootNum) + " 0 R";
+  if (infoNum) trailer += " /Info " + std::to_string(infoNum) + " 0 R";
+  trailer += " /Encrypt " + std::to_string(encNum) + " 0 R /ID [<" +
+             hexRow(id, 16) + "> <" + hexRow(id, 16) + ">] >>\n";
+  out.insert(out.end(), xref.begin(), xref.end());
+  out.insert(out.end(), trailer.begin(), trailer.end());
+  std::string tailText = "startxref\n" + std::to_string(xrefOff) + "\n%%EOF\n";
+  out.insert(out.end(), tailText.begin(), tailText.end());
+  return out;
+}
+
 static bool SaveAsString(FPDF_DOCUMENT d, std::vector<unsigned char>& out)
 {
   FileWriter fw{};
@@ -3903,6 +4459,65 @@ check("saved %PDF header", bytes.size() > 8 &&
       FPDF_DOCUMENT disk = FPDF_LoadDocument(Utf8(ef).c_str(), "stitchup");
       check("enc: disk fixture opens with correct password", disk != nullptr);
       if (disk) FPDF_CloseDocument(disk);
+    }
+  }
+
+  {
+    // Encrypt-on-save writer: a pdfium-serialized document is encrypted and
+    // must reopen with the user password (proves per-object RC4 keys, the
+    // chained U entry and the rebuilt xref/trailer).
+    FPDF_DOCUMENT esrc = FPDF_LoadMemDocument(sample.data(), (int)sample.size(), nullptr);
+    check("epw: source loads", esrc != nullptr);
+    std::vector<unsigned char> eplain;
+    bool eser = esrc && SaveAsString(esrc, eplain);
+    check("epw: source serializes", eser);
+    if (esrc) FPDF_CloseDocument(esrc);
+    std::vector<unsigned char> eenc = EncryptPdfBytes(eplain, "s3cret", "ownerpw");
+    check("epw: writer produced output", !eenc.empty());
+    if (!eplain.empty() && !eenc.empty())
+      check("epw: bytes differ from plaintext", eplain != eenc);
+    const std::string estr(eenc.begin(), eenc.end());
+    check("epw: /Encrypt in output", estr.find("/Encrypt") != std::string::npos);
+    check("epw: /Filter /Standard present",
+          estr.find("/Filter /Standard") != std::string::npos);
+    check("epw: V2 R3 128 present",
+          estr.find("/V 2 /R 3 /Length 128") != std::string::npos);
+    check("epw: user password not stored in clear",
+          estr.find("s3cret") == std::string::npos);
+    FPDF_DOCUMENT eok = FPDF_LoadMemDocument(eenc.data(), (int)eenc.size(), "s3cret");
+    check("epw: opens with correct password", eok != nullptr);
+    if (eok)
+    {
+      checkEq("epw: page count", FPDF_GetPageCount(eok), 1);
+      check("epw: stream decrypted (text run)",
+            DocTextRaw(eok).find(L"Stitchup PDF Editor") != std::wstring::npos);
+      FPDF_CloseDocument(eok);
+    }
+    FPDF_DOCUMENT ebad = FPDF_LoadMemDocument(eenc.data(), (int)eenc.size(), "wrongpass");
+    check("epw: wrong password rejected", ebad == nullptr);
+    check("epw: wrong password is PASSWORD error",
+          ebad == nullptr && FPDF_GetLastError() == FPDF_ERR_PASSWORD);
+    if (ebad) FPDF_CloseDocument(ebad);
+    FPDF_DOCUMENT enone = FPDF_LoadMemDocument(eenc.data(), (int)eenc.size(), nullptr);
+    check("epw: empty password rejected", enone == nullptr);
+    if (enone) FPDF_CloseDocument(enone);
+    wchar_t tp5[MAX_PATH];
+    GetTempPathW(MAX_PATH, tp5);
+    std::wstring epwf = std::wstring(tp5) + L"stitchup_encwrite_test.pdf";
+    FILE* fe2 = nullptr;
+    bool ewrote = false;
+    if (_wfopen_s(&fe2, epwf.c_str(), L"wb") == 0 && fe2)
+    {
+      ewrote = fwrite(eenc.data(), 1, eenc.size(), fe2) == eenc.size();
+      fclose(fe2);
+    }
+    check("epw: disk fixture written",
+          ewrote && GetFileAttributesW(epwf.c_str()) != INVALID_FILE_ATTRIBUTES);
+    if (ewrote)
+    {
+      FPDF_DOCUMENT edge = FPDF_LoadDocument(Utf8(epwf).c_str(), "s3cret");
+      check("epw: disk fixture opens with correct password", edge != nullptr);
+      if (edge) FPDF_CloseDocument(edge);
     }
   }
 

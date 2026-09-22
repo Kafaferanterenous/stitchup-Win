@@ -21,7 +21,7 @@ user rejected as a product (no GUI).
 
 Command: `Stitchup.exe --self-test`
 
-Result: **141 passed, 0 failed** (exit code 0).
+Result: **157 passed, 0 failed** (exit code 0).
 
 Coverage: PDFium init; create doc + add page; save to buffer (PDF header and
 `%%EOF` trailer checks); reopen roundtrip; page count; load sample PDF (612x792);
@@ -65,10 +65,25 @@ column.
   watermark; a watermarked doc saves and round-trips with the watermark
   retained, and the same holds for a doc re-opened from disk after
   watermarking.
+- Encrypt-on-save (`EncryptPdfBytes`, PDF revision 3 / 128-bit RC4 standard
+  security handler): the writer produces output from a source document, the
+  bytes differ from the plaintext, and the output carries `/Encrypt`, the
+  `/Filter /Standard` handler, `/V 2 /R 3 /Length 128`, and the user password
+  is not stored in the clear. The encrypted file reopens against the bundled
+  PDFium with the correct password (page count = 1, the content stream
+  decrypts and yields the sample text run "Stitchup PDF Editor"), while a
+  wrong password returns `FPDF_ERR_PASSWORD`, an empty password is rejected,
+  and a copy written to disk reopens with the same password. Key derivation
+  follows the ISO/PDFium chain: `U` is built from 20 chained RC4 passes
+  (`key, key^1 .. key^19`) over `MD5(padding||ID)[0..16]` with
+  `U[16..32] = MD5(U[0..16])`, `O` = 50x MD5(pad_owner) then RC4, the file key
+  = `MD5(pad_u || O || P(-4) || ID)` followed by 50x MD5, and each content
+  object is encrypted with `MD5(fileKey[0..15] || objnum_LSB || gen_LSB)`
+  truncated to the key length.
 
 `test_result.txt` (SHA-256 of the run captured in the report):
 ```
--- enter -- ... SUMMARY 141 passed, 0 failed
+-- enter -- ... SUMMARY 157 passed, 0 failed
 ```
 
 GUI verification (programmatic, window handles + messages):
@@ -124,6 +139,14 @@ GUI verification (programmatic, window handles + messages):
   A pixel probe of the toolbar (window DC, `GetPixel`) confirms both palettes
   render: light = accent strip `0B6CE0` / ribbon `F7F8FA` / card `EFF0F3`,
   dark = accent strip `4CA0FF` / ribbon `202020` / card `282828`).
+- Encrypt-on-save (File > Save As Encrypted, menu id 4037): the command opens
+  the `SKEpwWnd` "Set password" dialog with three ES_PASSWORD entries (user,
+  confirm, optional owner) and Ok = id 1 / Cancel = id 2; a mismatched confirm
+  shows the "Passwords do not match." box and the dialog stays open; an empty
+  user password is rejected; matching non-empty passwords with an owner
+  password close the dialog and open the Save As dialog in the app process
+  ("Save As", class `#32770`), which cancels cleanly and leaves the frame
+  healthy with the document still open.
 - App icon: `ExtractAssociatedIcon` on the built exe yields the embedded
   multi-size icon (16/24/32/48/256, generated programmatically as
   `resources/app.ico`, compiled via `resources/app.rc`).
@@ -155,7 +178,7 @@ No CRT DLLs (static `/MT` linked). Portable package = `Stitchup.exe` +
 
 | File           | Size     | SHA-256                                                           |
 |----------------|----------|-------------------------------------------------------------------|
-| Stitchup.exe   | 395,776 B | A1DE73FF6A9C353604A84FC1624A9C62C039DB37497451327186C73EFAED71DC |
+| Stitchup.exe   | 430,080 B | 922461646405781DEBE1E7B8465717E257D535C3ECE42686F43AF562B4B30719 |
 | pdfium.dll     | 7,375,360 B | 55E7EBEF29A1EC9523D1ADB8B260A73E7DFB0F64D3F0285121D20ECD6148EF18 |
 | example.pdf    | 1,034 B   | B276682EFD75780E462C17489176D710AD1339D84E69C6218AD3C2F8E60FC132 |
 | app.ico        | 20,597 B  | 5FB009C7A83254FBCD81C205492E03A683EDB0BA65B6E44962614B06A240CA44 |
@@ -189,8 +212,12 @@ box); the Save-in-place file-replace bug is fixed. Watermarks now done
 (File > Watermark stamps every page at 36 pt / 45 degrees / filler gray /
 50% alpha, prefilled "Confidential", with size 16-96 pt and Center / Top /
 Tiled placements; verified end-to-end through the saved file's content
-streams). Remaining Phase C: encrypt-on-save.
-Self-test 141/141. User verdict pending — open `dist\Stitchup.exe file.pdf` and
+streams). Encrypt-on-save now done (File > Save As Encrypted writes a
+PDF revision 3 / 128-bit RC4 password-protected copy with user + optional
+owner passwords; verified end-to-end, including reopening the encrypted file
+against the bundled PDFium with the correct password). Phase C COMPLETE —
+no remaining feature milestones.
+Self-test 157/157. User verdict pending — open `dist\Stitchup.exe file.pdf` and
 try Home > Annotate, click any PDF link, Home > Pages (Extract / Split /
-Auto-Crop), File > Export Text / Export CSV, File > Watermark, and open a
-password-protected PDF.
+Auto-Crop), File > Export Text / Export CSV, File > Watermark, File > Save As
+Encrypted, and open a password-protected PDF.
