@@ -21,6 +21,7 @@
 #pragma warning(pop)
 
 #include <cstdio>
+#include <cstdlib>
 #include <cwchar>
 #include <cmath>
 #include <algorithm>
@@ -68,6 +69,7 @@ enum
   ID_EXPORT_TEXT,
   ID_EXPORT_CSV,
   ID_THEME,
+  ID_WATERMARK,
 };
 
 enum
@@ -779,6 +781,253 @@ static void ExportCsvAll()
     else
       MessageBoxW(g.frame, L"Export failed.", L"Export CSV", MB_OK | MB_ICONERROR);
   }
+}
+
+// ---------------------------------------------------------------------------
+// Watermark
+// ---------------------------------------------------------------------------
+enum { WMDP_CENTER = 0, WMDP_TOP = 1, WMDP_TILED = 2 };
+
+static bool ApplyWatermarkDoc(FPDF_DOCUMENT doc, const wchar_t* text,
+                              float sizePts, int mode)
+{
+  if (!doc || !text || !text[0] || sizePts <= 0) return false;
+  CheckLib();
+  const int np = FPDF_GetPageCount(doc);
+  if (np < 1) return false;
+  const double rad = 45.0 * 3.14159265358979323846 / 180.0;
+  const float co = static_cast<float>(cos(rad));
+  const float si = static_cast<float>(sin(rad));
+  const unsigned short* u16 = reinterpret_cast<const unsigned short*>(text);
+  bool any = false;
+  for (int i = 0; i < np; ++i)
+  {
+    FPDF_PAGE page = FPDF_LoadPage(doc, i);
+    if (!page) continue;
+    const float pw = FPDF_GetPageWidthF(page);
+    const float ph = FPDF_GetPageHeightF(page);
+    if (pw <= 0 || ph <= 0) { FPDF_ClosePage(page); continue; }
+    int inserted = 0;
+    auto placeOne = [&](float tx, float ty, bool rotate) {
+      FPDF_PAGEOBJECT obj = FPDFPageObj_NewTextObj(doc, "Helvetica", sizePts);
+      if (!obj) return;
+      if (!FPDFText_SetText(obj, u16)) { FPDFPageObj_Destroy(obj); return; }
+      FS_MATRIX m{};
+      if (rotate) { m.a = co; m.b = si; m.c = -si; m.d = co; }
+      else { m.a = 1; m.d = 1; }
+      FPDFPageObj_SetMatrix(obj, &m);
+      float l = 0, b = 0, r = 0, t = 0;
+      bool gb = FPDFPageObj_GetBounds(obj, &l, &b, &r, &t);
+      if (gb)
+      {
+        m.e = tx - (l + r) / 2;
+        m.f = ty - (b + t) / 2;
+        FPDFPageObj_SetMatrix(obj, &m);
+      }
+      FPDFPageObj_SetFillColor(obj, 140, 140, 140, 128);
+      FPDFPage_InsertObject(page, obj);
+      ++inserted;
+    };
+    if (mode == WMDP_TILED)
+    {
+      const float step = sizePts * 2.5f;
+      for (float gx = -ph; gx < pw + ph; gx += step)
+        for (float gy = -pw; gy < ph + pw; gy += step)
+          placeOne(gx, gy, true);
+    }
+    else if (mode == WMDP_TOP)
+    {
+      placeOne(pw / 2, ph - 30, false);
+    }
+    else
+    {
+      placeOne(pw / 2, ph / 2, true);
+    }
+    if (inserted > 0 && FPDFPage_GenerateContent(page)) any = true;
+    FPDF_ClosePage(page);
+  }
+  return any;
+}
+
+struct WmCtx
+{
+  HWND edit = nullptr, size = nullptr, pos = nullptr;
+  bool ok = false;
+  std::wstring text;
+  int sizeSel = 2;   // default 36 pt
+  int posSel = 0;    // default center diagonal
+};
+static const int kWmSizes[] = { 16, 24, 36, 48, 64, 96 };
+
+static LRESULT CALLBACK WmProc(HWND h, UINT m, WPARAM w, LPARAM l)
+{
+  switch (m)
+  {
+    case WM_CREATE:
+    {
+      WmCtx* ctx = reinterpret_cast<WmCtx*>(
+        reinterpret_cast<CREATESTRUCTW*>(l)->lpCreateParams);
+      SetWindowLongPtrW(h, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(ctx));
+      CreateWindowExW(0, L"STATIC", L"Watermark text:",
+                      WS_CHILD | WS_VISIBLE, 16, 14, 140, 16, h, nullptr, g.inst, nullptr);
+      ctx->edit = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
+                                  WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL,
+                                  16, 32, 312, 24, h, nullptr, g.inst, nullptr);
+      CreateWindowExW(0, L"STATIC", L"Size (pt):",
+                      WS_CHILD | WS_VISIBLE, 16, 66, 120, 16, h, nullptr, g.inst, nullptr);
+      ctx->size = CreateWindowExW(0, L"COMBOBOX", L"",
+                                  WS_CHILD | WS_VISIBLE | WS_TABSTOP | CBS_DROPDOWNLIST,
+                                  140, 64, 120, 130, h, nullptr, g.inst, nullptr);
+      for (int n : kWmSizes)
+      {
+        std::wstring s = std::to_wstring(n);
+        SendMessageW(ctx->size, CB_ADDSTRING, 0, (LPARAM)s.c_str());
+      }
+      SendMessageW(ctx->size, CB_SETCURSEL, ctx->sizeSel, 0);
+      CreateWindowExW(0, L"STATIC", L"Position:",
+                      WS_CHILD | WS_VISIBLE, 16, 98, 100, 16, h, nullptr, g.inst, nullptr);
+      ctx->pos = CreateWindowExW(0, L"COMBOBOX", L"",
+                                 WS_CHILD | WS_VISIBLE | WS_TABSTOP | CBS_DROPDOWNLIST,
+                                 140, 96, 160, 130, h, nullptr, g.inst, nullptr);
+      SendMessageW(ctx->pos, CB_ADDSTRING, 0, (LPARAM)L"Center (diagonal)");
+      SendMessageW(ctx->pos, CB_ADDSTRING, 0, (LPARAM)L"Top center");
+      SendMessageW(ctx->pos, CB_ADDSTRING, 0, (LPARAM)L"Tiled (diagonal)");
+      SendMessageW(ctx->pos, CB_SETCURSEL, ctx->posSel, 0);
+      CreateWindowExW(0, L"BUTTON", L"Ok",
+                      WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_DEFPUSHBUTTON,
+                      100, 136, 74, 28, h, (HMENU)1, g.inst, nullptr);
+      CreateWindowExW(0, L"BUTTON", L"Cancel",
+                      WS_CHILD | WS_VISIBLE | WS_TABSTOP,
+                      186, 136, 74, 28, h, (HMENU)2, g.inst, nullptr);
+      SetFocus(ctx->edit);
+      SetWindowTextW(ctx->edit, L"Confidential");
+      return 0;
+    }
+    case WM_COMMAND:
+      if (LOWORD(w) == 1 || LOWORD(w) == 2)
+      {
+        WmCtx* ctx = reinterpret_cast<WmCtx*>(
+          GetWindowLongPtrW(h, GWLP_USERDATA));
+        if (ctx)
+        {
+          if (LOWORD(w) == 1)
+          {
+            wchar_t buf[512] = { 0 };
+            ctx->text = GetWindowTextW(ctx->edit, buf, 512) > 0 ? buf : L"";
+            ctx->sizeSel = (int)SendMessageW(ctx->size, CB_GETCURSEL, 0, 0);
+            ctx->posSel = (int)SendMessageW(ctx->pos, CB_GETCURSEL, 0, 0);
+          }
+          ctx->ok = (LOWORD(w) == 1);
+        }
+        DestroyWindow(h);
+        return 0;
+      }
+      break;
+    case WM_CLOSE:
+    {
+      WmCtx* ctx = reinterpret_cast<WmCtx*>(
+        GetWindowLongPtrW(h, GWLP_USERDATA));
+      if (ctx) ctx->ok = false;
+      DestroyWindow(h);
+      return 0;
+    }
+    case WM_CTLCOLORSTATIC:
+      return (LRESULT)(HBRUSH)(COLOR_BTNFACE + 1);
+  }
+  return DefWindowProcW(h, m, w, l);
+}
+
+static bool PromptWatermark(std::wstring& text, float& sizePts, int& mode)
+{
+  const wchar_t cls[] = L"SKWmWnd";
+  static bool reg = false;
+  if (!reg)
+  {
+    WNDCLASSEXW wc{};
+    wc.cbSize = sizeof(wc);
+    wc.lpfnWndProc = WmProc;
+    wc.hInstance = g.inst;
+    wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+    wc.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
+    wc.lpszClassName = cls;
+    RegisterClassExW(&wc);
+    reg = true;
+  }
+  WmCtx ctx;
+  HWND hw = CreateWindowExW(WS_EX_DLGMODALFRAME, cls, L"Watermark",
+                            WS_POPUP | WS_CAPTION | WS_SYSMENU,
+                            CW_USEDEFAULT, CW_USEDEFAULT, 352, 212,
+                            g.frame, nullptr, g.inst, &ctx);
+  if (!hw) return false;
+  RECT fr, rc;
+  GetWindowRect(g.frame, &fr);
+  GetWindowRect(hw, &rc);
+  SetWindowPos(hw, nullptr,
+               fr.left + (fr.right - fr.left - (rc.right - rc.left)) / 2,
+               fr.top + (fr.bottom - fr.top - (rc.bottom - rc.top)) / 2,
+               0, 0, SWP_NOSIZE | SWP_NOZORDER);
+  ShowWindow(hw, SW_SHOW);
+  UpdateWindow(hw);
+  HWND owner = g.frame;
+  EnableWindow(owner, FALSE);
+  MSG msg;
+  while (IsWindow(hw))
+  {
+    const BOOL r = GetMessageW(&msg, nullptr, 0, 0);
+    if (r <= 0) break;
+    if (!IsDialogMessageW(hw, &msg))
+    {
+      TranslateMessage(&msg);
+      DispatchMessageW(&msg);
+    }
+  }
+  EnableWindow(owner, TRUE);
+  SetActiveWindow(owner);
+  SetFocus(owner);
+  text = ctx.text;
+  if (ctx.sizeSel >= 0 && ctx.sizeSel < 6) sizePts = (float)kWmSizes[ctx.sizeSel];
+  else sizePts = 36.0f;
+  mode = (ctx.posSel == 1) ? WMDP_TOP : (ctx.posSel == 2) ? WMDP_TILED : WMDP_CENTER;
+  return ctx.ok;
+}
+
+static void WatermarkCurrentDoc()
+{
+  static bool active = false;
+  if (active) return;
+  active = true;
+  struct WmGuard
+  {
+    bool& f;
+    ~WmGuard() { f = false; }
+  } guard{active};
+  if (!g.doc || FPDF_GetPageCount(g.doc) < 1)
+  {
+    MessageBoxW(g.frame, L"No document open.", L"Watermark", MB_OK | MB_ICONINFORMATION);
+    return;
+  }
+  std::wstring text;
+  float sizePts = 36.0f;
+  int mode = WMDP_CENTER;
+  if (!PromptWatermark(text, sizePts, mode)) return;
+  if (text.empty())
+  {
+    MessageBoxW(g.frame, L"Watermark text is empty.", L"Watermark",
+                MB_OK | MB_ICONINFORMATION);
+    return;
+  }
+  if (!ApplyWatermarkDoc(g.doc, text.c_str(), sizePts, mode))
+  {
+    MessageBoxW(g.frame, L"Could not apply watermark.", L"Watermark",
+                MB_OK | MB_ICONERROR);
+    return;
+  }
+  g.dirty = true;
+  RefreshState();
+  for (auto& kv : g.thumbCache) DeleteObject(kv.second);
+  g.thumbCache.clear();
+  InvalidateRect(g.canvas, nullptr, TRUE);
+  InvalidateRect(g.thumbs, nullptr, TRUE);
 }
 
 static bool SaveDocTo(const std::wstring& target)
@@ -2402,6 +2651,7 @@ static void DoCommand(int id)
     case ID_PAGE_CROP:    CropCurrentPageToContent(); break;
     case ID_EXPORT_TEXT:  ExportTextAll(); break;
     case ID_EXPORT_CSV:   ExportCsvAll(); break;
+    case ID_WATERMARK:    WatermarkCurrentDoc(); break;
     case ID_THEME:        ToggleTheme(); break;
     case ID_ABOUT:
       MessageBoxW(g.frame,
@@ -2436,6 +2686,7 @@ static HMENU BuildMenu()
   addItem(file, ID_IMPORT, L"Import PDF...");
   addItem(file, ID_EXPORT_TEXT, L"Export Text...");
   addItem(file, ID_EXPORT_CSV, L"Export CSV...");
+  addItem(file, ID_WATERMARK, L"Watermark...");
   AppendMenuW(file, MF_SEPARATOR, 0, nullptr);
   addItem(file, ID_EXIT, L"Exit");
   AppendMenuW(bar, MF_POPUP, (UINT_PTR)file, L"&File");
@@ -3653,6 +3904,138 @@ check("saved %PDF header", bytes.size() > 8 &&
       check("enc: disk fixture opens with correct password", disk != nullptr);
       if (disk) FPDF_CloseDocument(disk);
     }
+  }
+
+  {
+    FPDF_DOCUMENT wd = FPDF_LoadMemDocument(sample.data(), (int)sample.size(), nullptr);
+    check("wat: sample loads", wd != nullptr);
+    if (wd)
+    {
+      check("wat: empty text rejected",
+            !ApplyWatermarkDoc(wd, L"", 36.0f, WMDP_CENTER));
+      check("wat: center watermark applies",
+            ApplyWatermarkDoc(wd, L"TRIAL", 36.0f, WMDP_CENTER));
+      checkEq("wat: page count unchanged", FPDF_GetPageCount(wd), 1);
+      FPDF_PAGE wp = FPDF_LoadPage(wd, 0);
+      if (wp)
+      {
+        std::wstring wt = PageTextRaw(wp);
+        check("wat: original text preserved",
+              wt.find(L"Stitchup PDF Editor") != std::wstring::npos);
+        check("wat: watermark text extractable",
+              wt.find(L"TRIAL") != std::wstring::npos);
+        FPDF_ClosePage(wp);
+      }
+      std::vector<unsigned char> wbytes;
+      check("wat: watermarked doc saves",
+            SaveAsString(wd, wbytes) && wbytes.size() > 8);
+      FPDF_DOCUMENT wr = wbytes.empty() ? nullptr
+        : FPDF_LoadMemDocument(wbytes.data(), (int)wbytes.size(), nullptr);
+      check("wat: watermarked doc roundtrips", wr != nullptr);
+      if (wr)
+      {
+        checkEq("wat: roundtrip page count", FPDF_GetPageCount(wr), 1);
+        FPDF_PAGE rp = FPDF_LoadPage(wr, 0);
+        if (rp)
+        {
+          check("wat: roundtrip keeps watermark",
+                PageTextRaw(rp).find(L"TRIAL") != std::wstring::npos);
+          FPDF_ClosePage(rp);
+        }
+        FPDF_CloseDocument(wr);
+      }
+      FPDF_CloseDocument(wd);
+    }
+  }
+  {
+    FPDF_DOCUMENT wd = FPDF_LoadMemDocument(sample.data(), (int)sample.size(), nullptr);
+    check("wat: top mode applies", wd &&
+          ApplyWatermarkDoc(wd, L"TRIAL", 24.0f, WMDP_TOP));
+    if (wd)
+    {
+      FPDF_PAGE wp = FPDF_LoadPage(wd, 0);
+      if (wp)
+      {
+        check("wat: top mode extractable",
+              PageTextRaw(wp).find(L"TRIAL") != std::wstring::npos);
+        FPDF_ClosePage(wp);
+      }
+      FPDF_CloseDocument(wd);
+    }
+  }
+  {
+    FPDF_DOCUMENT wd = FPDF_LoadMemDocument(sample.data(), (int)sample.size(), nullptr);
+    check("wat: tiled mode applies", wd &&
+          ApplyWatermarkDoc(wd, L"TRIAL", 16.0f, WMDP_TILED));
+    if (wd)
+    {
+      FPDF_PAGE wp = FPDF_LoadPage(wd, 0);
+      if (wp)
+      {
+        check("wat: tiled mode extractable",
+              PageTextRaw(wp).find(L"TRIAL") != std::wstring::npos);
+        FPDF_ClosePage(wp);
+      }
+      FPDF_CloseDocument(wd);
+    }
+  }
+  {
+    std::string outline = MakeOutlinePdf();
+    FPDF_DOCUMENT wd = FPDF_LoadMemDocument(outline.data(), (int)outline.size(), nullptr);
+    check("wat: multipage sample loads", wd != nullptr);
+    if (wd)
+    {
+      checkEq("wat: multipage count", FPDF_GetPageCount(wd), 2);
+      check("wat: multipage watermark applies",
+            ApplyWatermarkDoc(wd, L"TRIAL", 36.0f, WMDP_CENTER));
+      bool both = true;
+      for (int i = 0; i < FPDF_GetPageCount(wd); ++i)
+      {
+        FPDF_PAGE wp = FPDF_LoadPage(wd, i);
+        if (!wp) { both = false; continue; }
+        if (PageTextRaw(wp).find(L"TRIAL") == std::wstring::npos) both = false;
+        FPDF_ClosePage(wp);
+      }
+      check("wat: watermark on all pages", both);
+      FPDF_CloseDocument(wd);
+    }
+  }
+  {
+    // disk-loaded document, mirroring the GUI path (file -> apply -> save)
+    wchar_t dwt[MAX_PATH];
+    GetTempPathW(MAX_PATH, dwt);
+    std::wstring dp = std::wstring(dwt) + L"stitchup_wm_disk.pdf";
+    FILE* dwf = nullptr;
+    if (_wfopen_s(&dwf, dp.c_str(), L"wb") == 0 && dwf)
+    {
+      fwrite(sample.data(), 1, sample.size(), dwf);
+      fclose(dwf);
+    }
+    check("wat: disk fixture written",
+          GetFileAttributesW(dp.c_str()) != INVALID_FILE_ATTRIBUTES);
+    FPDF_DOCUMENT dd = FPDF_LoadDocument(Utf8(dp).c_str(), nullptr);
+    check("wat: disk load", dd != nullptr);
+    check("wat: disk watermark applies",
+          dd && ApplyWatermarkDoc(dd, L"TRIAL", 36.0f, WMDP_CENTER));
+    std::vector<unsigned char> dbytes;
+    bool ds = dd && SaveAsString(dd, dbytes);
+    check("wat: disk doc saves after watermark", ds && dbytes.size() > 8);
+    FPDF_DOCUMENT dr = dbytes.empty() ? nullptr
+      : FPDF_LoadMemDocument(dbytes.data(), (int)dbytes.size(), nullptr);
+    check("wat: disk doc roundtrip", dr != nullptr);
+    if (dr)
+    {
+      FPDF_PAGE dp2 = FPDF_LoadPage(dr, 0);
+      if (dp2)
+      {
+        check("wat: disk doc watermark persisted",
+              PageTextRaw(dp2).find(L"TRIAL") != std::wstring::npos);
+        FPDF_ClosePage(dp2);
+      }
+      FPDF_CloseDocument(dr);
+    }
+    if (dd) FPDF_CloseDocument(dd);
+    DeleteFileW(dp.c_str());
   }
 
   if (s) FPDF_CloseDocument(s);

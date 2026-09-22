@@ -55,6 +55,10 @@ Produces `dist\Stitchup.exe` + `dist\pdfium.dll`.
   UTF-8 (BOM) .txt file
 - Export CSV (File > Export CSV): writes a UTF-8 (BOM) `.csv` with one
   `Page,Width (pt),Height (pt),Text chars,Annotations` row per page
+- Watermark (File > Watermark): stamp every page with custom text in filler
+  gray at 50% opacity. The dialog prefills "Confidential", with a 16/24/36/
+  48/64/96 pt size selector and Center (diagonal, 45 degrees) / Top center /
+  Tiled placements; the document is saved in place and reloaded
 - Security: password-protected PDFs are detected and unlocked through a modal
   password dialog (up to 3 attempts, then an error box); wrong passwords are
   rejected by PDFium
@@ -78,8 +82,8 @@ project (github.com/bblanchon/pdfium-binaries). Non-GPL build.
   single-exe build is planned but first requires building PDFium with the
   static CRT from source (the prebuilt import lib is not static).
 - Shell + annotations + link activation + page management (extract/split/
-  auto-crop) + text export + CSV export + password-unlock are done; watermarks
-  and encrypt-on-save are the next milestones. Rendering, page model,
+  auto-crop) + text export + CSV export + password-unlock + watermarks are
+  done; encrypt-on-save is the next milestone. Rendering, page model,
   editing operations, ribbon navigation, the bookmarks pane, annotation
   creation/persistence, link navigation and page extract/split/crop are
   functional.

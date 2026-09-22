@@ -21,7 +21,7 @@ user rejected as a product (no GUI).
 
 Command: `Stitchup.exe --self-test`
 
-Result: **117 passed, 0 failed** (exit code 0).
+Result: **141 passed, 0 failed** (exit code 0).
 
 Coverage: PDFium init; create doc + add page; save to buffer (PDF header and
 `%%EOF` trailer checks); reopen roundtrip; page count; load sample PDF (612x792);
@@ -60,10 +60,15 @@ run), the file carries a UTF-8 BOM byte-for-byte with the header line
 row per page, an empty doc makes `ExportCsvToFile` return false and writes no
 file, and a doc with a highlight annotation reports `0,1` in the annotation
 column.
+- Watermark (`ApplyWatermarkDoc`): empty text rejected; center/top/tiled modes
+  each apply and are extractable; every page of a 2-page doc gains the
+  watermark; a watermarked doc saves and round-trips with the watermark
+  retained, and the same holds for a doc re-opened from disk after
+  watermarking.
 
 `test_result.txt` (SHA-256 of the run captured in the report):
 ```
--- enter -- ... SUMMARY 117 passed, 0 failed
+-- enter -- ... SUMMARY 141 passed, 0 failed
 ```
 
 GUI verification (programmatic, window handles + messages):
@@ -102,6 +107,18 @@ GUI verification (programmatic, window handles + messages):
   opens the Save As dialog (owned by the app process, title "Save As")
   prefilled with `<name>.csv` (verified via UI Automation on the filename
   field); the engine writes a UTF-8 BOM CSV (verified headless).
+- Watermark (File > Watermark, menu id 4036): with a PDF loaded the
+  `SKWmWnd` dialog opens (all controls present and inside bounds, Ok = id 1,
+  Cancel = id 2, size/position combo boxes default to 36 pt / Center). The
+  dialog prefills the text edit with "Confidential" so a press of Ok stamps
+  the document. Doing exactly that from the harness (accept the default, Ok,
+  then File > Save / id 4003) produced a saved fixture whose FlateDecode
+  content streams, once inflated, contain the watermark drawing operators on
+  every page: the UTF-16BE hex string `[<436F6E666964656E7469616C>] TJ`,
+  Helvetica at 36 pt (`/FXF1 36 Tf`), the 45-degree rotation matrix
+  (0.70710677 / -0.70710677), filler-gray fill `.54901963 rg` (140/255), and
+  the `/FXE2 gs` 50%-alpha ExtGState (raw object `<</ca .5019608>>`); 5 pages,
+  5 watermark text placements, saved file grew 1,034 -> 3,755 bytes.
 - Theme: View > Dark Mode (`Ctrl+D` on the menu, checkbox state toggles)
   repaints every surface and persists to `HKCU\Software\StitchupPDFEditor`.
   A pixel probe of the toolbar (window DC, `GetPixel`) confirms both palettes
@@ -138,7 +155,7 @@ No CRT DLLs (static `/MT` linked). Portable package = `Stitchup.exe` +
 
 | File           | Size     | SHA-256                                                           |
 |----------------|----------|-------------------------------------------------------------------|
-| Stitchup.exe   | 380,416 B | F79697582C067726AEFBF5B441BC8B665559A58B810098F323964DD3AFA4D778 |
+| Stitchup.exe   | 395,776 B | A1DE73FF6A9C353604A84FC1624A9C62C039DB37497451327186C73EFAED71DC |
 | pdfium.dll     | 7,375,360 B | 55E7EBEF29A1EC9523D1ADB8B260A73E7DFB0F64D3F0285121D20ECD6148EF18 |
 | example.pdf    | 1,034 B   | B276682EFD75780E462C17489176D710AD1339D84E69C6218AD3C2F8E60FC132 |
 | app.ico        | 20,597 B  | 5FB009C7A83254FBCD81C205492E03A683EDB0BA65B6E44962614B06A240CA44 |
@@ -168,8 +185,12 @@ page); UI restyled (modern flat ribbon with accent brand strip, labelled group
 cards, hover/pressed button states, and a light/dark theme with an embedded
 app icon); security started (password-protected PDFs are detected and
 unlocked through a modal password dialog, up to 3 attempts before an error
-box); the Save-in-place file-replace bug is fixed. Remaining Phase C:
-watermarks and encrypt-on-save.
-Self-test 117/117. User verdict pending — open `dist\Stitchup.exe file.pdf` and
+box); the Save-in-place file-replace bug is fixed. Watermarks now done
+(File > Watermark stamps every page at 36 pt / 45 degrees / filler gray /
+50% alpha, prefilled "Confidential", with size 16-96 pt and Center / Top /
+Tiled placements; verified end-to-end through the saved file's content
+streams). Remaining Phase C: encrypt-on-save.
+Self-test 141/141. User verdict pending — open `dist\Stitchup.exe file.pdf` and
 try Home > Annotate, click any PDF link, Home > Pages (Extract / Split /
-Auto-Crop), File > Export Text / Export CSV, and open a password-protected PDF.
+Auto-Crop), File > Export Text / Export CSV, File > Watermark, and open a
+password-protected PDF.
