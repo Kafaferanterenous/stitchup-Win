@@ -71,6 +71,10 @@ enum
   ID_THEME,
   ID_WATERMARK,
   ID_SAVEENC,
+  ID_TOOL_SELECT,
+  ID_OBJ_EDIT,
+  ID_OBJ_DELETE,
+  ID_OBJ_RECOLOR,
 };
 
 enum
@@ -156,6 +160,21 @@ struct App
   bool thumbDrag = false;
   int dragPage = -1;
   int dragCursor = -1;
+
+  bool toolSelect = false;   // Select/Move content-object tool
+  struct Sel
+  {
+    bool active = false;
+    int page = -1;
+    int index = -1;
+    int type = 0;
+    float l = 0, b = 0, r = 0, t = 0;
+  } sel;
+  FPDF_PAGE editPage = nullptr;   // page kept open during a live object drag
+  FPDF_PAGEOBJECT editObj = nullptr;
+  bool selDrag = false;
+  bool selDragMoved = false;
+  double dragLastX = 0, dragLastY = 0;
 };
 
 static App g;
@@ -345,9 +364,9 @@ static double MaxPageH()
   return m;
 }
 
-static HBITMAP RenderPageBitmap(int index, int w, int h)
+static HBITMAP RenderPageBitmapInto(FPDF_PAGE p, int w, int h)
 {
-  if (g.pageCount == 0 || w < 1 || h < 1) return nullptr;
+  if (!p || w < 1 || h < 1) return nullptr;
   HDC hdc = GetDC(g.canvas ? g.canvas : nullptr);
   BITMAPINFO bi{};
   bi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
@@ -365,14 +384,18 @@ static HBITMAP RenderPageBitmap(int index, int w, int h)
   FPDF_BITMAP fb = FPDFBitmap_CreateEx(w, h, FPDFBitmap_BGRA, bits, stride);
   FPDFBitmap_FillRect(fb, 0, 0, w, h, 0xFFFFFFFF);
 
-  FPDF_PAGE p = FPDF_LoadPage(g.doc, index);
-  if (p)
-  {
-    FPDF_RenderPageBitmap(fb, p, 0, 0, w, h, 0,
-                          FPDF_ANNOT | FPDF_LCD_TEXT);
-    FPDF_ClosePage(p);
-  }
+  FPDF_RenderPageBitmap(fb, p, 0, 0, w, h, 0,
+                        FPDF_ANNOT | FPDF_LCD_TEXT);
   FPDFBitmap_Destroy(fb);
+  return hb;
+}
+
+static HBITMAP RenderPageBitmap(int index, int w, int h)
+{
+  if (g.pageCount == 0 || w < 1 || h < 1) return nullptr;
+  FPDF_PAGE p = FPDF_LoadPage(g.doc, index);
+  HBITMAP hb = p ? RenderPageBitmapInto(p, w, h) : nullptr;
+  if (p) FPDF_ClosePage(p);
   return hb;
 }
 
@@ -1936,6 +1959,443 @@ static LRESULT CALLBACK ThumbsProc(HWND hw, UINT msg, WPARAM wp, LPARAM lp)
 // ---------------------------------------------------------------------------
 // Canvas
 // ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// Content object editing (Select / Move / Delete / Recolor / Edit text)
+// ---------------------------------------------------------------------------
+struct PageObject
+{
+  int index = -1;
+  int type = 0;             // FPDF_PAGEOBJ_*
+  float l = 0, b = 0, r = 0, t = 0;
+  std::wstring text;        // TEXT only
+  std::string fontName;     // TEXT only (base name, subset prefix stripped)
+  float fontSize = 0;
+  bool isText() const { return type == FPDF_PAGEOBJ_TEXT; }
+  bool isPainted() const { return type == FPDF_PAGEOBJ_TEXT ||
+                                  type == FPDF_PAGEOBJ_PATH ||
+                                  type == FPDF_PAGEOBJ_IMAGE; }
+  bool hit(double px, double py) const
+  {
+    return isPainted() && px >= l && px <= r && py >= b && py <= t;
+  }
+};
+
+static std::vector<PageObject> ListPageObjects(int pi)
+{
+  std::vector<PageObject> out;
+  if (!g.doc || pi < 0 || pi >= g.pageCount) return out;
+  FPDF_PAGE page = FPDF_LoadPage(g.doc, pi);
+  if (!page) return out;
+  FPDF_TEXTPAGE tp = FPDFText_LoadPage(page);
+  const int n = FPDFPage_CountObjects(page);
+  for (int i = 0; i < n; ++i)
+  {
+    FPDF_PAGEOBJECT o = FPDFPage_GetObject(page, i);
+    if (!o) continue;
+    float l = 0, b = 0, r = 0, t = 0;
+    if (!FPDFPageObj_GetBounds(o, &l, &b, &r, &t)) continue;
+    PageObject po;
+    po.index = i;
+    po.type = FPDFPageObj_GetType(o);
+    po.l = l; po.b = b; po.r = r; po.t = t;
+    if (po.isText())
+    {
+      if (tp)
+      {
+        unsigned long len = FPDFTextObj_GetText(o, tp, nullptr, 0);
+        if (len > 1)
+        {
+          std::vector<unsigned short> buf(len, 0);
+          if (FPDFTextObj_GetText(o, tp, buf.data(), len) >= 2)
+          {
+            po.text.assign(reinterpret_cast<const wchar_t*>(buf.data()), len);
+            while (!po.text.empty() && po.text.back() == L'\0')
+              po.text.pop_back();
+          }
+        }
+      }
+      FPDFTextObj_GetFontSize(o, &po.fontSize);
+      FPDF_FONT font = FPDFTextObj_GetFont(o);
+      if (font)
+      {
+        size_t fn = FPDFFont_GetBaseFontName(font, nullptr, 0);
+        if (fn > 1)
+        {
+          std::vector<char> nb(fn, 0);
+          FPDFFont_GetBaseFontName(font, nb.data(), nb.size());
+          po.fontName.assign(nb.data());
+          size_t plus = po.fontName.find('+');
+          if (plus != std::string::npos) po.fontName.erase(0, plus + 1);
+        }
+      }
+    }
+    out.push_back(po);
+  }
+  if (tp) FPDFText_ClosePage(tp);
+  FPDF_ClosePage(page);
+  return out;
+}
+
+static bool HitTestObject(int pi, double px, double py, PageObject& best)
+{
+  const std::vector<PageObject> objs = ListPageObjects(pi);
+  // Last painted is the topmost.
+  for (auto it = objs.rbegin(); it != objs.rend(); ++it)
+    if (it->hit(px, py)) { best = *it; return true; }
+  return false;
+}
+
+static void RefreshSelBounds()
+{
+  if (!g.sel.active) return;
+  for (const PageObject& po : ListPageObjects(g.sel.page))
+  {
+    if (po.index == g.sel.index)
+    {
+      g.sel.type = po.type;
+      g.sel.l = po.l; g.sel.b = po.b; g.sel.r = po.r; g.sel.t = po.t;
+      return;
+    }
+  }
+  g.sel.active = false;  // stale selection (page changed or object gone)
+}
+
+static void SetToolSelect(bool on)
+{
+  g.toolSelect = on;
+  if (!on) g.sel.active = false;
+  for (HWND h : g.ribbonBtns)
+  {
+    if (GetWindowLongPtrW(h, GWLP_ID) == ID_TOOL_SELECT)
+    {
+      Btn* b2 = reinterpret_cast<Btn*>(GetWindowLongPtrW(h, GWLP_USERDATA));
+      if (b2) { b2->pressed = on; InvalidateRect(h, nullptr, TRUE); }
+    }
+  }
+  InvalidateRect(g.status, nullptr, TRUE);
+}
+
+static void ApplyRecolor(int pi, int index, int r, int g_, int b);
+
+// Persist object edits: serializes the (already GenerateContent'ed) doc and
+// reloads it, exactly like Save-in-place. Selection is invalidated on reload.
+static void CommitEdits()
+{
+  if (g.editPage) { FPDF_ClosePage(g.editPage); g.editPage = nullptr; }
+  g.editObj = nullptr;
+  g.selDrag = false;
+  g.sel.active = false;
+  SaveInPlace();
+  RefreshSelBounds();
+}
+
+static void DeleteSelectedObject()
+{
+  if (!g.sel.active)
+  {
+    MessageBoxW(g.frame, L"Nothing selected. Use the Select tool to pick an object.",
+                L"Stitchup", MB_OK | MB_ICONINFORMATION);
+    return;
+  }
+  FPDF_PAGE page = FPDF_LoadPage(g.doc, g.sel.page);
+  FPDF_PAGEOBJECT o = page ? FPDFPage_GetObject(page, g.sel.index) : nullptr;
+  if (o) FPDFPage_RemoveObject(page, o);
+  if (page && o) FPDFPage_GenerateContent(page);
+  if (page) FPDF_ClosePage(page);
+  CommitEdits();
+}
+
+// ---------------------------------------------------------------------------
+// Recolor palette dialog (SKClrWnd)
+// ---------------------------------------------------------------------------
+static std::vector<COLORREF> kPalette = {
+  RGB(0x00, 0x00, 0x00), RGB(0xFF, 0xFF, 0xFF), RGB(0xFF, 0x00, 0x00),
+  RGB(0x00, 0x80, 0x00), RGB(0x00, 0x00, 0xFF), RGB(0xFF, 0xE0, 0x00),
+  RGB(0xFF, 0x80, 0x00), RGB(0x80, 0x80, 0x80),
+};
+static const wchar_t* kPaletteNames[] = {
+  L"Black", L"White", L"Red", L"Green", L"Blue", L"Yellow", L"Orange", L"Gray",
+};
+
+static LRESULT CALLBACK ClrProc(HWND h, UINT m, WPARAM w, LPARAM l)
+{
+  switch (m)
+  {
+    case WM_CREATE:
+    {
+      const int cols = 4, bw = 52, bh = 30;
+      for (int i = 0; i < (int)kPalette.size(); ++i)
+      {
+        int cx = 16 + (i % cols) * (bw + 12);
+        int cy = 40 + (i / cols) * (bh + 12);
+        CreateWindowExW(0, L"BUTTON", kPaletteNames[i],
+                        WS_CHILD | WS_VISIBLE | WS_TABSTOP,
+                        cx, cy, bw, bh, h, (HMENU)(INT_PTR)(i + 1),
+                        g.inst, nullptr);
+      }
+      CreateWindowExW(0, L"STATIC", L"Pick a fill / stroke color:",
+                      WS_CHILD | WS_VISIBLE, 16, 16, 240, 16, h, nullptr, g.inst, nullptr);
+      CreateWindowExW(0, L"BUTTON", L"Cancel", WS_CHILD | WS_VISIBLE | WS_TABSTOP,
+                      16, 124, 74, 28, h, (HMENU)99, g.inst, nullptr);
+      return 0;
+    }
+    case WM_COMMAND:
+    {
+      const int id = LOWORD(w);
+      if (id >= 1 && id <= (int)kPalette.size())
+      {
+        std::vector<unsigned char> col(3);
+        col[0] = (kPalette[id - 1] >> 16) & 0xFF;
+        col[1] = (kPalette[id - 1] >> 8) & 0xFF;
+        col[2] = kPalette[id - 1] & 0xFF;
+        ApplyRecolor(g.sel.page, g.sel.index, col[0], col[1], col[2]);
+        DestroyWindow(h);
+        return 0;
+      }
+      if (id == 99 || id == 2) { DestroyWindow(h); return 0; }
+      break;
+    }
+    case WM_CLOSE:
+      DestroyWindow(h);
+      return 0;
+  }
+  return DefWindowProcW(h, m, w, l);
+}
+
+static void ApplyRecolorSelected()
+{
+  if (!g.sel.active)
+  {
+    MessageBoxW(g.frame, L"Nothing selected. Use the Select tool to pick an object.",
+                L"Stitchup", MB_OK | MB_ICONINFORMATION);
+    return;
+  }
+  FPDF_PAGE page = FPDF_LoadPage(g.doc, g.sel.page);
+  FPDF_PAGEOBJECT o = page ? FPDFPage_GetObject(page, g.sel.index) : nullptr;
+  if (!o || !page) { if (page) FPDF_ClosePage(page); return; }
+  const int t = FPDFPageObj_GetType(o);
+  if (t != FPDF_PAGEOBJ_TEXT && t != FPDF_PAGEOBJ_PATH)
+  {
+    FPDF_ClosePage(page);
+    MessageBoxW(g.frame, L"Recolor works on text and vector objects, not images.",
+                L"Stitchup", MB_OK | MB_ICONINFORMATION);
+    return;
+  }
+  FPDF_ClosePage(page);
+
+  const wchar_t cls[] = L"SKClrWnd";
+  static bool reg = false;
+  if (!reg)
+  {
+    WNDCLASSEXW wc{};
+    wc.cbSize = sizeof(wc);
+    wc.lpfnWndProc = ClrProc;
+    wc.hInstance = g.inst;
+    wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+    wc.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
+    wc.lpszClassName = cls;
+    RegisterClassExW(&wc);
+    reg = true;
+  }
+  HWND hw = CreateWindowExW(WS_EX_DLGMODALFRAME, cls, L"Recolor object",
+                            WS_POPUP | WS_CAPTION | WS_SYSMENU,
+                            CW_USEDEFAULT, CW_USEDEFAULT, 292, 190,
+                            g.frame, nullptr, g.inst, nullptr);
+  if (!hw) return;
+  RECT fr, rc;
+  GetWindowRect(g.frame, &fr);
+  GetWindowRect(hw, &rc);
+  SetWindowPos(hw, nullptr,
+               fr.left + (fr.right - fr.left - (rc.right - rc.left)) / 2,
+               fr.top + (fr.bottom - fr.top - (rc.bottom - rc.top)) / 2,
+               0, 0, SWP_NOSIZE | SWP_NOZORDER);
+  EnableWindow(g.frame, FALSE);
+  ShowWindow(hw, SW_SHOW);
+  UpdateWindow(hw);
+  MSG msg;
+  while (IsWindow(hw))
+  {
+    const BOOL r = GetMessageW(&msg, nullptr, 0, 0);
+    if (r <= 0) break;
+    if (!IsDialogMessageW(hw, &msg)) { TranslateMessage(&msg); DispatchMessageW(&msg); }
+  }
+  EnableWindow(g.frame, TRUE);
+  SetActiveWindow(g.frame);
+  SetFocus(g.frame);
+}
+
+// ---------------------------------------------------------------------------
+// Text edit dialog (SKTxtWnd) - double-click a text object to replace it
+// ---------------------------------------------------------------------------
+static HWND g_tedEdit = nullptr;
+static bool g_tedOk = false;
+static std::wstring g_tedValue;
+
+static LRESULT CALLBACK TedProc(HWND h, UINT m, WPARAM w, LPARAM l)
+{
+  switch (m)
+  {
+    case WM_CREATE:
+      CreateWindowExW(0, L"STATIC", L"Text:",
+                      WS_CHILD | WS_VISIBLE, 16, 14, 60, 16, h, nullptr, g.inst, nullptr);
+      g_tedEdit = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
+                                  WS_CHILD | WS_VISIBLE | WS_TABSTOP |
+                                  ES_MULTILINE | ES_AUTOVSCROLL | WS_VSCROLL,
+                                  66, 12, 262, 80, h, nullptr, g.inst, nullptr);
+      CreateWindowExW(0, L"BUTTON", L"Ok", WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_DEFPUSHBUTTON,
+                      110, 104, 74, 28, h, (HMENU)1, g.inst, nullptr);
+      CreateWindowExW(0, L"BUTTON", L"Cancel", WS_CHILD | WS_VISIBLE | WS_TABSTOP,
+                      196, 104, 74, 28, h, (HMENU)2, g.inst, nullptr);
+      SetWindowTextW(g_tedEdit, g_tedValue.c_str());
+      SetFocus(g_tedEdit);
+      return 0;
+    case WM_COMMAND:
+      if (LOWORD(w) == 1 || LOWORD(w) == 2)
+      {
+        if (LOWORD(w) == 1 && g_tedEdit)
+        {
+          wchar_t buf[1024];
+          GetWindowTextW(g_tedEdit, buf, 1024);
+          g_tedValue = buf;
+        }
+        g_tedOk = (LOWORD(w) == 1);
+        DestroyWindow(h);
+        return 0;
+      }
+      break;
+    case WM_CLOSE:
+      g_tedOk = false;
+      DestroyWindow(h);
+      return 0;
+    case WM_CTLCOLORSTATIC:
+      return (LRESULT)(HBRUSH)(COLOR_BTNFACE + 1);
+  }
+  return DefWindowProcW(h, m, w, l);
+}
+
+static bool PromptEditText(const std::wstring& initial, std::wstring& out)
+{
+  const wchar_t cls[] = L"SKTxtWnd";
+  static bool reg = false;
+  if (!reg)
+  {
+    WNDCLASSEXW wc{};
+    wc.cbSize = sizeof(wc);
+    wc.lpfnWndProc = TedProc;
+    wc.hInstance = g.inst;
+    wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+    wc.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
+    wc.lpszClassName = cls;
+    RegisterClassExW(&wc);
+    reg = true;
+  }
+  g_tedEdit = nullptr;
+  g_tedOk = false;
+  g_tedValue = initial;
+  HWND hw = CreateWindowExW(WS_EX_DLGMODALFRAME, cls, L"Edit text",
+                            WS_POPUP | WS_CAPTION | WS_SYSMENU,
+                            CW_USEDEFAULT, CW_USEDEFAULT, 348, 170,
+                            g.frame, nullptr, g.inst, nullptr);
+  if (!hw) return false;
+  RECT fr, rc;
+  GetWindowRect(g.frame, &fr);
+  GetWindowRect(hw, &rc);
+  SetWindowPos(hw, nullptr,
+               fr.left + (fr.right - fr.left - (rc.right - rc.left)) / 2,
+               fr.top + (fr.bottom - fr.top - (rc.bottom - rc.top)) / 2,
+               0, 0, SWP_NOSIZE | SWP_NOZORDER);
+  EnableWindow(g.frame, FALSE);
+  ShowWindow(hw, SW_SHOW);
+  UpdateWindow(hw);
+  MSG msg;
+  while (IsWindow(hw))
+  {
+    const BOOL r = GetMessageW(&msg, nullptr, 0, 0);
+    if (r <= 0) break;
+    if (!IsDialogMessageW(hw, &msg)) { TranslateMessage(&msg); DispatchMessageW(&msg); }
+  }
+  EnableWindow(g.frame, TRUE);
+  SetActiveWindow(g.frame);
+  SetFocus(g.frame);
+  out = g_tedValue;
+  return g_tedOk;
+}
+
+static void EditTextObject(int pi, int index, const std::wstring& newText)
+{
+  if (pi < 0 || pi >= g.pageCount) return;
+  FPDF_PAGE page = FPDF_LoadPage(g.doc, pi);
+  FPDF_PAGEOBJECT oldObj = page ? FPDFPage_GetObject(page, index) : nullptr;
+  if (!oldObj || !page) { if (page) FPDF_ClosePage(page); return; }
+  float ol = 0, ob = 0, or_ = 0, ot = 0;
+  FPDFPageObj_GetBounds(oldObj, &ol, &ob, &or_, &ot);
+  float size = 12.0f;
+  if (FPDFTextObj_GetFontSize(oldObj, &size) == 0) size = 12.0f;
+
+  // Build the replacement first so a failure never destroys the original.
+  const PageObject foundHere = [&]() {
+    const std::vector<PageObject> objs = ListPageObjects(pi);
+    for (const PageObject& po : objs)
+      if (po.index == index) return po;
+    return PageObject{};
+  }();
+  std::string fn = foundHere.fontName.empty() ? "Helvetica" : foundHere.fontName;
+  FPDF_PAGEOBJECT no = FPDFPageObj_NewTextObj(g.doc, fn.c_str(), size);
+  if (!no) { FPDF_ClosePage(page); return; }
+  const unsigned short* u16t = reinterpret_cast<const unsigned short*>(newText.c_str());
+  if (!FPDFText_SetText(no, u16t)) { FPDFPageObj_Destroy(no); FPDF_ClosePage(page); return; }
+  FS_MATRIX m{};
+  m.a = 1; m.d = 1;
+  FPDFPageObj_SetMatrix(no, &m);
+  float nl = 0, nb = 0, nr = 0, nt = 0;
+  FPDFPageObj_GetBounds(no, &nl, &nb, &nr, &nt);
+  m.e = ol - nl;   // anchor bottom-left of the original run
+  m.f = ob - nb;
+  FPDFPageObj_SetMatrix(no, &m);
+  FPDFPage_RemoveObject(page, oldObj);
+  FPDFPage_InsertObjectAtIndex(page, no, index);
+  FPDFPage_GenerateContent(page);
+  FPDF_ClosePage(page);
+  CommitEdits();
+}
+
+static void ApplyRecolor(int pi, int index, int r, int g_, int b)
+{
+  if (pi < 0 || pi >= g.pageCount) return;
+  FPDF_PAGE page = FPDF_LoadPage(g.doc, pi);
+  FPDF_PAGEOBJECT o = page ? FPDFPage_GetObject(page, index) : nullptr;
+  if (o)
+  {
+    FPDFPageObj_SetFillColor(o, (unsigned int)r, (unsigned int)g_, (unsigned int)b, 255);
+    FPDFPageObj_SetStrokeColor(o, (unsigned int)r, (unsigned int)g_, (unsigned int)b, 255);
+    FPDFPage_GenerateContent(page);
+  }
+  if (page) FPDF_ClosePage(page);
+  CommitEdits();
+}
+
+static void EditSelectedText()
+{
+  if (!g.sel.active)
+  {
+    MessageBoxW(g.frame, L"Nothing selected. Double-click a text object to edit it.",
+                L"Stitchup", MB_OK | MB_ICONINFORMATION);
+    return;
+  }
+  if (g.sel.type != FPDF_PAGEOBJ_TEXT)
+  {
+    MessageBoxW(g.frame, L"Only text objects can be edited this way.",
+                L"Stitchup", MB_OK | MB_ICONINFORMATION);
+    return;
+  }
+  std::wstring cur;
+  for (const PageObject& po : ListPageObjects(g.sel.page))
+    if (po.index == g.sel.index) { cur = po.text; break; }
+  std::wstring out;
+  if (PromptEditText(cur, out))
+    EditTextObject(g.sel.page, g.sel.index, out);
+}
+
 static void CanvasPaint(HDC dc, int cw, int ch)
 {
   const Theme& th = ThemeNow();
@@ -1975,8 +2435,15 @@ static void CanvasPaint(HDC dc, int cw, int ch)
 
       auto it = g.canvasCache.find(i);
       HBITMAP hb = nullptr;
+      bool liveBmp = false;
       key = ZoomKey();
-      if (it != g.canvasCache.end() && it->second.key == key)
+      if (g.toolSelect && g.selDrag && g.editPage && g.sel.page == i)
+      {
+        // Live drag: always re-render from the open page being transformed.
+        hb = RenderPageBitmapInto(g.editPage, w, h);
+        liveBmp = true;
+      }
+      else if (it != g.canvasCache.end() && it->second.key == key)
         hb = it->second.bmp;
       if (!hb)
       {
@@ -1999,11 +2466,47 @@ static void CanvasPaint(HDC dc, int cw, int ch)
         if (w > 0 && h > 0)
           BitBlt(dc, rx, ry, rw, rh, mem, 0, 0, SRCCOPY);
         DeleteDC(mem);
+        if (liveBmp) DeleteObject(hb);
       }
       HBRUSH fb = CreateSolidBrush(g.selected == i ? th.accent
                                                    : th.pageFrame);
       FrameRect(dc, &r, fb);
       DeleteObject(fb);
+
+      // Content-object selection overlay (Select tool)
+      if (g.sel.active && g.sel.page == i && g.sel.type > 0)
+      {
+        float slx = g.sel.l, sbx = g.sel.b, srx = g.sel.r, stx = g.sel.t;
+        if (srx > slx && stx > sbx)
+        {
+          int ax = x + (int)std::lround(slx * s);
+          int ay = yc + (int)std::lround((ph - stx) * s);
+          int aw = (int)std::lround((srx - slx) * s);
+          int ah = (int)std::lround((stx - sbx) * s);
+          HPEN pen = CreatePen(PS_SOLID, 2, th.accent);
+          HPEN old = (HPEN)SelectObject(dc, pen);
+          HBRUSH oldb = (HBRUSH)SelectObject(dc, GetStockObject(NULL_BRUSH));
+          Rectangle(dc, ax, ay, ax + aw, ay + ah);
+          SelectObject(dc, oldb);
+          SelectObject(dc, old);
+          DeleteObject(pen);
+          HBRUSH wh = CreateSolidBrush(th.canvasBg);
+          HBRUSH acc = CreateSolidBrush(th.accent);
+          for (int hx = 0; hx < 2; ++hx)
+          {
+            for (int hy = 0; hy < 2; ++hy)
+            {
+              int hcx = hx ? ax + aw - 4 : ax - 4;
+              int hcy = hy ? ay + ah - 4 : ay - 4;
+              RECT hr{hcx, hcy, hcx + 8, hcy + 8};
+              FillRect(dc, &hr, wh);
+              FrameRect(dc, &hr, acc);
+            }
+          }
+          DeleteObject(acc);
+          DeleteObject(wh);
+        }
+      }
     }
     yc += h + 14;
   }
@@ -2101,6 +2604,20 @@ static LRESULT CALLBACK CanvasProc(HWND hw, UINT msg, WPARAM wp, LPARAM lp)
         HitInfo hi;
         if (HitPage(cur, hi))
         {
+          if (g.toolSelect)
+          {
+            const double s = g.zoom;
+            const float ph = PageH(hi.page);
+            double px = (cur.x - hi.x) / s;
+            double py = ph - (cur.y - hi.y) / s;
+            PageObject best;
+            if (HitTestObject(hi.page, px, py, best))
+            {
+              SetCursor(LoadCursorW(nullptr, IDC_SIZEALL));
+              return TRUE;
+            }
+            return DefWindowProcW(hw, msg, wp, lp);
+          }
           FPDF_PAGE page = FPDF_LoadPage(g.doc, hi.page);
           if (page)
           {
@@ -2124,6 +2641,43 @@ static LRESULT CALLBACK CanvasProc(HWND hw, UINT msg, WPARAM wp, LPARAM lp)
       HitInfo hi;
       if (HitPage(pt, hi))
       {
+        if (g.toolSelect)
+        {
+          const double s = g.zoom;
+          const float ph = PageH(hi.page);
+          double px = (pt.x - hi.x) / s;
+          double py = ph - (pt.y - hi.y) / s;
+          PageObject best;
+          if (HitTestObject(hi.page, px, py, best))
+          {
+            g.sel.active = true;
+            g.sel.page = hi.page;
+            g.sel.index = best.index;
+            g.sel.type = best.type;
+            g.sel.l = best.l; g.sel.b = best.b; g.sel.r = best.r; g.sel.t = best.t;
+            g.editPage = FPDF_LoadPage(g.doc, g.sel.page);
+            g.editObj = g.editPage ? FPDFPage_GetObject(g.editPage, g.sel.index) : nullptr;
+            if (g.editObj)
+            {
+              g.selDrag = true;
+              g.selDragMoved = false;
+              g.dragLastX = px;
+              g.dragLastY = py;
+              SetCapture(hw);
+            }
+          }
+          else
+          {
+            g.sel.active = false;
+            g.selDrag = false;
+          }
+          g.selected = hi.page;
+          ClearCanvasCache();
+          InvalidateRect(hw, nullptr, TRUE);
+          InvalidateRect(g.thumbs, nullptr, TRUE);
+          InvalidateRect(g.status, nullptr, TRUE);
+          return 0;
+        }
         FPDF_PAGE page = FPDF_LoadPage(g.doc, hi.page);
         bool viaLink = false;
         if (page)
@@ -2138,6 +2692,86 @@ static LRESULT CALLBACK CanvasProc(HWND hw, UINT msg, WPARAM wp, LPARAM lp)
           InvalidateRect(g.thumbs, nullptr, TRUE);
           InvalidateRect(g.status, nullptr, TRUE);
         }
+      }
+      return 0;
+    }
+    case WM_LBUTTONDBLCLK:
+    {
+      if (!g.toolSelect) return 0;
+      POINT pt{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
+      HitInfo hi;
+      if (!HitPage(pt, hi)) return 0;
+      const double s = g.zoom;
+      const float ph = PageH(hi.page);
+      double px = (pt.x - hi.x) / s;
+      double py = ph - (pt.y - hi.y) / s;
+      PageObject best;
+      if (HitTestObject(hi.page, px, py, best) && best.isText())
+      {
+        g.selDrag = false;
+        if (g.editPage) { FPDF_ClosePage(g.editPage); g.editPage = nullptr; }
+        g.editObj = nullptr;
+        g.sel.active = true;
+        g.sel.page = hi.page;
+        g.sel.index = best.index;
+        g.sel.type = best.type;
+        g.sel.l = best.l; g.sel.b = best.b; g.sel.r = best.r; g.sel.t = best.t;
+        std::wstring out;
+        if (PromptEditText(best.text, out))
+          EditTextObject(hi.page, best.index, out);
+        else
+          RefreshSelBounds();
+      }
+      return 0;
+    }
+    case WM_MOUSEMOVE:
+    {
+      if (!(g.toolSelect && g.selDrag && GetCapture() == hw)) break;
+      POINT pt{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
+      HitInfo hi;
+      if (!HitPage(pt, hi)) return 0;
+      const double s = g.zoom;
+      const float ph = PageH(hi.page);
+      double px = (pt.x - hi.x) / s;
+      double py = ph - (pt.y - hi.y) / s;
+      double dx = px - g.dragLastX;
+      double dy = py - g.dragLastY;
+      if (dx != 0 || dy != 0)
+      {
+        if (g.editPage && g.editObj)
+        {
+          FPDFPageObj_Transform(g.editObj, 1, 0, 0, 1, (float)dx, (float)dy);
+          g.selDragMoved = true;
+          g.sel.l += (float)dx; g.sel.r += (float)dx;
+          g.sel.b += (float)dy; g.sel.t += (float)dy;
+        }
+        g.dragLastX = px;
+        g.dragLastY = py;
+        ClearCanvasCache();
+        InvalidateRect(hw, nullptr, TRUE);
+      }
+      return 0;
+    }
+    case WM_LBUTTONUP:
+    {
+      if (!(g.toolSelect && g.selDrag)) break;
+      ReleaseCapture();
+      const bool moved = g.selDragMoved;
+      if (g.editPage && g.editObj)
+      {
+        if (moved)
+        {
+          FPDFPage_GenerateContent(g.editPage);
+        }
+        FPDF_ClosePage(g.editPage);
+      }
+      g.editPage = nullptr;
+      g.editObj = nullptr;
+      g.selDrag = false;
+      g.selDragMoved = false;
+      if (moved)
+      {
+        CommitEdits();
       }
       return 0;
     }
@@ -2401,6 +3035,10 @@ static void BuildToolbar(HWND)
     {ID_ANN_TEXT,     L"Text Box",   78, 0, 2},
     {ID_ANN_SHAPE,    L"Shape",      62, 0, 2},
     {ID_ANN_STAMP,    L"Stamp",      62, 0, 2},
+    {ID_TOOL_SELECT,  L"Select",     62, 0, 3},
+    {ID_OBJ_EDIT,     L"Edit Text",  78, 0, 3},
+    {ID_OBJ_DELETE,   L"Delete",     62, 0, 3},
+    {ID_OBJ_RECOLOR,  L"Recolor",    66, 0, 3},
   };
   g.tabBtns[0] = MakeBtn(g.toolbar, ID_TAB_HOME, L"Home", 4, 2, 66, 20, true);
   g.tabBtns[1] = MakeBtn(g.toolbar, ID_TAB_VIEW, L"View", 74, 2, 66, 20, true);
@@ -2416,7 +3054,8 @@ static void BuildToolbar(HWND)
 
 static const wchar_t* GroupName(int tab, int grp)
 {
-  if (tab == 0) return grp == 0 ? L"Document" : (grp == 1 ? L"Pages" : L"Annotate");
+  if (tab == 0)
+    return grp == 0 ? L"Document" : (grp == 1 ? L"Pages" : (grp == 2 ? L"Annotate" : L"Content"));
   if (tab == 1)
     return grp == 0 ? L"Zoom" : (grp == 1 ? L"Navigate" : L"Panes");
   return nullptr;
@@ -2424,7 +3063,7 @@ static const wchar_t* GroupName(int tab, int grp)
 
 static int GroupCount(int tab)
 {
-  return tab == 0 ? 3 : (tab == 1 ? 3 : 0);
+  return tab == 0 ? 4 : (tab == 1 ? 3 : 0);
 }
 
 static void SetTabPressed()
@@ -2832,6 +3471,10 @@ static void DoCommand(int id)
     case ID_ADD:    AddPage(); break;
     case ID_ROTL:   RotatePage(3); break;
     case ID_ROTR:   RotatePage(1); break;
+    case ID_TOOL_SELECT: SetToolSelect(!g.toolSelect); break;
+    case ID_OBJ_EDIT:   EditSelectedText(); break;
+    case ID_OBJ_DELETE: DeleteSelectedObject(); break;
+    case ID_OBJ_RECOLOR: ApplyRecolorSelected(); break;
     case ID_ZOOM_OUT: ZoomTo(g.zoom / 1.25, false); break;
     case ID_ZOOM_IN:  ZoomTo(g.zoom * 1.25, false); break;
     case ID_ZOOM100:  ZoomTo(1.0, false); break;
@@ -2901,6 +3544,11 @@ static HMENU BuildMenu()
   addItem(edit, ID_ROTL, L"Rotate Left\tCtrl+Shift+R");
   addItem(edit, ID_DELETE, L"Delete Page\tDel");
   addItem(edit, ID_ADD, L"Add Page...");
+  AppendMenuW(edit, MF_SEPARATOR, 0, nullptr);
+  addItem(edit, ID_TOOL_SELECT, L"Select / Move Content Object");
+  addItem(edit, ID_OBJ_EDIT, L"Edit Text...\tDouble-click");
+  addItem(edit, ID_OBJ_DELETE, L"Delete Selected Object\tCtrl+Del");
+  addItem(edit, ID_OBJ_RECOLOR, L"Recolor Selected Object...");
   AppendMenuW(bar, MF_POPUP, (UINT_PTR)edit, L"&Edit");
 
   HMENU pages = CreatePopupMenu();
@@ -3074,13 +3722,14 @@ static LRESULT CALLBACK FrameProc(HWND hw, UINT msg, WPARAM wp, LPARAM lp)
           case 'W': DoCommand(ID_FITW); return 0;
           case VK_PRIOR: GoPage(-1); return 0;
           case VK_NEXT: GoPage(1); return 0;
+          case VK_DELETE: DoCommand(ID_OBJ_DELETE); return 0;
         }
       }
       else
       {
         switch (vk)
         {
-          case VK_DELETE: DoCommand(ID_DELETE); return 0;
+          case VK_DELETE: DoCommand(g.toolSelect ? ID_OBJ_DELETE : ID_DELETE); return 0;
         }
       }
       return 0;
@@ -4651,6 +5300,211 @@ check("saved %PDF header", bytes.size() > 8 &&
     }
     if (dd) FPDF_CloseDocument(dd);
     DeleteFileW(dp.c_str());
+  }
+
+  {
+    // --- Content-object editing (FPDFEdit API) ---
+    FPDF_DOCUMENT ed = FPDF_LoadMemDocument(sample.data(), (int)sample.size(), nullptr);
+    check("obj: edit sample loads", ed != nullptr);
+    if (ed)
+    {
+      FPDF_PAGE ep = FPDF_LoadPage(ed, 0);
+      check("obj: edit page loads", ep != nullptr);
+      if (ep)
+      {
+        const int n0 = FPDFPage_CountObjects(ep);
+        checkEq("obj: two objects in sample", n0, 2);
+        if (n0 == 2)
+        {
+          FPDF_PAGEOBJECT o0 = FPDFPage_GetObject(ep, 0);
+          FPDF_PAGEOBJECT o1 = FPDFPage_GetObject(ep, 1);
+          check("obj: first is text", FPDFPageObj_GetType(o0) == FPDF_PAGEOBJ_TEXT);
+          check("obj: second is vector", FPDFPageObj_GetType(o1) == FPDF_PAGEOBJ_PATH);
+          FPDF_TEXTPAGE et = FPDFText_LoadPage(ep);
+          if (et)
+          {
+            FPDF_WCHAR wb[512] = {};
+            unsigned long wl = FPDFTextObj_GetText(o0, et, wb, sizeof(wb));
+            check("obj: text object has content",
+                  wl > 2 &&
+                  wcsncmp(reinterpret_cast<const wchar_t*>(wb), L"Stitchup", 8) == 0);
+            FPDFText_ClosePage(et);
+          }
+          else check("obj: textpage", false);
+
+          float ol = 0, ob = 0, or_ = 0, ot = 0;
+          if (FPDFPageObj_GetBounds(o0, &ol, &ob, &or_, &ot) && ot > 700)
+          {
+            FPDFPageObj_Transform(o0, 1, 0, 0, 1, 10, 5);
+            FPDFPage_GenerateContent(ep);
+            FPDF_ClosePage(ep);
+            ep = nullptr;
+            std::vector<unsigned char> ebytes;
+            bool eSaved = SaveAsString(ed, ebytes) && !ebytes.empty();
+            check("obj: doc saves after transform", eSaved);
+            FPDF_DOCUMENT er = eSaved ? FPDF_LoadMemDocument(ebytes.data(), (int)ebytes.size(), nullptr) : nullptr;
+            check("obj: transformed doc reloads", er != nullptr);
+            if (er)
+            {
+              FPDF_PAGE erp = FPDF_LoadPage(er, 0);
+              check("obj: transformed page loads", erp != nullptr);
+              if (erp)
+              {
+                FPDF_PAGEOBJECT eo0 = FPDFPage_GetObject(erp, 0);
+                float nl = 0, nb = 0, nr = 0, nt = 0;
+                if (FPDFPageObj_GetBounds(eo0, &nl, &nb, &nr, &nt))
+                {
+                  check("obj: moved object persisted x", std::fabs(nl - (ol + 10)) < 1.0f);
+                  check("obj: moved object persisted y", std::fabs(nt - (ot + 5)) < 1.0f);
+                }
+                else check("obj: reloaded bounds query", false);
+                FPDF_ClosePage(erp);
+              }
+              FPDF_CloseDocument(er);
+            }
+          }
+          else check("obj: text bounds readable", false);
+        }
+        if (ep) FPDF_ClosePage(ep);
+      }
+      FPDF_CloseDocument(ed);
+    }
+
+    // Remove an object -> serialize -> reload -> one object (the path) remains.
+    {
+      FPDF_DOCUMENT rd = FPDF_LoadMemDocument(sample.data(), (int)sample.size(), nullptr);
+      check("obj: remove doc loads", rd != nullptr);
+      if (rd)
+      {
+        FPDF_PAGE rp = FPDF_LoadPage(rd, 0);
+        check("obj: remove page loads", rp != nullptr);
+        if (rp)
+        {
+          FPDF_PAGEOBJECT r0 = FPDFPage_GetObject(rp, 0);
+          if (r0)
+          {
+            FPDFPage_RemoveObject(rp, r0);
+            FPDFPage_GenerateContent(rp);
+          }
+          FPDF_ClosePage(rp);
+        }
+        std::vector<unsigned char> rbytes;
+        bool rSaved = SaveAsString(rd, rbytes) && !rbytes.empty();
+        check("obj: doc saves after removal", rSaved);
+        FPDF_DOCUMENT rr = rSaved ? FPDF_LoadMemDocument(rbytes.data(), (int)rbytes.size(), nullptr) : nullptr;
+        check("obj: removed doc reloads", rr != nullptr);
+        if (rr)
+        {
+          FPDF_PAGE rrp = FPDF_LoadPage(rr, 0);
+          if (rrp)
+          {
+            checkEq("obj: one object remains", FPDFPage_CountObjects(rrp), 1);
+            check("obj: remaining is the path",
+                  FPDFPageObj_GetType(FPDFPage_GetObject(rrp, 0)) == FPDF_PAGEOBJ_PATH);
+            FPDF_ClosePage(rrp);
+          }
+          FPDF_CloseDocument(rr);
+        }
+        FPDF_CloseDocument(rd);
+      }
+    }
+
+    // Recolor: blue -> red, fill color round-trips through serialize/reload.
+    {
+      FPDF_DOCUMENT cd = FPDF_LoadMemDocument(sample.data(), (int)sample.size(), nullptr);
+      check("obj: recolor doc loads", cd != nullptr);
+      if (cd)
+      {
+        FPDF_PAGE cp = FPDF_LoadPage(cd, 0);
+        if (cp)
+        {
+          FPDF_PAGEOBJECT co = FPDFPage_GetObject(cp, 1);
+          FPDFPageObj_SetFillColor(co, 255, 0, 0, 255);
+          FPDFPageObj_SetStrokeColor(co, 255, 0, 0, 255);
+          FPDFPage_GenerateContent(cp);
+          FPDF_ClosePage(cp);
+        }
+        std::vector<unsigned char> cbytes;
+        bool cSaved = SaveAsString(cd, cbytes) && !cbytes.empty();
+        check("obj: recolor saved", cSaved);
+        FPDF_DOCUMENT cr = cSaved ? FPDF_LoadMemDocument(cbytes.data(), (int)cbytes.size(), nullptr) : nullptr;
+        check("obj: recolored doc reloads", cr != nullptr);
+        if (cr)
+        {
+          FPDF_PAGE crp = FPDF_LoadPage(cr, 0);
+          if (crp)
+          {
+            unsigned int R = 0, G = 0, B = 0, A = 0;
+            FPDF_PAGEOBJECT co2 = crp ? FPDFPage_GetObject(crp, 1) : nullptr;
+            if (co2 && FPDFPageObj_GetFillColor(co2, &R, &G, &B, &A))
+              check("obj: fill is red now", R == 255 && G == 0 && B == 0 && A == 255);
+            else
+              check("obj: fill color query", false);
+            FPDF_ClosePage(crp);
+          }
+          FPDF_CloseDocument(cr);
+        }
+        FPDF_CloseDocument(cd);
+      }
+    }
+
+    // Text edit: replace the only run, serialize, reload -> new text present.
+    {
+      FPDF_DOCUMENT td = FPDF_LoadMemDocument(sample.data(), (int)sample.size(), nullptr);
+      check("obj: edit-text doc loads", td != nullptr);
+      if (td)
+      {
+        FPDF_PAGE tp = FPDF_LoadPage(td, 0);
+        check("obj: edit-text page loads", tp != nullptr);
+        bool textReplaced = false;
+        if (tp)
+        {
+          FPDF_PAGEOBJECT to = FPDFPage_GetObject(tp, 0);
+          float ol = 0, ob = 0, or_ = 0, ot = 0;
+          FPDFPageObj_GetBounds(to, &ol, &ob, &or_, &ot);
+          FPDF_PAGEOBJECT no2 = FPDFPageObj_NewTextObj(td, "Helvetica", 24.0f);
+          if (no2)
+          {
+            const unsigned short* u16 = reinterpret_cast<const unsigned short*>(L"Edited Text");
+            if (FPDFText_SetText(no2, u16))
+            {
+              FS_MATRIX tm{};
+              tm.a = 1; tm.d = 1;
+              FPDFPageObj_SetMatrix(no2, &tm);
+              float nl = 0, nb = 0, nr = 0, nt = 0;
+              FPDFPageObj_GetBounds(no2, &nl, &nb, &nr, &nt);
+              tm.e = ol - nl; tm.f = ob - nb;
+              FPDFPageObj_SetMatrix(no2, &tm);
+              FPDFPage_RemoveObject(tp, to);
+              FPDFPage_InsertObjectAtIndex(tp, no2, 0);
+              textReplaced = true;
+            }
+            else FPDFPageObj_Destroy(no2);
+          }
+          FPDFPage_GenerateContent(tp);
+          FPDF_ClosePage(tp);
+        }
+        check("obj: new text object installed", textReplaced);
+        std::vector<unsigned char> tbytes;
+        bool tSaved = SaveAsString(td, tbytes) && !tbytes.empty();
+        check("obj: edited text saved", tSaved);
+        FPDF_DOCUMENT tr = tSaved ? FPDF_LoadMemDocument(tbytes.data(), (int)tbytes.size(), nullptr) : nullptr;
+        check("obj: edited text doc reloads", tr != nullptr);
+        if (tr)
+        {
+          FPDF_PAGE trp = FPDF_LoadPage(tr, 0);
+          if (trp)
+          {
+            const std::wstring tx = PageTextRaw(trp);
+            check("obj: new text present", tx.find(L"Edited Text") != std::wstring::npos);
+            check("obj: original text gone", tx.find(L"Stitchup") == std::wstring::npos);
+            FPDF_ClosePage(trp);
+          }
+          FPDF_CloseDocument(tr);
+        }
+        FPDF_CloseDocument(td);
+      }
+    }
   }
 
   if (s) FPDF_CloseDocument(s);

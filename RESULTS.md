@@ -1,4 +1,4 @@
-# RESULTS - Project 027: Stitchup PDF Editor
+﻿# RESULTS - Project 027: Stitchup PDF Editor
 
 ## Goal
 
@@ -21,7 +21,20 @@ user rejected as a product (no GUI).
 
 Command: `Stitchup.exe --self-test`
 
-Result: **157 passed, 0 failed** (exit code 0).
+Result: **185 passed, 0 failed** (exit code 0).
+
+Select / Move Content Object (`obj:` checks covering content-object editing):
+clicking a content object (text run or vector path) on the current page selects
+it (accent bounding box + handles); **Move** drags the object via
+`FPDFPageObj_Transform` and the offset persists through save + reload
+(x +10 / y +5 verified on reopen); **Delete** removes the object from the page's
+object array immediately (2 objects -> 1, the survivor is the path); **Recolor**
+applies `FPDFPageObj_SetFillColor` and the new fill survives save + reopen
+(`GetFillColor` returns the recolored R/G/B/A on reload); **Edit Text**
+(double-click) detaches the selected text object and installs a new text object,
+and after save + reload the edited string is present while the original run is
+gone (verified via `FPDFPageObj_GetType`, the edited doc's `FPDFText_LoadPage`
+run, and a `FlateDecode`-inflated content-stream text probe).
 
 Coverage: PDFium init; create doc + add page; save to buffer (PDF header and
 `%%EOF` trailer checks); reopen roundtrip; page count; load sample PDF (612x792);
@@ -83,7 +96,7 @@ column.
 
 `test_result.txt` (SHA-256 of the run captured in the report):
 ```
--- enter -- ... SUMMARY 157 passed, 0 failed
+-- enter -- ... SUMMARY 185 passed, 0 failed
 ```
 
 GUI verification (programmatic, window handles + messages):
@@ -178,7 +191,7 @@ No CRT DLLs (static `/MT` linked). Portable package = `Stitchup.exe` +
 
 | File           | Size     | SHA-256                                                           |
 |----------------|----------|-------------------------------------------------------------------|
-| Stitchup.exe   | 430,080 B | 922461646405781DEBE1E7B8465717E257D535C3ECE42686F43AF562B4B30719 |
+| Stitchup.exe   | 451,584 B | 67E2460D5FA295264D1AF3F8F10090A9329E79D0D85E8F9D3E8194A87410FB30 |
 | pdfium.dll     | 7,375,360 B | 55E7EBEF29A1EC9523D1ADB8B260A73E7DFB0F64D3F0285121D20ECD6148EF18 |
 | example.pdf    | 1,034 B   | B276682EFD75780E462C17489176D710AD1339D84E69C6218AD3C2F8E60FC132 |
 | app.ico        | 20,597 B  | 5FB009C7A83254FBCD81C205492E03A683EDB0BA65B6E44962614B06A240CA44 |
@@ -217,7 +230,7 @@ PDF revision 3 / 128-bit RC4 password-protected copy with user + optional
 owner passwords; verified end-to-end, including reopening the encrypted file
 against the bundled PDFium with the correct password). Phase C COMPLETE —
 no remaining feature milestones.
-Self-test 157/157. User verdict pending — open `dist\Stitchup.exe file.pdf` and
+Self-test 185/185. User verdict pending — open `dist\Stitchup.exe file.pdf` and
 try Home > Annotate, click any PDF link, Home > Pages (Extract / Split /
 Auto-Crop), File > Export Text / Export CSV, File > Watermark, File > Save As
 Encrypted, and open a password-protected PDF.

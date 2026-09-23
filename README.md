@@ -48,6 +48,12 @@ Produces `dist\Stitchup.exe` + `dist\pdfium.dll`.
   page; annotations persist through Save and keep their rendered appearance
 - Links: clicking an internal link jumps to its destination page; clicking a
   URI link opens the URL in the default browser (hand cursor over link areas)
+- Content object editing (Edit > Select / Move Content Object, or the Home >
+  Edit group Select tool): click any content object — text run, vector path or
+  image — on the current page to select it (accent bounding box + handles), then
+  drag to move it, Ctrl+Del (or Menu > Delete Selected Object) to remove it,
+  RecColor to recolor the fill, or Edit Text (double-click) to replace the text
+  run; edits persist through Save and reload (4 object tests added)
 - Page management (Home > Pages): Extract the current page into its own PDF,
   Split a document into one file per page, and Auto-Crop the current page to
   its content (white margins trimmed via an ink-bounding-box render pass)
