@@ -33,6 +33,13 @@ Produces `dist\Stitchup.exe` + `dist\pdfium.dll`.
 - Nitro Pro v7-style shell: ribbon (Home/View/Tools tabs with groups: Document,
   Pages, Zoom, Navigate, Panes), left navigation pane (Page Thumbnails,
   Bookmarks with outline tree), splitter, canvas, status bar
+- Multi-document tabs: open several files at once and switch between them
+  (Ctrl+Tab / Ctrl+Shift+Tab, New Tab Ctrl+T, Close Tab Ctrl+Shift+F4, or click
+  the strip at the top of the window); each tab keeps its own page, zoom and
+  scroll position
+- View: two-page side-by-side spread (`F5` or View > Two-Page Spread) and a
+  toggleable left navigation pane (`F8` or View > Sidebar) for extra canvas
+  room; pages are centered horizontally in the main display
 - File menu: New, Open, Save (atomic: temp file + replace), Save As, Import PDF
 - Edit: rotate page CW/CCW, delete page, add blank page (Letter/A4), drag pages
   in the thumbnails panel to reorder
@@ -76,7 +83,8 @@ Produces `dist\Stitchup.exe` + `dist\pdfium.dll`.
 - Drag & drop a PDF onto the window to open it; open via command-line argument
 - Shortcuts: Ctrl+N/O/S, Ctrl+Shift+S, Ctrl+R (rotate), Ctrl+[/Ctrl+], Delete,
   Ctrl+0/1/2 (100%/fit width/fit page), Ctrl+D (dark mode), PgUp/PgDn,
-  Ctrl+wheel to zoom
+  Ctrl+wheel to zoom, F5 (two-page spread), F8 (toggle sidebar), Ctrl+T
+  (new tab), Ctrl+Tab/Ctrl+Shift+Tab (next/previous tab)
 
 ## Third-party components
 

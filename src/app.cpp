@@ -75,11 +75,18 @@ enum
   ID_OBJ_EDIT,
   ID_OBJ_DELETE,
   ID_OBJ_RECOLOR,
+  ID_SIDEBAR,
+  ID_SPREAD,
+  ID_NEW_TAB,
+  ID_CLOSE_TAB,
+  ID_NEXT_TAB,
+  ID_PREV_TAB,
 };
 
 enum
 {
   RIB_TAB_H = 24,   // ribbon tab strip height
+  TAB_H = 30,       // document tab strip height
   RIB_BTN_Y = 32,   // button row top
   RIB_BTN_H = 34,   // button height
   RIB_CAP_Y = 70,   // group caption row top
@@ -126,6 +133,7 @@ struct App
   HWND status = nullptr;
   HWND paneTabs = nullptr;
   HWND bookmarks = nullptr;
+  HWND tabbar = nullptr;
   HFONT font = nullptr;
   HFONT treeFont = nullptr;
   int dpi = 96;
@@ -143,6 +151,8 @@ struct App
   int pane = 0;        // 0 = thumbnails, 1 = bookmarks
   int ribbonTab = 0;   // 0 = Home, 1 = View, 2 = Tools
   bool bmDirty = true;
+  bool showSidebar = true;
+  bool spread = false;  // two-page side-by-side layout
 
   struct GroupBox
   {
@@ -176,6 +186,25 @@ struct App
   bool selDragMoved = false;
   double dragLastX = 0, dragLastY = 0;
 };
+
+// A document open in its own tab. The live App fields above always mirror the
+// active tab (g.doc, g.path, g.name, g.dirty, g.pageCount, g.selected, g.zoom,
+// g.scrollX/Y). Switching tabs snapshots the current live state back into its
+// TabDoc and restores the target's.
+struct TabDoc
+{
+  FPDF_DOCUMENT doc = nullptr;
+  std::wstring path;
+  std::wstring name;
+  bool dirty = false;
+  int pageCount = 0;
+  int selected = 0;
+  double zoom = 1.0;
+  int scrollX = 0;
+  int scrollY = 0;
+};
+static std::vector<TabDoc> g_tabs;
+static int g_curTab = -1;
 
 static App g;
 
@@ -364,6 +393,70 @@ static double MaxPageH()
   return m;
 }
 
+// Absolute (pre-scroll) device rect for every page under current zoom/spread.
+// rects is indexed by page number (zero rect for skipped/unloadable pages).
+// Also returns the total scrollable content size.
+static void LayoutPages(int cw, std::vector<RECT>& rects, int& contentW,
+                        int& contentH)
+{
+  rects.clear();
+  contentW = std::max(cw, 24);
+  contentH = 24;
+  if (!g.doc || g.pageCount == 0) return;
+  double s = g.zoom;
+  double span = std::max(1.0, MaxPageW()) * s;
+  int spanC = (int)std::ceil(span);
+  int yc = 12;
+  if (!g.spread)
+  {
+    int workW = spanC + 32;
+    int ctxW = std::max(workW, cw);
+    int xBase = (ctxW - spanC) / 2;
+    for (int i = 0; i < g.pageCount; ++i)
+    {
+      float pw = PageW(i), ph = PageH(i);
+      int w = (int)std::ceil(pw * s);
+      int h = (int)std::ceil(ph * s);
+      if (w < 1 || h < 1) { rects.push_back({0, 0, 0, 0}); continue; }
+      int x = xBase + (spanC - w) / 2;
+      rects.push_back({x, yc, x + w, yc + h});
+      contentH = yc + h + 12;
+      yc += h + 14;
+    }
+    contentW = workW;
+  }
+  else
+  {
+    contentW = 32;
+    for (int i = 0; i < g.pageCount; i += 2)
+    {
+      int j = i + 1;
+      float pw0 = PageW(i), ph0 = PageH(i);
+      int w0 = (int)std::ceil(pw0 * s);
+      int h0 = (int)std::ceil(ph0 * s);
+      bool has2 = j < g.pageCount;
+      float pw1 = has2 ? PageW(j) : 0.0f;
+      float ph1 = has2 ? PageH(j) : 0.0f;
+      int w1 = (int)std::ceil(pw1 * s);
+      int h1 = (int)std::ceil(ph1 * s);
+      if (w0 < 1 && (!has2 || w1 < 1)) continue;
+      int rowW = (w0 > 0 ? w0 : 0) + (has2 && w1 > 0 ? w1 + 12 : 0);
+      int xBase = (std::max(rowW + 32, cw) - rowW) / 2;
+      int rowH = std::max(h0, h1);
+      rects.push_back({xBase, yc, xBase + w0, yc + h0});
+      if (has2 && w1 > 0)
+        rects.push_back({xBase + w0 + 12, yc, xBase + w0 + 12 + w1, yc + h1});
+      else
+        rects.push_back({0, 0, 0, 0});
+      contentW = std::max(contentW, rowW + 32);
+      contentH = yc + rowH + 12;
+      yc += rowH + 14;
+    }
+  }
+}
+
+static POINT PageOrigin(int sx, int sy) { return POINT{-sx, -sy}; }
+
 static HBITMAP RenderPageBitmapInto(FPDF_PAGE p, int w, int h)
 {
   if (!p || w < 1 || h < 1) return nullptr;
@@ -433,11 +526,97 @@ static void CloseDoc()
   g.bmDirty = true;
 }
 
+static void SnapshotCurrentTab()
+{
+  if (g_curTab < 0 || g_curTab >= (int)g_tabs.size()) return;
+  TabDoc& t = g_tabs[g_curTab];
+  t.doc = g.doc;
+  t.path = g.path;
+  t.name = g.name;
+  t.dirty = g.dirty;
+  t.pageCount = g.pageCount;
+  t.selected = g.selected;
+  t.zoom = g.zoom;
+  t.scrollX = g.scrollX;
+  t.scrollY = g.scrollY;
+}
+
+static void RefreshTabBar();
+static void RefreshState();
+static void UpdateScrollbars();
+
+static void RestoreTab(int i)
+{
+  if (i < 0 || i >= (int)g_tabs.size()) return;
+  SnapshotCurrentTab();
+  g_curTab = i;
+  const TabDoc& t = g_tabs[i];
+  g.doc = t.doc;
+  g.path = t.path;
+  g.name = t.name;
+  g.dirty = t.dirty;
+  g.pageCount = t.pageCount;
+  g.selected = t.selected;
+  g.zoom = t.zoom;
+  g.scrollX = t.scrollX;
+  g.scrollY = t.scrollY;
+  SetWindowTextW(g.frame, ((g.name.empty() ? std::wstring(L"Stitchup PDF Editor")
+                                            : g.name + L" - Stitchup PDF Editor"))
+                              .c_str());
+  RefreshState();
+  g.bmDirty = true;
+  UpdateScrollbars();
+  InvalidateRect(g.canvas, nullptr, TRUE);
+  InvalidateRect(g.thumbs, nullptr, TRUE);
+  InvalidateRect(g.status, nullptr, TRUE);
+  RefreshTabBar();
+}
+
+static void CloseTab(int i)
+{
+  if (i < 0 || i >= (int)g_tabs.size()) return;
+  SnapshotCurrentTab();
+  TabDoc t = g_tabs[i];
+  g_tabs.erase(g_tabs.begin() + i);
+  if (t.doc) FPDF_CloseDocument(t.doc);
+  if (g_tabs.empty())
+  {
+    CloseDoc();
+    g_curTab = -1;
+    if (g.frame) SetWindowTextW(g.frame, L"Stitchup PDF Editor");
+    RefreshTabBar();
+    return;
+  }
+  int next = i;
+  if (next >= (int)g_tabs.size()) next = (int)g_tabs.size() - 1;
+  RestoreTab(next);
+}
+
+static void SetActiveTab(int i)
+{
+  if (i < 0 || i >= (int)g_tabs.size()) return;
+  RestoreTab(i);
+}
+
+static void NextTab(int d)
+{
+  if (g_tabs.empty()) return;
+  SetActiveTab((g_curTab + d + (int)g_tabs.size()) % (int)g_tabs.size());
+}
+
+static void RefreshTabBar()
+{
+  if (g.tabbar) InvalidateRect(g.tabbar, nullptr, TRUE);
+}
+
 static void RefreshState()
 {
+  SnapshotCurrentTab();
   g.pageCount = g.doc ? FPDF_GetPageCount(g.doc) : 0;
   if (g.selected >= g.pageCount) g.selected = g.pageCount ? g.pageCount - 1 : 0;
   if (g.selected < 0) g.selected = 0;
+  if (g_curTab >= 0 && g_curTab < (int)g_tabs.size())
+    g_tabs[g_curTab].pageCount = g.pageCount;
   ClearCanvasCache();
   if (g.status) InvalidateRect(g.status, nullptr, TRUE);
 }
@@ -576,12 +755,21 @@ static void LoadDoc(const std::wstring& file)
     MessageBoxW(g.frame, msg.c_str(), L"Stitchup", MB_OK | MB_ICONERROR);
     return;
   }
-  CloseDoc();
+  SnapshotCurrentTab();
   g.doc = d;
   g.path = file;
   g.bmDirty = true;
   size_t p = file.find_last_of(L"\\/");
   g.name = (p == std::wstring::npos) ? file : file.substr(p + 1);
+  TabDoc nd;
+  nd.doc = d;
+  nd.path = g.path;
+  nd.name = g.name;
+  nd.pageCount = FPDF_GetPageCount(d);
+  nd.selected = 0;
+  g.dirty = false;
+  g_tabs.push_back(nd);
+  g_curTab = (int)g_tabs.size() - 1;
   SetWindowTextW(g.frame, (g.name + L" - Stitchup PDF Editor").c_str());
   RefreshState();
   double mx = std::max(1.0, MaxPageW());
@@ -592,19 +780,34 @@ static void LoadDoc(const std::wstring& file)
   g.scrollX = g.scrollY = 0;
   InvalidateRect(g.canvas, nullptr, TRUE);
   InvalidateRect(g.thumbs, nullptr, TRUE);
+  InvalidateRect(g.status, nullptr, TRUE);
+  RefreshTabBar();
   SetFocus(g.frame);
 }
 
 static void NewDoc()
 {
-  CloseDoc();
+  SnapshotCurrentTab();
   g.doc = FPDF_CreateNewDocument();
   FPDFPage_New(g.doc, 0, 612.0, 792.0);
+  g.path.clear();
+  g.name.clear();
+  g.dirty = false;
+  TabDoc nd;
+  nd.doc = g.doc;
+  nd.pageCount = FPDF_GetPageCount(g.doc);
+  g.pageCount = nd.pageCount;
+  g.selected = 0;
+  g.zoom = 1.0;
+  g.scrollX = g.scrollY = 0;
+  g_tabs.push_back(nd);
+  g_curTab = (int)g_tabs.size() - 1;
   SetWindowTextW(g.frame, L"Stitchup PDF Editor");
   RefreshState();
   g.bmDirty = true;
   InvalidateRect(g.canvas, nullptr, TRUE);
   InvalidateRect(g.thumbs, nullptr, TRUE);
+  RefreshTabBar();
   SetFocus(g.frame);
 }
 
@@ -1639,13 +1842,11 @@ static void UpdateScrollbars()
   RECT rc{};
   GetClientRect(g.canvas, &rc);
   int cw = rc.right - rc.left, ch = rc.bottom - rc.top;
-  double s = g.zoom;
-  double span = std::max(1.0, MaxPageW()) * s;
-  int contentW = (int)std::ceil(span) + 32;
-  int th = 0;
-  for (int i = 0; i < g.pageCount; ++i)
-    th += (int)std::ceil(PageH(i) * s) + 14;
-  int contentH = th + 24;
+  std::vector<RECT> rects;
+  int contentW = 0, contentH = 0;
+  LayoutPages(cw, rects, contentW, contentH);
+  contentW = std::max(contentW, 24);
+  contentH = std::max(contentH, 24);
 
   SCROLLINFO si{};
   si.cbSize = sizeof(si);
@@ -2406,30 +2607,30 @@ static void CanvasPaint(HDC dc, int cw, int ch)
 
   if (!g.doc || g.pageCount == 0) return;
   double s = g.zoom;
-  double span = std::max(1.0, MaxPageW()) * s;
-  int workW = (int)std::ceil(span) + 32;
-  int xBase = (workW - (int)std::ceil(span)) / 2 - g.scrollX;
-  int yc = 12 - g.scrollY;
+  std::vector<RECT> rects;
+  int contentW = 0, contentH = 0;
+  LayoutPages(cw, rects, contentW, contentH);
+  POINT org = PageOrigin((int)std::lround(g.scrollX),
+                         (int)std::lround(g.scrollY));
 
-  for (int i = 0; i < g.pageCount; ++i)
+  for (int i = 0; i < g.pageCount && i < (int)rects.size(); ++i)
   {
-    float pw = PageW(i), ph = PageH(i);
-    if (pw < 1 || ph < 1) continue;
-    int w = (int)std::ceil(pw * s);
-    int h = (int)std::ceil(ph * s);
-    int x = xBase + (int)((std::ceil(span) - w) / 2.0);
-    RECT r{x, yc, x + w, yc + h};
-    if (r.bottom < 0 || r.top > ch) { yc += h + 14; continue; }
-    if (r.right >= 0 && r.left <= cw)
+    const RECT& pr = rects[i];
+    int w = pr.right - pr.left, h = pr.bottom - pr.top;
+    int x = pr.left + org.x, y = pr.top + org.y;
+    if (w < 1 || h < 1) continue;
+    if (y + h < 0 || y > ch) continue;
+    if (x + w >= 0 && x <= cw)
     {
       int key;
-      int rx = x, ry = yc, rw = w, rh = h;
+      int rx = x, ry = y, rw = w, rh = h;
+      RECT r{x, y, x + w, y + h};
       // shadow (canvas dimmed ~30%)
       COLORREF shC = RGB((GetRValue(th.canvasBg) * 7) / 10,
                          (GetGValue(th.canvasBg) * 7) / 10,
                          (GetBValue(th.canvasBg) * 7) / 10);
       HBRUSH sh = CreateSolidBrush(shC);
-      RECT sr{x + 4, yc + 4, x + w + 4, yc + h + 4};
+      RECT sr{x + 4, y + 4, x + w + 4, y + h + 4};
       FillRect(dc, &sr, sh);
       DeleteObject(sh);
 
@@ -2479,8 +2680,9 @@ static void CanvasPaint(HDC dc, int cw, int ch)
         float slx = g.sel.l, sbx = g.sel.b, srx = g.sel.r, stx = g.sel.t;
         if (srx > slx && stx > sbx)
         {
+          float phh = PageH(i);
           int ax = x + (int)std::lround(slx * s);
-          int ay = yc + (int)std::lround((ph - stx) * s);
+          int ay = y + (int)std::lround((phh - stx) * s);
           int aw = (int)std::lround((srx - slx) * s);
           int ah = (int)std::lround((stx - sbx) * s);
           HPEN pen = CreatePen(PS_SOLID, 2, th.accent);
@@ -2508,7 +2710,6 @@ static void CanvasPaint(HDC dc, int cw, int ch)
         }
       }
     }
-    yc += h + 14;
   }
 }
 
@@ -2782,6 +2983,8 @@ static LRESULT CALLBACK CanvasProc(HWND hw, UINT msg, WPARAM wp, LPARAM lp)
 // ---------------------------------------------------------------------------
 // Split bar
 // ---------------------------------------------------------------------------
+static void RelayoutPanes(int w, int h);
+
 static LRESULT CALLBACK SplitProc(HWND hw, UINT msg, WPARAM wp, LPARAM lp)
 {
   switch (msg)
@@ -2820,14 +3023,7 @@ static LRESULT CALLBACK SplitProc(HWND hw, UINT msg, WPARAM wp, LPARAM lp)
           g.thumbsW = nw;
           RECT cr;
           GetClientRect(g.frame, &cr);
-          SetWindowPos(g.thumbs, nullptr, 0, 0, g.thumbsW, cr.bottom - 28,
-                       SWP_NOMOVE | SWP_NOZORDER);
-          SetWindowPos(hw, nullptr, g.thumbsW, 0, 6, cr.bottom - 28,
-                       SWP_NOZORDER);
-          SetWindowPos(g.canvas, nullptr, g.thumbsW + 6, 44,
-                       std::max(100, (int)(cr.right - (g.thumbsW + 6))),
-                       cr.bottom - 72, SWP_NOZORDER);
-          InvalidateRect(g.thumbs, nullptr, TRUE);
+          RelayoutPanes(cr.right - cr.left, cr.bottom - cr.top);
         }
       }
       return 0;
@@ -3027,8 +3223,10 @@ static void BuildToolbar(HWND)
     {ID_FITP,         L"Fit Page",   76, 1, 0},
     {ID_PREV,         L"Previous",   78, 1, 1},
     {ID_NEXT,         L"Next",       62, 1, 1},
+    {ID_SPREAD,       L"Spread",     70, 1, 1},
     {ID_PANE_THUMBS,  L"Thumbnails", 92, 1, 2},
     {ID_PANE_BOOKMARKS, L"Bookmarks", 90, 1, 2},
+    {ID_SIDEBAR,      L"Sidebar",    72, 1, 2},
     {ID_ANN_HL,       L"Highlight",  80, 0, 2},
     {ID_ANN_UL,       L"Underline",  80, 0, 2},
     {ID_ANN_NOTE,     L"Note",       56, 0, 2},
@@ -3038,8 +3236,12 @@ static void BuildToolbar(HWND)
     {ID_TOOL_SELECT,  L"Select",     62, 0, 3},
     {ID_OBJ_EDIT,     L"Edit Text",  78, 0, 3},
     {ID_OBJ_DELETE,   L"Delete",     62, 0, 3},
-    {ID_OBJ_RECOLOR,  L"Recolor",    66, 0, 3},
-  };
+  {ID_OBJ_RECOLOR,  L"Recolor",    66, 0, 3},
+  {ID_WATERMARK,    L"Watermark",  76, 2, 0},
+  {ID_SAVEENC,      L"Encrypt",    66, 2, 0},
+  {ID_EXPORT_TEXT,  L"Export Text",80, 2, 1},
+  {ID_EXPORT_CSV,   L"Export CSV", 66, 2, 1},
+};
   g.tabBtns[0] = MakeBtn(g.toolbar, ID_TAB_HOME, L"Home", 4, 2, 66, 20, true);
   g.tabBtns[1] = MakeBtn(g.toolbar, ID_TAB_VIEW, L"View", 74, 2, 66, 20, true);
   g.tabBtns[2] = MakeBtn(g.toolbar, ID_TAB_TOOLS, L"Tools", 144, 2, 66, 20, true);
@@ -3058,12 +3260,14 @@ static const wchar_t* GroupName(int tab, int grp)
     return grp == 0 ? L"Document" : (grp == 1 ? L"Pages" : (grp == 2 ? L"Annotate" : L"Content"));
   if (tab == 1)
     return grp == 0 ? L"Zoom" : (grp == 1 ? L"Navigate" : L"Panes");
+  if (tab == 2)
+    return grp == 0 ? L"Security" : L"Export";
   return nullptr;
 }
 
 static int GroupCount(int tab)
 {
-  return tab == 0 ? 4 : (tab == 1 ? 3 : 0);
+  return tab == 0 ? 4 : (tab == 1 ? 3 : 2);
 }
 
 static void SetTabPressed()
@@ -3160,9 +3364,17 @@ static void GotoPageIndex(int idx)
 {
   if (g.pageCount == 0) return;
   g.selected = std::max(0, std::min(g.pageCount - 1, idx));
-  double s = g.zoom;
-  float ph = PageH(g.selected);
-  g.scrollY = (int)((g.selected < 2) ? 0 : (g.selected - 1) * (ph * s + 14.0));
+  RECT cr{};
+  int cw = 120;
+  if (g.canvas) { GetClientRect(g.canvas, &cr); cw = cr.right - cr.left; }
+  std::vector<RECT> rects;
+  int cwD = 0, chD = 0;
+  LayoutPages(cw, rects, cwD, chD);
+  if (g.selected >= 0 && g.selected < (int)rects.size())
+  {
+    int rTop = rects[g.selected].top;
+    g.scrollY = std::max(0, rTop - 12 - (int)(PageH(g.selected) * g.zoom * 0.2));
+  }
   InvalidateRect(g.canvas, nullptr, TRUE);
   InvalidateRect(g.thumbs, nullptr, TRUE);
   InvalidateRect(g.status, nullptr, TRUE);
@@ -3181,24 +3393,25 @@ static void GoPage(int d)
 // ---------------------------------------------------------------------------
 static bool HitPage(POINT pt, HitInfo& out)
 {
-  double s = g.zoom;
-  double span = std::max(1.0, MaxPageW()) * s;
-  int workW = (int)std::ceil(span) + 32;
-  int xBase = (workW - (int)std::ceil(span)) / 2 - g.scrollX;
-  int yc = 12 - g.scrollY;
-  for (int i = 0; i < g.pageCount; ++i)
+  RECT cr{};
+  int cw = 120;
+  if (g.canvas) { GetClientRect(g.canvas, &cr); cw = cr.right - cr.left; }
+  std::vector<RECT> rects;
+  int cwDummy = 0, chDummy = 0;
+  LayoutPages(cw, rects, cwDummy, chDummy);
+  POINT org = PageOrigin((int)std::lround(g.scrollX),
+                         (int)std::lround(g.scrollY));
+  for (int i = 0; i < g.pageCount && i < (int)rects.size(); ++i)
   {
-    float pw = PageW(i), ph = PageH(i);
-    if (pw < 1 || ph < 1) continue;
-    int w = (int)std::ceil(pw * s);
-    int h = (int)std::ceil(ph * s);
-    int x = xBase + (int)((std::ceil(span) - w) / 2.0);
-    if (pt.x >= x && pt.x <= x + w && pt.y >= yc && pt.y <= yc + h)
+    const RECT& pr = rects[i];
+    int w = pr.right - pr.left, h = pr.bottom - pr.top;
+    if (w < 1 || h < 1) continue;
+    int x = pr.left + org.x, y = pr.top + org.y;
+    if (pt.x >= x && pt.x <= x + w && pt.y >= y && pt.y <= y + h)
     {
-      out = {i, x, yc, w, h};
+      out = {i, x, y, w, h};
       return true;
     }
-    yc += h + 14;
   }
   return false;
 }
@@ -3445,6 +3658,60 @@ static void SetPane(int p)
   }
 }
 
+static void RelayoutPanes(int w, int h)
+{
+  if (!g.toolbar) return;
+  int paneY = TAB_H + RIB_H + PANE_TAB_H;
+  int paneH = std::max(10, h - paneY - 28);
+  int canvasH = std::max(10, h - TAB_H - RIB_H - 28);
+  bool sb = g.showSidebar;
+  int sw = sb ? g.thumbsW : 0;
+  SetWindowPos(g.tabbar, nullptr, 0, 0, w, TAB_H, SWP_NOZORDER);
+  SetWindowPos(g.toolbar, nullptr, 0, TAB_H, w, RIB_H, SWP_NOZORDER);
+  SetWindowPos(g.paneTabs, nullptr, 0, TAB_H + RIB_H, sw, PANE_TAB_H,
+               SWP_NOZORDER);
+  SetWindowPos(g.status, nullptr, 0, h - 28, w, 28, SWP_NOZORDER);
+  SetWindowPos(g.thumbs, nullptr, 0, paneY, sw, paneH, SWP_NOZORDER);
+  SetWindowPos(g.bookmarks, nullptr, 0, paneY, sw, paneH, SWP_NOZORDER);
+  SetWindowPos(g.split, nullptr, sw, TAB_H + RIB_H, 6,
+               PANE_TAB_H + paneH, SWP_NOZORDER);
+  SetWindowPos(g.canvas, nullptr, sb ? sw + 6 : 0, TAB_H + RIB_H,
+               std::max(100, w - (sb ? sw + 6 : 0)), canvasH, SWP_NOZORDER);
+  ShowWindow(g.paneTabs, sb ? SW_SHOW : SW_HIDE);
+  ShowWindow(g.thumbs, sb && g.pane == 0 ? SW_SHOW : SW_HIDE);
+  ShowWindow(g.bookmarks, sb && g.pane == 1 ? SW_SHOW : SW_HIDE);
+  ShowWindow(g.split, sb ? SW_SHOW : SW_HIDE);
+  InvalidateRect(g.thumbs, nullptr, TRUE);
+  InvalidateRect(g.canvas, nullptr, TRUE);
+  InvalidateRect(g.tabbar, nullptr, TRUE);
+  UpdateScrollbars();
+}
+
+static void ToggleSidebar()
+{
+  g.showSidebar = !g.showSidebar;
+  RECT cr{};
+  GetClientRect(g.frame, &cr);
+  RelayoutPanes(cr.right - cr.left, cr.bottom - cr.top);
+}
+
+static void ToggleSpread()
+{
+  g.spread = !g.spread;
+  RECT cr{};
+  int cw = 120;
+  if (g.canvas) { GetClientRect(g.canvas, &cr); cw = cr.right - cr.left; }
+  std::vector<RECT> rects;
+  int cwD = 0, chD = 0;
+  LayoutPages(cw, rects, cwD, chD);
+  if (g.selected < (int)rects.size())
+    g.scrollY = std::max(0, (int)rects[g.selected].top - 30);
+  UpdateScrollbars();
+  InvalidateRect(g.canvas, nullptr, TRUE);
+  InvalidateRect(g.thumbs, nullptr, TRUE);
+  InvalidateRect(g.status, nullptr, TRUE);
+}
+
 static void DoCommand(int id)
 {
   switch (id)
@@ -3482,6 +3749,12 @@ static void DoCommand(int id)
     case ID_FITP:     FitPage(); break;
     case ID_PREV:     GoPage(-1); break;
     case ID_NEXT:     GoPage(1); break;
+    case ID_SPREAD:   ToggleSpread(); break;
+    case ID_SIDEBAR:  ToggleSidebar(); break;
+    case ID_NEW_TAB:  NewDoc(); break;
+    case ID_CLOSE_TAB: CloseTab(g_curTab); break;
+    case ID_PREV_TAB: NextTab(-1); break;
+    case ID_NEXT_TAB: NextTab(1); break;
     case ID_TAB_HOME:    SwitchRibbonTab(0); break;
     case ID_TAB_VIEW:    SwitchRibbonTab(1); break;
     case ID_TAB_TOOLS:   SwitchRibbonTab(2); break;
@@ -3528,6 +3801,11 @@ static HMENU BuildMenu()
   HMENU file = CreatePopupMenu();
   addItem(file, ID_NEW, L"New\tCtrl+N");
   addItem(file, ID_OPEN, L"Open...\tCtrl+O");
+  addItem(file, ID_NEW_TAB, L"New Tab\tCtrl+T");
+  addItem(file, ID_CLOSE_TAB, L"Close Tab\tCtrl+Shift+F4");
+  addItem(file, ID_PREV_TAB, L"Previous Tab\tCtrl+Shift+Tab");
+  addItem(file, ID_NEXT_TAB, L"Next Tab\tCtrl+Tab");
+  AppendMenuW(file, MF_SEPARATOR, 0, nullptr);
   addItem(file, ID_SAVE, L"Save\tCtrl+S");
   addItem(file, ID_SAVEAS, L"Save As...\tCtrl+Shift+S");
   addItem(file, ID_SAVEENC, L"Save As Encrypted...");
@@ -3579,6 +3857,9 @@ static HMENU BuildMenu()
   addItem(view, ID_PANE_THUMBS, L"Page Thumbnails");
   addItem(view, ID_PANE_BOOKMARKS, L"Bookmarks");
   AppendMenuW(view, MF_SEPARATOR, 0, nullptr);
+  addItem(view, ID_SPREAD, L"Two-Page Spread\tF5");
+  addItem(view, ID_SIDEBAR, L"Sidebar\tF8");
+  AppendMenuW(view, MF_SEPARATOR, 0, nullptr);
   addItem(view, ID_THEME, L"Dark Mode\tCtrl+D");
   AppendMenuW(bar, MF_POPUP, (UINT_PTR)view, L"&View");
 
@@ -3596,8 +3877,10 @@ static LRESULT CALLBACK FrameProc(HWND hw, UINT msg, WPARAM wp, LPARAM lp)
       return (LRESULT)LoadIconW(g.inst, MAKEINTRESOURCEW(101));
     case WM_CREATE:
     {
+      g.tabbar = CreateWindowExW(0, L"SKTabBar", nullptr, WS_CHILD | WS_VISIBLE,
+                                 0, 0, 600, TAB_H, hw, nullptr, g.inst, nullptr);
       g.toolbar = CreateWindowExW(0, L"SKToolbar", nullptr, WS_CHILD | WS_VISIBLE,
-                                  0, 0, 600, RIB_H, hw, nullptr, g.inst, nullptr);
+                                  0, TAB_H, 600, RIB_H, hw, nullptr, g.inst, nullptr);
       BuildToolbar(g.toolbar);
       LayoutRibbon();
 
@@ -3677,26 +3960,7 @@ static LRESULT CALLBACK FrameProc(HWND hw, UINT msg, WPARAM wp, LPARAM lp)
     case WM_SIZE:
     {
       int w = LOWORD(lp), h = HIWORD(lp);
-      if (g.toolbar)
-      {
-        int paneY = RIB_H + PANE_TAB_H;
-        int paneH = std::max(10, h - paneY - 28);
-        int canvasH = std::max(10, h - RIB_H - 28);
-        SetWindowPos(g.toolbar, nullptr, 0, 0, w, RIB_H, SWP_NOZORDER);
-        SetWindowPos(g.paneTabs, nullptr, 0, RIB_H, g.thumbsW, PANE_TAB_H,
-                     SWP_NOZORDER);
-        SetWindowPos(g.status, nullptr, 0, h - 28, w, 28, SWP_NOZORDER);
-        SetWindowPos(g.thumbs, nullptr, 0, paneY, g.thumbsW, paneH,
-                     SWP_NOZORDER);
-        SetWindowPos(g.bookmarks, nullptr, 0, paneY, g.thumbsW, paneH,
-                     SWP_NOZORDER);
-        SetWindowPos(g.split, nullptr, g.thumbsW, RIB_H, 6,
-                     PANE_TAB_H + paneH, SWP_NOZORDER);
-        SetWindowPos(g.canvas, nullptr, g.thumbsW + 6, RIB_H,
-                     std::max(100, w - g.thumbsW - 6), canvasH, SWP_NOZORDER);
-        InvalidateRect(g.thumbs, nullptr, TRUE);
-        InvalidateRect(g.canvas, nullptr, TRUE);
-      }
+      if (g.toolbar) RelayoutPanes(w, h);
       return 0;
     }
     case WM_SETFOCUS:
@@ -3713,6 +3977,9 @@ static LRESULT CALLBACK FrameProc(HWND hw, UINT msg, WPARAM wp, LPARAM lp)
         {
           case 'N': DoCommand(ID_NEW); return 0;
           case 'O': DoCommand(ID_OPEN); return 0;
+          case 'T': DoCommand(ID_NEW_TAB); return 0;
+          case VK_TAB: DoCommand(shift ? ID_PREV_TAB : ID_NEXT_TAB); return 0;
+          case VK_F4: if (shift) DoCommand(ID_CLOSE_TAB); return 0;
           case 'S': DoCommand(shift ? ID_SAVEAS : ID_SAVE); return 0;
           case 'R': DoCommand(shift ? ID_ROTL : ID_ROTR); return 0;
           case VK_OEM_PLUS: case VK_ADD: DoCommand(ID_ZOOM_IN); return 0;
@@ -3729,6 +3996,8 @@ static LRESULT CALLBACK FrameProc(HWND hw, UINT msg, WPARAM wp, LPARAM lp)
       {
         switch (vk)
         {
+          case VK_F5: DoCommand(ID_SPREAD); return 0;
+          case VK_F8: DoCommand(ID_SIDEBAR); return 0;
           case VK_DELETE: DoCommand(g.toolSelect ? ID_OBJ_DELETE : ID_DELETE); return 0;
         }
       }
@@ -5575,6 +5844,110 @@ static bool HasArg(const char* arg)
 // ---------------------------------------------------------------------------
 // Entry point
 // ---------------------------------------------------------------------------
+static LRESULT CALLBACK TabBarProc(HWND hw, UINT msg, WPARAM wp, LPARAM lp)
+{
+  switch (msg)
+  {
+    case WM_ERASEBKGND:
+      return 1;
+    case WM_PAINT:
+    {
+      PAINTSTRUCT ps;
+      HDC dc = BeginPaint(hw, &ps);
+      RECT rc;
+      GetClientRect(hw, &rc);
+      const Theme& th = ThemeNow();
+      HBRUSH bg = CreateSolidBrush(th.ribbonBg);
+      FillRect(dc, &rc, bg);
+      DeleteObject(bg);
+      HBRUSH cap = CreateSolidBrush(th.accent);
+      RECT sr{0, 0, rc.right, 2};
+      FillRect(dc, &sr, cap);
+      DeleteObject(cap);
+      HFONT tabFont = CreateFontW(-MulDiv(11, g.dpi, 72), 0, 0, 0, FW_NORMAL,
+                                  FALSE, FALSE, FALSE, DEFAULT_CHARSET,
+                                  OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+                                  CLEARTYPE_QUALITY,
+                                  DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI");
+      int x = 4;
+      for (int i = 0; i < (int)g_tabs.size(); ++i)
+      {
+        const TabDoc& t = g_tabs[i];
+        SIZE cxt{};
+        const wchar_t* label = t.name.empty() ? L"Untitled" : t.name.c_str();
+        SelectObject(dc, tabFont);
+        GetTextExtentPoint32W(dc, label, (int)wcslen(label), &cxt);
+        int w = cxt.cx + 34;
+        bool active = (i == g_curTab);
+        RECT tr{x, 4, x + w, rc.bottom - 3};
+        HBRUSH fill = CreateSolidBrush(active ? th.card : th.ribbonBg);
+        HPEN pen = CreatePen(PS_SOLID, 1, active ? th.accent : th.cardBorder);
+        HBRUSH wasb = (HBRUSH)SelectObject(dc, fill);
+        HPEN wasp = (HPEN)SelectObject(dc, pen);
+        RoundRect(dc, tr.left, tr.top, tr.right, tr.bottom, 6, 6);
+        SelectObject(dc, wasb);
+        SelectObject(dc, wasp);
+        DeleteObject(fill);
+        DeleteObject(pen);
+        SetBkMode(dc, TRANSPARENT);
+        SetTextColor(dc, active ? th.text : th.textDim);
+        RECT lr{tr.left + 6, tr.top, tr.right - 20, tr.bottom};
+        DrawTextW(dc, label, -1, &lr, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+        RECT xr{tr.right - 18, tr.top, tr.right - 4, tr.bottom};
+        DrawTextW(dc, L"\u00d7", -1, &xr, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+        x = tr.right + 2;
+        if (x > rc.right) break;
+      }
+      DeleteObject(tabFont);
+      EndPaint(hw, &ps);
+      return 0;
+    }
+    case WM_LBUTTONDOWN:
+    {
+      RECT rc;
+      GetClientRect(hw, &rc);
+      int px = GET_X_LPARAM(lp);
+      int x = 4;
+      for (int i = 0; i < (int)g_tabs.size(); ++i)
+      {
+        const TabDoc& t = g_tabs[i];
+        const wchar_t* label = t.name.empty() ? L"Untitled" : t.name.c_str();
+        HDC tdc = GetDC(hw);
+        HFONT f = CreateFontW(-MulDiv(11, g.dpi, 72), 0, 0, 0, FW_NORMAL,
+                              FALSE, FALSE, FALSE, DEFAULT_CHARSET,
+                              OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+                              CLEARTYPE_QUALITY,
+                              DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI");
+        HFONT of = (HFONT)SelectObject(tdc, f);
+        SIZE cxt{};
+        GetTextExtentPoint32W(tdc, label, (int)wcslen(label), &cxt);
+        SelectObject(tdc, of);
+        DeleteObject(f);
+        ReleaseDC(hw, tdc);
+        int w = cxt.cx + 34;
+        RECT tr{x, 4, x + w, rc.bottom - 3};
+        if (px >= tr.right - 18 && px <= tr.right - 4)
+        {
+          CloseTab(i);
+          ReleaseCapture();
+          return 0;
+        }
+        if (px >= tr.left && px <= tr.right)
+        {
+          SetActiveTab(i);
+          return 0;
+        }
+        x = tr.right + 2;
+      }
+      return 0;
+    }
+    case WM_SETCURSOR:
+      SetCursor(LoadCursorW(nullptr, IDC_ARROW));
+      return TRUE;
+  }
+  return DefWindowProcW(hw, msg, wp, lp);
+}
+
 static LRESULT CALLBACK ToolbarProc(HWND hw, UINT msg, WPARAM wp, LPARAM lp)
 {
   switch (msg)
@@ -5703,6 +6076,10 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int)
   wc.hbrBackground = nullptr;
   RegisterClassExW(&wc);
 
+  wc.lpfnWndProc = TabBarProc;
+  wc.lpszClassName = L"SKTabBar";
+  RegisterClassExW(&wc);
+
   wc.lpfnWndProc = ToolBtnProc;
   wc.lpszClassName = L"SKToolBtn";
   wc.hbrBackground = nullptr;
@@ -5757,6 +6134,9 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int)
     DispatchMessageW(&msg);
   }
   CloseDoc();
+  for (TabDoc& t : g_tabs)
+    if (t.doc) FPDF_CloseDocument(t.doc);
+  g_tabs.clear();
   FPDF_DestroyLibrary();
   DeleteObject(g.font);
   return (int)msg.wParam;

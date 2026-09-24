@@ -163,6 +163,14 @@ GUI verification (programmatic, window handles + messages):
 - App icon: `ExtractAssociatedIcon` on the built exe yields the embedded
   multi-size icon (16/24/32/48/256, generated programmatically as
   `resources/app.ico`, compiled via `resources/app.rc`).
+- Tabs, sidebar + spread (menu-driven, phase-D work): multi-document tabs
+  implemented (File > New Tab / Close Tab / Next / Previous, `Ctrl+T`,
+  `Ctrl+Shift+F4`, `Ctrl+Tab` / `Ctrl+Shift+Tab`, plus a clickable tab strip
+  above the ribbon with close buttons); each tab owns its doc, page, zoom and
+  scroll state and switches without losing the others; File > Sidebar
+  (`F8`) toggles the left pane; View > Two-Page Spread (`F5`) switches the
+  canvas to side-by-side rendering; pages are horizontally centered in the
+  canvas (single and spread modes).
 
 ## Bug fixed during this session
 
@@ -233,4 +241,9 @@ no remaining feature milestones.
 Self-test 185/185. User verdict pending — open `dist\Stitchup.exe file.pdf` and
 try Home > Annotate, click any PDF link, Home > Pages (Extract / Split /
 Auto-Crop), File > Export Text / Export CSV, File > Watermark, File > Save As
-Encrypted, and open a password-protected PDF.
+Encrypted, and open a password-protected PDF. Plus the new view extras:
+File > New Tab (Ctrl+T), File > Close Tab / Next Tab / Previous Tab
+(Ctrl+Shift+F4 / Ctrl+Tab / Ctrl+Shift+Tab) to manage multi-doc tabs, View >
+Sidebar (F8) to toggle the left pane, and View > Two-Page Spread (F5) for the
+side-by-side canvas (pages are centered horizontally in both single and spread
+modes).
