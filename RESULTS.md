@@ -100,9 +100,15 @@ column.
 ```
 
 GUI verification (programmatic, window handles + messages):
-- Ribbon renders Home/View/Tools tabs; `WM_COMMAND` on tab control IDs switches
-  button sets per group (View shows Zoom/Navigate/Panes, Home hides); Home now
-  has a third "Annotate" group (Highlight/Underline/Note/Text Box/Shape/Stamp).
+- Ribbon menus merged (v0.8.1): the tab strip above the ribbon is gone;
+  Home / Tools (and Sidebar) are now top-level menus between View and Help
+  (order: File Edit Pages Annotate View Home Tools Sidebar Help). Selecting
+  Home or Tools switches the ribbon tab; SetTabPressed keeps the menu radio
+  (Home <-> Tools) and the Sidebar / Two-Page Spread check marks in sync.
+  `WM_COMMAND` on the tab command IDs still switches button sets per group
+  (View shows Zoom/Navigate/Panes, Home hides); Home has a third "Annotate"
+  group (Highlight/Underline/Note/Text Box/Shape/Stamp) and a fourth "Content"
+  group (Select/Edit Text/Delete/Recolor).
 - Pane header tabs switch Page Thumbnails <-> Bookmarks (thumbnail list vs
   `SysTreeView32` visibility toggles).
 - Bookmarks tree populated from an outline PDF on disk: TVM_GETCOUNT = 3
@@ -161,8 +167,10 @@ GUI verification (programmatic, window handles + messages):
   ("Save As", class `#32770`), which cancels cleanly and leaves the frame
   healthy with the document still open.
 - App icon: `ExtractAssociatedIcon` on the built exe yields the embedded
-  multi-size icon (16/24/32/48/256, generated programmatically as
-  `resources/app.ico`, compiled via `resources/app.rc`).
+  multi-size icon (16/24/32/48/64/128/256, generated programmatically as
+  `resources/app.ico`, compiled via `resources/app.rc`). The v0.8.1 icon draws
+  a parchment scroll (rolled ends, dowel caps, text lines) with a diagonal
+  inked quill; the 32x32 view resolves cleanly to a scroll shape with a pen.
 - Tabs, sidebar + spread (menu-driven, phase-D work): multi-document tabs
   implemented (File > New Tab / Close Tab / Next / Previous, `Ctrl+T`,
   `Ctrl+Shift+F4`, `Ctrl+Tab` / `Ctrl+Shift+Tab`, plus a clickable tab strip
@@ -180,6 +188,44 @@ GUI verification (programmatic, window handles + messages):
   buffer first) before the file is replaced, then reloaded. Verified: the
   annotate + save cycle completes instantly and persists the annotation.
 - Save-As onto the currently-open file now routes through the same path.
+
+## Fixed / changed for v0.8.1
+
+- **Thumbnails showed blank/ghost pages and a broken scrollbar**: the
+  thumbnails filled asynchronously, and the thumbnails scrollbar range was never
+  derived from the thumbnails content. `RefreshState` now calls
+  `ClearThumbCache` + `ResetThumbScroll`; `ResetThumbScroll` sets the SB_VERT
+  range from content height vs. client height and is also called on
+  thumbnails-pane resize (WM_SIZE); `ThumbForY` geometry now matches the paint
+  pass (thumbW = pane width - 26, 34px offset, +16 spacing). The pane repaints
+  into a memory DC and blits once, and the focus-hotspot invalidates that caused
+  the flash on WM_SETFOCUS / WM_KILLFOCUS were removed.
+- **Flicker on movement/clicking**: the canvas and thumbnails panes now paint
+  double-buffered (memory DC + single BitBlt); `WindowProc`-driven repaint
+  invalidations that used `TRUE` (erasing the background behind the new frame)
+  now use `FALSE` (Clip returns e.g. thumbnails scroll, thumbnails
+  mouse-down/move/up) and the frame window sets `WS_CLIPCHILDREN`. Ctrl+wheel
+  zoom intentionally keeps a full repaint since it happens rarely.
+- **Two-page spread displayed but didn't fit**: the fit-width/fit-page
+  calculations used the single-page `MaxPageW`, so a spread overflowed the
+  viewport. A new `LayoutSpanW` returns the spread-aware row width
+  (`PageW(i)+PageW(i+1)+12` when a spread is active, else `MaxPageW`), and both
+  `FitWidth` and `FitPage` now use it; `ToggleSpread` calls `FitWidth` and then
+  re-scrolls to the selected page, so enabling side-by-side always brings the
+  pair into view.
+- **Menu merge**: the three-tab ribbon strip (Home/View/Tools) was collapsed
+  into top-level menus Home, Tools and Sidebar between View and Help. The
+  ribbon now runs ~26px shorter (constant set: `TAB_H 30, RIB_BTN_Y 8,
+  RIB_BTN_H 34, RIB_CAP_Y 48, RIB_H 66`; `RIB_TAB_H` removed) and shows the
+  Home groups by default. `SetTabPressed` maintains the Home/Tools radio check
+  plus the Sidebar and Two-Page Spread check marks.
+- New multi-size app icon (scroll + quill) authored programmatically
+  (System.Drawing, JSON-free), DIB-encoded for <=128px and PNG for 256px so it
+  loads both in Explorer and in the exe.
+
+GUI smoke test after v0.8.1: window opens, menu bar carries the merged Home /
+Tools / Sidebar items, Home groups render, thumbnails scroll in step with the
+page list, dark theme still applies, and side-by-side spread fits the viewport.
 
 GUI smoke test: window opens ("Stitchup PDF Editor"), message loop stays alive.
 
@@ -199,10 +245,10 @@ No CRT DLLs (static `/MT` linked). Portable package = `Stitchup.exe` +
 
 | File           | Size     | SHA-256                                                           |
 |----------------|----------|-------------------------------------------------------------------|
-| Stitchup.exe   | 451,584 B | 67E2460D5FA295264D1AF3F8F10090A9329E79D0D85E8F9D3E8194A87410FB30 |
+| Stitchup.exe   | 464,384 B | 253A6985050B88F4013D1C59BCE5E1B97D9433AA6CB1129817BC7AC10997EC77 |
 | pdfium.dll     | 7,375,360 B | 55E7EBEF29A1EC9523D1ADB8B260A73E7DFB0F64D3F0285121D20ECD6148EF18 |
 | example.pdf    | 1,034 B   | B276682EFD75780E462C17489176D710AD1339D84E69C6218AD3C2F8E60FC132 |
-| app.ico        | 20,597 B  | 5FB009C7A83254FBCD81C205492E03A683EDB0BA65B6E44962614B06A240CA44 |
+| app.ico        | 112,219 B | 3C7D09689F58EA3E08CE29CBB366CBCC2CFE974ADFC11E70B8D2FBB1B7C6A970 |
 
 ## Notes
 
@@ -238,12 +284,14 @@ PDF revision 3 / 128-bit RC4 password-protected copy with user + optional
 owner passwords; verified end-to-end, including reopening the encrypted file
 against the bundled PDFium with the correct password). Phase C COMPLETE —
 no remaining feature milestones.
-Self-test 185/185. User verdict pending — open `dist\Stitchup.exe file.pdf` and
-try Home > Annotate, click any PDF link, Home > Pages (Extract / Split /
-Auto-Crop), File > Export Text / Export CSV, File > Watermark, File > Save As
-Encrypted, and open a password-protected PDF. Plus the new view extras:
-File > New Tab (Ctrl+T), File > Close Tab / Next Tab / Previous Tab
-(Ctrl+Shift+F4 / Ctrl+Tab / Ctrl+Shift+Tab) to manage multi-doc tabs, View >
-Sidebar (F8) to toggle the left pane, and View > Two-Page Spread (F5) for the
-side-by-side canvas (pages are centered horizontally in both single and spread
-modes).
+Self-test 185/185. v0.8.1 released (private) with the post-v0.8.0 fixes:
+thumbnails render in step with the page list and scroll correctly, canvas and
+thumbnails repaint without flicker, the two-page spread fits the viewport, the
+Home/View/Tools tab strip is merged into the menu bar (Home / Tools / Sidebar
+top-level items between View and Help), and the app ships a new scroll-and-quill
+icon. User verdict pending — open `dist\Stitchup.exe file.pdf` and try
+Home > Annotate, click any PDF link, Home > Pages (Extract / Split /
+Auto-Crop), File > Export Text / Export CSV / Watermark / Save As Encrypted,
+open a password-protected PDF, and the new view extras: File > New Tab (Ctrl+T),
+File > Close / Next / Previous Tab, View > Two-Page Spread (F5), View >
+Sidebar / Sidebar menu (F8), and the Home / Tools ribbon-switch menus.

@@ -30,9 +30,14 @@ Produces `dist\Stitchup.exe` + `dist\pdfium.dll`.
 
 ## Features
 
-- Nitro Pro v7-style shell: ribbon (Home/View/Tools tabs with groups: Document,
-  Pages, Zoom, Navigate, Panes), left navigation pane (Page Thumbnails,
-  Bookmarks with outline tree), splitter, canvas, status bar
+- Nitro Pro v7-style shell: menu bar `File Edit Pages Annotate View Home Tools
+  Sidebar Help`, a compact ribbon below it that shows the Home groups by default
+  (Document, Pages, Annotate, Content), and a left navigation pane (Page
+  Thumbnails, Bookmarks with outline tree), splitter, canvas, status bar
+- Home and Tools top-level menus switch the ribbon tab (Home = Document /
+  Pages / Annotate / Content groups; Tools = Security / Export). The View
+  tab's controls (Zoom, Navigate, Panes) live under the View menu, and Sidebar
+  (F8) appears both in View and as its own top-level item
 - Multi-document tabs: open several files at once and switch between them
   (Ctrl+Tab / Ctrl+Shift+Tab, New Tab Ctrl+T, Close Tab Ctrl+Shift+F4, or click
   the strip at the top of the window); each tab keeps its own page, zoom and
@@ -46,8 +51,8 @@ Produces `dist\Stitchup.exe` + `dist\pdfium.dll`.
 - View: zoom in/out, 100%, fit width, fit page, previous/next page, and a
   Dark Mode toggle (View > Dark Mode, `Ctrl+D`, remembered between runs)
 - Modern flat UI: flat ribbon (hover/pressed states, accent brand strip,
-  labelled group cards), Segoe UI text, embedded multi-size app icon, and a
-  light/dark color theme
+  labelled group cards), Segoe UI text, embedded multi-size app icon (a
+  parchment scroll with an inked quill), and a light/dark color theme
 - Bookmarks pane lists the PDF outline (nested); clicking a bookmark jumps to
   its page
 - Annotate (Home > Annotate group or Edit > Annotate menu): insert highlight,
@@ -108,5 +113,5 @@ project (github.com/bblanchon/pdfium-binaries). Non-GPL build.
   functional.
   Note: link *creation* (drawing new links) requires a newer PDFium runtime
   than the bundled `pdfium.dll`, which exposes only link reading.
-- Tools tab currently shows a placeholder caption until the advanced feature
-  sets land.
+- Tools menu/ribbon tab hosts the Security (Save As Encrypted) and Export
+  (Export Text / Export CSV) groups.

@@ -85,12 +85,11 @@ enum
 
 enum
 {
-  RIB_TAB_H = 24,   // ribbon tab strip height
   TAB_H = 30,       // document tab strip height
-  RIB_BTN_Y = 32,   // button row top
+  RIB_BTN_Y = 8,    // button row top
   RIB_BTN_H = 34,   // button height
-  RIB_CAP_Y = 70,   // group caption row top
-  RIB_H = 92,       // full ribbon height
+  RIB_CAP_Y = 48,   // group caption row top
+  RIB_H = 66,       // full ribbon height
   PANE_TAB_H = 26,  // navigation-pane header height
 };
 
@@ -303,8 +302,6 @@ static void ToggleTheme()
   if (g.split)    InvalidateRect(g.split, nullptr, TRUE);
   if (g.canvas)   InvalidateRect(g.canvas, nullptr, TRUE);
   if (g.status)   InvalidateRect(g.status, nullptr, TRUE);
-  for (int i = 0; i < 3 && g.tabBtns[i]; ++i)
-    InvalidateRect(g.tabBtns[i], nullptr, TRUE);
   for (HWND hw : g.ribbonBtns)
     InvalidateRect(hw, nullptr, TRUE);
   ApplyTreeTheme();
@@ -391,6 +388,27 @@ static double MaxPageH()
   for (int i = 0; i < g.pageCount; ++i)
     m = std::max(m, (double)PageH(i));
   return m;
+}
+
+// Widest laid-out row at zoom 1.0: with spread this is the two-page pair
+// (plus the 12px inter-page gap), otherwise the widest single page.
+static double LayoutSpanW()
+{
+  double span = 0;
+  if (g.spread)
+  {
+    for (int i = 0; i < g.pageCount; i += 2)
+    {
+      double w0 = PageW(i);
+      double w1 = (i + 1 < g.pageCount) ? std::max(0.0, (double)PageW(i + 1)) : 0.0;
+      span = std::max(span, w0 + (w1 > 0 ? w1 + 12 : 0));
+    }
+  }
+  else
+  {
+    span = MaxPageW();
+  }
+  return std::max(1.0, span);
 }
 
 // Absolute (pre-scroll) device rect for every page under current zoom/spread.
@@ -544,6 +562,7 @@ static void SnapshotCurrentTab()
 static void RefreshTabBar();
 static void RefreshState();
 static void UpdateScrollbars();
+static void ResetThumbScroll();
 
 static void RestoreTab(int i)
 {
@@ -618,6 +637,8 @@ static void RefreshState()
   if (g_curTab >= 0 && g_curTab < (int)g_tabs.size())
     g_tabs[g_curTab].pageCount = g.pageCount;
   ClearCanvasCache();
+  ClearThumbCache();
+  ResetThumbScroll();
   if (g.status) InvalidateRect(g.status, nullptr, TRUE);
 }
 
@@ -1915,19 +1936,50 @@ static int ThumbForY(int y)
   RECT rc;
   GetClientRect(g.thumbs, &rc);
   int w = rc.right - rc.left;
-  int th = w - 24;
-  int yc = 30; // header area + scroll offset handled by caller
+  int thumbW = w - 26;
+  if (thumbW < 50) thumbW = 50;
+  int yc = 34; // header area; scroll offset handled by caller
   for (int i = 0; i < g.pageCount; ++i)
   {
     float pw = PageW(i), ph = PageH(i);
     if (pw < 1 || ph < 1) continue;
-    double scale = (double)(th - 8) / (double)pw;
-    scale = std::min(scale, 220.0 / (double)ph);
-    int hi = (int)std::ceil(ph * scale) + 12;
+    double scale = std::min((double)(thumbW - 8) / (double)pw,
+                            220.0 / (double)ph);
+    int hi = (int)std::ceil(ph * scale) + 16;
     if (y >= yc && y < yc + hi) return i;
     yc += hi;
   }
   return -1;
+}
+
+// Set the thumbnails scrollbar range so long documents actually scroll.
+static void ResetThumbScroll()
+{
+  if (!g.thumbs) return;
+  RECT rc;
+  GetClientRect(g.thumbs, &rc);
+  int view = rc.bottom - rc.top;
+  int content = 34;
+  int w = rc.right - rc.left;
+  int thumbW = w - 26;
+  if (thumbW < 50) thumbW = 50;
+  for (int i = 0; i < g.pageCount; ++i)
+  {
+    float pw = PageW(i), ph = PageH(i);
+    if (pw < 1 || ph < 1) continue;
+    double scale = std::min((double)(thumbW - 8) / (double)pw,
+                            220.0 / (double)ph);
+    content += (int)std::ceil(ph * scale) + 16;
+  }
+  SCROLLINFO si{};
+  si.cbSize = sizeof(si);
+  si.fMask = SIF_RANGE | SIF_PAGE | SIF_POS;
+  GetScrollInfo(g.thumbs, SB_VERT, &si);
+  si.nMin = 0;
+  si.nMax = std::max(0, content - view);
+  si.nPage = std::max(1, view);
+  if (si.nPos > si.nMax) si.nPos = si.nMax;
+  SetScrollInfo(g.thumbs, SB_VERT, &si, TRUE);
 }
 
 static HBITMAP GetThumb(int i)
@@ -1957,7 +2009,7 @@ static void ThumbScroll(int delta)
   si.nPos = std::max(si.nMin, std::min((int)si.nMax, si.nPos));
   si.fMask = SIF_POS;
   SetScrollInfo(g.thumbs, SB_VERT, &si, TRUE);
-  InvalidateRect(g.thumbs, nullptr, TRUE);
+  InvalidateRect(g.thumbs, nullptr, FALSE);
 }
 
 static LRESULT CALLBACK ThumbsProc(HWND hw, UINT msg, WPARAM wp, LPARAM lp)
@@ -1970,9 +2022,8 @@ static LRESULT CALLBACK ThumbsProc(HWND hw, UINT msg, WPARAM wp, LPARAM lp)
       ShowScrollBar(hw, SB_VERT, TRUE);
       return 0;
     case WM_SIZE:
-    case WM_SETFOCUS:
-    case WM_KILLFOCUS:
-      InvalidateRect(hw, nullptr, TRUE);
+      ResetThumbScroll();
+      InvalidateRect(hw, nullptr, FALSE);
       return 0;
     case WM_PAINT:
     {
@@ -1980,15 +2031,19 @@ static LRESULT CALLBACK ThumbsProc(HWND hw, UINT msg, WPARAM wp, LPARAM lp)
       HDC dc = BeginPaint(hw, &ps);
       RECT rc;
       GetClientRect(hw, &rc);
+      HDC mem = CreateCompatibleDC(dc);
+      HBITMAP bmp = CreateCompatibleBitmap(dc, rc.right - rc.left,
+                                           rc.bottom - rc.top);
+      HGDIOBJ oldBmp = SelectObject(mem, bmp);
       const Theme& thm = ThemeNow();
       HBRUSH bgb = CreateSolidBrush(thm.thumbBg);
-      FillRect(dc, &rc, bgb);
+      FillRect(mem, &rc, bgb);
       DeleteObject(bgb);
 
       RECT hr{rc.left + 10, 6, rc.right - 10, 26};
-      SetBkMode(dc, TRANSPARENT);
-      SetTextColor(dc, thm.textDim);
-      DrawTextW(dc, L"Pages", -1, &hr, DT_SINGLELINE);
+      SetBkMode(mem, TRANSPARENT);
+      SetTextColor(mem, thm.textDim);
+      DrawTextW(mem, L"Pages", -1, &hr, DT_SINGLELINE);
 
       int w = rc.right - rc.left;
       int x = 10;
@@ -2005,9 +2060,9 @@ static LRESULT CALLBACK ThumbsProc(HWND hw, UINT msg, WPARAM wp, LPARAM lp)
       if (g.dragPage >= 0 && g.dragCursor == 0)
       {
         HPEN pn = CreatePen(PS_SOLID, 2, thm.accent);
-        SelectObject(dc, pn);
-        MoveToEx(dc, x, yc - 4, nullptr);
-        LineTo(dc, x + thumbW, yc - 4);
+        SelectObject(mem, pn);
+        MoveToEx(mem, x, yc - 4, nullptr);
+        LineTo(mem, x + thumbW, yc - 4);
         DeleteObject(pn);
       }
 
@@ -2022,38 +2077,43 @@ static LRESULT CALLBACK ThumbsProc(HWND hw, UINT msg, WPARAM wp, LPARAM lp)
         if (slot.bottom > 0 && slot.top < rc.bottom)
         {
           HBITMAP hb = GetThumb(i);
-          HDC mem = CreateCompatibleDC(dc);
-          SelectObject(mem, hb);
-          BitBlt(dc, x + 4, yc, tw, th, mem, 0, 0, SRCCOPY);
-          DeleteDC(mem);
+          HDC md = CreateCompatibleDC(mem);
+          SelectObject(md, hb);
+          BitBlt(mem, x + 4, yc, tw, th, md, 0, 0, SRCCOPY);
+          DeleteDC(md);
           bool sel = (i == g.selected);
           if (g.dragPage >= 0 && i == g.dragPage)
           {
             HBRUSH dim = CreateSolidBrush(thm.btnHover);
             RECT dr{x + 2, yc - 2, x + 4 + tw, yc + th + 6};
-            FillRect(dc, &dr, dim);
+            FillRect(mem, &dr, dim);
             DeleteObject(dim);
           }
           RECT pr{x + 2, yc - 2, x + 4 + tw, yc + th + 6};
           HBRUSH phb = CreateSolidBrush(sel ? thm.accent
                                             : thm.pageFrame);
-          FrameRect(dc, &pr, phb);
+          FrameRect(mem, &pr, phb);
           DeleteObject(phb);
           std::wstring num = std::to_wstring(i + 1);
           RECT nr{x + 4, yc + th + 4, x + thumbW, yc + th + 14};
-          SetTextColor(dc, sel ? thm.accent : thm.textDim);
-          DrawTextW(dc, num.c_str(), -1, &nr, DT_SINGLELINE);
+          SetTextColor(mem, sel ? thm.accent : thm.textDim);
+          DrawTextW(mem, num.c_str(), -1, &nr, DT_SINGLELINE);
         }
         yc += th + 16;
         if (g.dragPage >= 0 && i + 1 == g.dragCursor)
         {
           HPEN pn = CreatePen(PS_SOLID, 2, thm.accent);
-          SelectObject(dc, pn);
-          MoveToEx(dc, x, yc - 4, nullptr);
-          LineTo(dc, x + thumbW, yc - 4);
+          SelectObject(mem, pn);
+          MoveToEx(mem, x, yc - 4, nullptr);
+          LineTo(mem, x + thumbW, yc - 4);
           DeleteObject(pn);
         }
       }
+      SelectObject(mem, oldBmp);
+      BitBlt(dc, 0, 0, rc.right - rc.left, rc.bottom - rc.top, mem, 0, 0,
+             SRCCOPY);
+      DeleteObject(bmp);
+      DeleteDC(mem);
       EndPaint(hw, &ps);
       return 0;
     }
@@ -2078,7 +2138,7 @@ static LRESULT CALLBACK ThumbsProc(HWND hw, UINT msg, WPARAM wp, LPARAM lp)
       si.nPos = pos;
       si.fMask = SIF_POS;
       SetScrollInfo(hw, SB_VERT, &si, TRUE);
-      InvalidateRect(hw, nullptr, TRUE);
+      InvalidateRect(hw, nullptr, FALSE);
       return 0;
     }
     case WM_MOUSEWHEEL:
@@ -2103,8 +2163,8 @@ static LRESULT CALLBACK ThumbsProc(HWND hw, UINT msg, WPARAM wp, LPARAM lp)
         g.selected = pi;
         g.dragPage = pi;
         g.dragCursor = pi;
-        InvalidateRect(hw, nullptr, TRUE);
-        InvalidateRect(g.canvas, nullptr, TRUE);
+        InvalidateRect(hw, nullptr, FALSE);
+        InvalidateRect(g.canvas, nullptr, FALSE);
         UpdateScrollbars();
       }
       return 0;
@@ -2127,7 +2187,7 @@ static LRESULT CALLBACK ThumbsProc(HWND hw, UINT msg, WPARAM wp, LPARAM lp)
         if (to != g.dragCursor)
         {
           g.dragCursor = to;
-          InvalidateRect(hw, nullptr, TRUE);
+          InvalidateRect(hw, nullptr, FALSE);
         }
       }
       return 0;
@@ -2143,7 +2203,7 @@ static LRESULT CALLBACK ThumbsProc(HWND hw, UINT msg, WPARAM wp, LPARAM lp)
         g.dragCursor = -1;
         if (from >= 0 && to >= 0 && from != to && from != to - 1)
           ReorderDoc(from, to);
-        InvalidateRect(hw, nullptr, TRUE);
+        InvalidateRect(hw, nullptr, FALSE);
       }
       return 0;
     }
@@ -2151,7 +2211,7 @@ static LRESULT CALLBACK ThumbsProc(HWND hw, UINT msg, WPARAM wp, LPARAM lp)
       ReleaseCapture();
       g.dragPage = -1;
       g.dragCursor = -1;
-      InvalidateRect(hw, nullptr, TRUE);
+      InvalidateRect(hw, nullptr, FALSE);
       return 0;
   }
   return DefWindowProcW(hw, msg, wp, lp);
@@ -2733,7 +2793,16 @@ static LRESULT CALLBACK CanvasProc(HWND hw, UINT msg, WPARAM wp, LPARAM lp)
       HDC dc = BeginPaint(hw, &ps);
       RECT rc;
       GetClientRect(hw, &rc);
-      CanvasPaint(dc, rc.right - rc.left, rc.bottom - rc.top);
+      int cw = rc.right - rc.left;
+      int ch = rc.bottom - rc.top;
+      HDC mem = CreateCompatibleDC(dc);
+      HBITMAP bmp = CreateCompatibleBitmap(dc, cw, ch);
+      HGDIOBJ oldBmp = SelectObject(mem, bmp);
+      CanvasPaint(mem, cw, ch);
+      SelectObject(mem, oldBmp);
+      BitBlt(dc, 0, 0, cw, ch, mem, 0, 0, SRCCOPY);
+      DeleteObject(bmp);
+      DeleteDC(mem);
       EndPaint(hw, &ps);
       return 0;
     }
@@ -2874,8 +2943,8 @@ static LRESULT CALLBACK CanvasProc(HWND hw, UINT msg, WPARAM wp, LPARAM lp)
           }
           g.selected = hi.page;
           ClearCanvasCache();
-          InvalidateRect(hw, nullptr, TRUE);
-          InvalidateRect(g.thumbs, nullptr, TRUE);
+          InvalidateRect(hw, nullptr, FALSE);
+          InvalidateRect(g.thumbs, nullptr, FALSE);
           InvalidateRect(g.status, nullptr, TRUE);
           return 0;
         }
@@ -2889,8 +2958,8 @@ static LRESULT CALLBACK CanvasProc(HWND hw, UINT msg, WPARAM wp, LPARAM lp)
         if (!viaLink && g.selected != hi.page)
         {
           g.selected = hi.page;
-          InvalidateRect(hw, nullptr, TRUE);
-          InvalidateRect(g.thumbs, nullptr, TRUE);
+          InvalidateRect(hw, nullptr, FALSE);
+          InvalidateRect(g.thumbs, nullptr, FALSE);
           InvalidateRect(g.status, nullptr, TRUE);
         }
       }
@@ -3242,9 +3311,6 @@ static void BuildToolbar(HWND)
   {ID_EXPORT_TEXT,  L"Export Text",80, 2, 1},
   {ID_EXPORT_CSV,   L"Export CSV", 66, 2, 1},
 };
-  g.tabBtns[0] = MakeBtn(g.toolbar, ID_TAB_HOME, L"Home", 4, 2, 66, 20, true);
-  g.tabBtns[1] = MakeBtn(g.toolbar, ID_TAB_VIEW, L"View", 74, 2, 66, 20, true);
-  g.tabBtns[2] = MakeBtn(g.toolbar, ID_TAB_TOOLS, L"Tools", 144, 2, 66, 20, true);
   for (const RibbonSpec& s : specs)
   {
     HWND hw = MakeBtn(s.id, s.label, 0, 0, s.w, RIB_BTN_H);
@@ -3272,15 +3338,13 @@ static int GroupCount(int tab)
 
 static void SetTabPressed()
 {
-  for (int i = 0; i < 3 && g.tabBtns[i]; ++i)
-  {
-    Btn* b = reinterpret_cast<Btn*>(GetWindowLongPtrW(g.tabBtns[i], GWLP_USERDATA));
-    if (b)
-    {
-      b->pressed = (g.ribbonTab == i);
-      InvalidateRect(g.tabBtns[i], nullptr, TRUE);
-    }
-  }
+  HMENU bar = GetMenu(g.frame);
+  if (!bar) return;
+  CheckMenuRadioItem(bar, ID_TAB_HOME, ID_TAB_TOOLS, g.ribbonTab, MF_BYCOMMAND);
+  CheckMenuItem(bar, ID_SIDEBAR,
+                MF_BYCOMMAND | (g.showSidebar ? MF_CHECKED : MF_UNCHECKED));
+  CheckMenuItem(bar, ID_SPREAD,
+                MF_BYCOMMAND | (g.spread ? MF_CHECKED : MF_UNCHECKED));
 }
 
 static void LayoutRibbon()
@@ -3346,7 +3410,7 @@ static void FitPage()
   GetClientRect(g.canvas, &rc);
   int cw = std::max(120, (int)(rc.right - rc.left));
   int ch = std::max(160, (int)(rc.bottom - rc.top));
-  double mw = std::max(1.0, MaxPageW());
+  double mw = std::max(1.0, LayoutSpanW());
   double mh = std::max(1.0, MaxPageH());
   ZoomTo(std::min((cw - 40.0) / mw, (ch - 60.0) / mh), true);
 }
@@ -3356,7 +3420,7 @@ static void FitWidth()
   RECT rc;
   GetClientRect(g.canvas, &rc);
   int cw = std::max(120, (int)(rc.right - rc.left));
-  double mw = std::max(1.0, MaxPageW());
+  double mw = std::max(1.0, LayoutSpanW());
   ZoomTo(std::max(0.1, (cw - 40.0) / mw), true);
 }
 
@@ -3681,9 +3745,9 @@ static void RelayoutPanes(int w, int h)
   ShowWindow(g.thumbs, sb && g.pane == 0 ? SW_SHOW : SW_HIDE);
   ShowWindow(g.bookmarks, sb && g.pane == 1 ? SW_SHOW : SW_HIDE);
   ShowWindow(g.split, sb ? SW_SHOW : SW_HIDE);
-  InvalidateRect(g.thumbs, nullptr, TRUE);
-  InvalidateRect(g.canvas, nullptr, TRUE);
-  InvalidateRect(g.tabbar, nullptr, TRUE);
+  InvalidateRect(g.thumbs, nullptr, FALSE);
+  InvalidateRect(g.canvas, nullptr, FALSE);
+  InvalidateRect(g.tabbar, nullptr, FALSE);
   UpdateScrollbars();
 }
 
@@ -3698,6 +3762,7 @@ static void ToggleSidebar()
 static void ToggleSpread()
 {
   g.spread = !g.spread;
+  FitWidth();
   RECT cr{};
   int cw = 120;
   if (g.canvas) { GetClientRect(g.canvas, &cr); cw = cr.right - cr.left; }
@@ -3708,8 +3773,8 @@ static void ToggleSpread()
     g.scrollY = std::max(0, (int)rects[g.selected].top - 30);
   UpdateScrollbars();
   InvalidateRect(g.canvas, nullptr, TRUE);
-  InvalidateRect(g.thumbs, nullptr, TRUE);
   InvalidateRect(g.status, nullptr, TRUE);
+  SetTabPressed();
 }
 
 static void DoCommand(int id)
@@ -3862,6 +3927,10 @@ static HMENU BuildMenu()
   AppendMenuW(view, MF_SEPARATOR, 0, nullptr);
   addItem(view, ID_THEME, L"Dark Mode\tCtrl+D");
   AppendMenuW(bar, MF_POPUP, (UINT_PTR)view, L"&View");
+
+  addItem(bar, ID_TAB_HOME, L"Ho&me");
+  addItem(bar, ID_TAB_TOOLS, L"&Tools");
+  addItem(bar, ID_SIDEBAR, L"&Sidebar\tF8");
 
   HMENU help = CreatePopupMenu();
   addItem(help, ID_ABOUT, L"About");
@@ -6107,7 +6176,8 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int)
   FPDF_InitLibrary();
 
   HWND frame = CreateWindowExW(0, L"SKFrame", L"Stitchup PDF Editor",
-                               WS_OVERLAPPEDWINDOW, CW_USEDEFAULT, CW_USEDEFAULT,
+                               WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN,
+                               CW_USEDEFAULT, CW_USEDEFAULT,
                                1240, 820, nullptr, BuildMenu(), inst, nullptr);
   if (!frame)
   {
@@ -6121,6 +6191,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int)
   ApplyTreeTheme();
   CheckMenuItem(GetMenu(g.frame), ID_THEME,
                 MF_BYCOMMAND | (g_dark ? MF_CHECKED : MF_UNCHECKED));
+  SetTabPressed();
 
   if (openFile.empty()) NewDoc();
   else LoadDoc(openFile);
