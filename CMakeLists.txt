@@ -15,6 +15,7 @@ set(PDFIUM_DIR "${CMAKE_CURRENT_SOURCE_DIR}/third_party/pdfium")
 add_executable(Stitchup WIN32 src/app.cpp resources/app.rc)
 target_include_directories(Stitchup PRIVATE src ${PDFIUM_DIR}/include)
 target_link_libraries(Stitchup PRIVATE gdi32 user32 shell32 comdlg32 comctl32
+                      uxtheme dwmapi
                       ${PDFIUM_DIR}/lib/pdfium.dll.lib)
 
 add_custom_command(TARGET Stitchup POST_BUILD

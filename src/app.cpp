@@ -8,6 +8,8 @@
 #include <shellapi.h>
 #include <commdlg.h>
 #include <windowsx.h>
+#include <uxtheme.h>
+#include <dwmapi.h>
 
 #pragma warning(push, 0)
 #include <fpdfview.h>
@@ -81,6 +83,16 @@ enum
   ID_CLOSE_TAB,
   ID_NEXT_TAB,
   ID_PREV_TAB,
+  // Colour-scheme pickers follow in one contiguous block (radio group).
+  ID_THEME_FIRST,
+  ID_THEME_LIGHT = ID_THEME_FIRST,
+  ID_THEME_DARK,
+  ID_THEME_DARKBLUE,
+  ID_THEME_PASTEL,
+  ID_THEME_HC_DARK,
+  ID_THEME_HC_LIGHT,
+  ID_THEME_XP,
+  ID_THEME_MAC,
 };
 
 enum
@@ -91,6 +103,7 @@ enum
   RIB_CAP_Y = 48,   // group caption row top
   RIB_H = 66,       // full ribbon height
   PANE_TAB_H = 26,  // navigation-pane header height
+  STATUS_H = 28,    // status bar height
 };
 
 // ---------------------------------------------------------------------------
@@ -150,7 +163,7 @@ struct App
   int pane = 0;        // 0 = thumbnails, 1 = bookmarks
   int ribbonTab = 0;   // 0 = Home, 1 = View, 2 = Tools
   bool bmDirty = true;
-  bool showSidebar = true;
+  bool showSidebar = false;  // hidden until the user asks for it (View / F8)
   bool spread = false;  // two-page side-by-side layout
 
   struct GroupBox
@@ -208,9 +221,30 @@ static int g_curTab = -1;
 static App g;
 
 // ---------------------------------------------------------------------------
-// Theme (light / dark) - flat modern palette
+// Themes - named colour schemes (light / dark / dark blue / pastel /
+// high-contrast / Windows XP / macOS), each with a matching title bar.
 // ---------------------------------------------------------------------------
-struct Theme
+enum ThemeId
+{
+  THEME_LIGHT = 0,
+  THEME_DARK,
+  THEME_DARKBLUE,
+  THEME_PASTEL,
+  THEME_HC_DARK,
+  THEME_HC_LIGHT,
+  THEME_XP,
+  THEME_MAC,
+  THEME_COUNT
+};
+
+enum CaptionStyle
+{
+  CAP_SYS = 0,  // Windows 10/11 style caption buttons
+  CAP_XP,       // Windows XP Luna caption
+  CAP_MAC,      // macOS traffic-light caption
+};
+
+struct UiTheme
 {
   COLORREF ribbonBg;    // toolbar background
   COLORREF card;        // ribbon group card fill
@@ -230,104 +264,414 @@ struct Theme
   COLORREF statusTxt;   // status bar text
   COLORREF treeBg;      // pane tree background
   COLORREF treeTxt;     // pane tree text
+  COLORREF emptyHint;   // "open a PDF" hint text on the empty canvas
+  // title bar
+  COLORREF capTop;      // caption gradient start
+  COLORREF capBottom;   // caption gradient end (== capTop when flat)
+  COLORREF capText;     // caption title text
+  COLORREF capLine;     // caption bottom hairline
+  COLORREF capBtn;      // caption button face
+  COLORREF capBtnHover; // caption button hover face
+  COLORREF capGlyph;    // caption button glyph
+  COLORREF macRed;      // traffic light: close
+  COLORREF macYellow;   // traffic light: minimise
+  COLORREF macGreen;    // traffic light: zoom
+  COLORREF macGlyph;    // traffic-light glyph on hover
+  int capStyle;         // CaptionStyle
+  bool dark;            // dark surfaces (paper/ink decisions)
 };
 
-static bool g_dark = false;
+static int g_themeId = THEME_LIGHT;
+static HMENU g_themeMenu = nullptr;   // "Colour Scheme" popup, for check marks
 
-static Theme LightTheme()
-{
-  Theme t{};
-  t.ribbonBg   = RGB(0xF7, 0xF8, 0xFA);
-  t.card       = RGB(0xEF, 0xF0, 0xF3);
-  t.cardBorder = RGB(0xD8, 0xDA, 0xDE);
-  t.accent     = RGB(0x0B, 0x6C, 0xE0);
-  t.accentDeep = RGB(0x0B, 0x3E, 0x77);
-  t.text       = RGB(0x20, 0x20, 0x20);
-  t.textDim    = RGB(0x80, 0x80, 0x80);
-  t.btnHover   = RGB(0xE6, 0xEF, 0xFB);
-  t.btnDown    = RGB(0xC8, 0xDC, 0xF2);
-  t.btnBorder  = RGB(0xD5, 0xD5, 0xD5);
-  t.thumbBg    = RGB(0xEC, 0xEC, 0xEC);
-  t.canvasBg   = RGB(0xE2, 0xE2, 0xE2);
-  t.pageFrame  = RGB(0x99, 0x99, 0x99);
-  t.split      = RGB(0xD8, 0xDA, 0xDE);
-  t.statusBg   = RGB(0x2B, 0x2B, 0x2B);
-  t.statusTxt  = RGB(0xE8, 0xE8, 0xE8);
-  t.treeBg     = RGB(0xFF, 0xFF, 0xFF);
-  t.treeTxt    = RGB(0x20, 0x20, 0x20);
-  return t;
-}
+static const UiTheme kThemes[THEME_COUNT] = {
+    // ---- Light grey (default): soft light UI, medium-grey canvas ---
+    {
+    /* ribbonBg   */ RGB(0xF2, 0xF3, 0xF5),
+    /* card       */ RGB(0xFF, 0xFF, 0xFF),
+    /* cardBorder */ RGB(0xDC, 0xDE, 0xE3),
+    /* accent     */ RGB(0x0B, 0x6C, 0xE0),
+    /* accentDeep */ RGB(0x08, 0x4A, 0x9E),
+    /* text       */ RGB(0x1B, 0x1F, 0x24),
+    /* textDim    */ RGB(0x55, 0x5F, 0x6B),
+    /* btnHover   */ RGB(0xE3, 0xED, 0xFB),
+    /* btnDown    */ RGB(0xC9, 0xDD, 0xF7),
+    /* btnBorder  */ RGB(0xD5, 0xD9, 0xDE),
+    /* thumbBg    */ RGB(0xE9, 0xEB, 0xEE),
+    /* canvasBg   */ RGB(0xC6, 0xCA, 0xD1),
+    /* pageFrame  */ RGB(0x76, 0x7E, 0x88),
+    /* split      */ RGB(0xDC, 0xDE, 0xE3),
+    /* statusBg   */ RGB(0x2B, 0x2F, 0x36),
+    /* statusTxt  */ RGB(0xEC, 0xEE, 0xF3),
+    /* treeBg     */ RGB(0xFF, 0xFF, 0xFF),
+    /* treeTxt    */ RGB(0x1B, 0x1F, 0x24),
+    /* emptyHint  */ RGB(0x6B, 0x75, 0x81),
+    /* capTop     */ RGB(0xFF, 0xFF, 0xFF),
+    /* capBottom  */ RGB(0xF0, 0xF2, 0xF5),
+    /* capText    */ RGB(0x1B, 0x1F, 0x24),
+    /* capLine    */ RGB(0xD8, 0xDB, 0xE0),
+    /* capBtn     */ RGB(0xF0, 0xF2, 0xF5),
+    /* capBtnHover */ RGB(0xE4, 0xE8, 0xEE),
+    /* capGlyph   */ RGB(0x3A, 0x40, 0x48),
+    /* macRed     */ RGB(0xFF, 0x5F, 0x57),
+    /* macYellow  */ RGB(0xFE, 0xBC, 0x2E),
+    /* macGreen   */ RGB(0x28, 0xC8, 0x40),
+    /* macGlyph   */ RGB(0x00, 0x00, 0x00),
+    /* capStyle   */ CAP_SYS,
+    /* dark       */ false
+    },
+    // ---- Dark: neutral charcoal ---
+    {
+    /* ribbonBg   */ RGB(0x20, 0x21, 0x24),
+    /* card       */ RGB(0x2A, 0x2C, 0x30),
+    /* cardBorder */ RGB(0x3A, 0x3D, 0x43),
+    /* accent     */ RGB(0x4C, 0x9A, 0xFF),
+    /* accentDeep */ RGB(0x1E, 0x6F, 0xC9),
+    /* text       */ RGB(0xE8, 0xEA, 0xED),
+    /* textDim    */ RGB(0xA6, 0xAC, 0xB4),
+    /* btnHover   */ RGB(0x33, 0x37, 0x3D),
+    /* btnDown    */ RGB(0x3D, 0x44, 0x4D),
+    /* btnBorder  */ RGB(0x3A, 0x3D, 0x43),
+    /* thumbBg    */ RGB(0x23, 0x25, 0x29),
+    /* canvasBg   */ RGB(0x1A, 0x1C, 0x1F),
+    /* pageFrame  */ RGB(0x6A, 0x70, 0x79),
+    /* split      */ RGB(0x2E, 0x31, 0x36),
+    /* statusBg   */ RGB(0x15, 0x17, 0x1A),
+    /* statusTxt  */ RGB(0xC9, 0xCE, 0xD6),
+    /* treeBg     */ RGB(0x23, 0x25, 0x29),
+    /* treeTxt    */ RGB(0xE0, 0xE3, 0xE8),
+    /* emptyHint  */ RGB(0x8A, 0x91, 0x9A),
+    /* capTop     */ RGB(0x2B, 0x2E, 0x33),
+    /* capBottom  */ RGB(0x20, 0x21, 0x24),
+    /* capText    */ RGB(0xE8, 0xEA, 0xED),
+    /* capLine    */ RGB(0x39, 0x3D, 0x43),
+    /* capBtn     */ RGB(0x3D, 0x41, 0x48),
+    /* capBtnHover */ RGB(0x4A, 0x4F, 0x57),
+    /* capGlyph   */ RGB(0xE6, 0xE8, 0xEC),
+    /* macRed     */ RGB(0xFF, 0x5F, 0x57),
+    /* macYellow  */ RGB(0xFE, 0xBC, 0x2E),
+    /* macGreen   */ RGB(0x28, 0xC8, 0x40),
+    /* macGlyph   */ RGB(0x00, 0x00, 0x00),
+    /* capStyle   */ CAP_SYS,
+    /* dark       */ true
+    },
+    // ---- Dark blue: deep navy with bright blue accents ---
+    {
+    /* ribbonBg   */ RGB(0x16, 0x23, 0x3A),
+    /* card       */ RGB(0x1D, 0x2C, 0x46),
+    /* cardBorder */ RGB(0x2B, 0x3E, 0x5C),
+    /* accent     */ RGB(0x6F, 0xB2, 0xFF),
+    /* accentDeep */ RGB(0x3D, 0x82, 0xD6),
+    /* text       */ RGB(0xE6, 0xEE, 0xF9),
+    /* textDim    */ RGB(0xA2, 0xB6, 0xD0),
+    /* btnHover   */ RGB(0x24, 0x38, 0x5A),
+    /* btnDown    */ RGB(0x2C, 0x45, 0x70),
+    /* btnBorder  */ RGB(0x2B, 0x3E, 0x5C),
+    /* thumbBg    */ RGB(0x1A, 0x29, 0x42),
+    /* canvasBg   */ RGB(0x10, 0x1A, 0x2B),
+    /* pageFrame  */ RGB(0x5A, 0x73, 0x96),
+    /* split      */ RGB(0x23, 0x33, 0x4D),
+    /* statusBg   */ RGB(0x0D, 0x15, 0x22),
+    /* statusTxt  */ RGB(0xC3, 0xD3, 0xE8),
+    /* treeBg     */ RGB(0x1A, 0x29, 0x42),
+    /* treeTxt    */ RGB(0xDC, 0xE7, 0xF5),
+    /* emptyHint  */ RGB(0x86, 0x9C, 0xB8),
+    /* capTop     */ RGB(0x1F, 0x31, 0x4F),
+    /* capBottom  */ RGB(0x16, 0x23, 0x3A),
+    /* capText    */ RGB(0xE6, 0xEE, 0xF9),
+    /* capLine    */ RGB(0x33, 0x4C, 0x72),
+    /* capBtn     */ RGB(0x2B, 0x3E, 0x5C),
+    /* capBtnHover */ RGB(0x3C, 0x53, 0x7A),
+    /* capGlyph   */ RGB(0xDD, 0xE7, 0xF6),
+    /* macRed     */ RGB(0xFF, 0x5F, 0x57),
+    /* macYellow  */ RGB(0xFE, 0xBC, 0x2E),
+    /* macGreen   */ RGB(0x28, 0xC8, 0x40),
+    /* macGlyph   */ RGB(0x00, 0x00, 0x00),
+    /* capStyle   */ CAP_SYS,
+    /* dark       */ true
+    },
+    // ---- Pastel: soft lavender, light surfaces ---
+    {
+    /* ribbonBg   */ RGB(0xF6, 0xF1, 0xFA),
+    /* card       */ RGB(0xFF, 0xFF, 0xFF),
+    /* cardBorder */ RGB(0xE3, 0xD8, 0xEC),
+    /* accent     */ RGB(0x7C, 0x4D, 0xBE),
+    /* accentDeep */ RGB(0x5A, 0x2F, 0x92),
+    /* text       */ RGB(0x2A, 0x24, 0x31),
+    /* textDim    */ RGB(0x6B, 0x5F, 0x7A),
+    /* btnHover   */ RGB(0xEF, 0xE3, 0xF8),
+    /* btnDown    */ RGB(0xDF, 0xCD, 0xF0),
+    /* btnBorder  */ RGB(0xE0, 0xD6, 0xE9),
+    /* thumbBg    */ RGB(0xF1, 0xEA, 0xF7),
+    /* canvasBg   */ RGB(0xD3, 0xC9, 0xDE),
+    /* pageFrame  */ RGB(0x8B, 0x7E, 0x9B),
+    /* split      */ RGB(0xE3, 0xD8, 0xEC),
+    /* statusBg   */ RGB(0x4A, 0x3B, 0x5C),
+    /* statusTxt  */ RGB(0xF0, 0xE9, 0xF7),
+    /* treeBg     */ RGB(0xFF, 0xFF, 0xFF),
+    /* treeTxt    */ RGB(0x2A, 0x24, 0x31),
+    /* emptyHint  */ RGB(0x7A, 0x6C, 0x88),
+    /* capTop     */ RGB(0xFF, 0xFD, 0xFF),
+    /* capBottom  */ RGB(0xF4, 0xEC, 0xFB),
+    /* capText    */ RGB(0x2A, 0x24, 0x31),
+    /* capLine    */ RGB(0xE3, 0xD8, 0xEC),
+    /* capBtn     */ RGB(0xF6, 0xEE, 0xFB),
+    /* capBtnHover */ RGB(0xEF, 0xE6, 0xF8),
+    /* capGlyph   */ RGB(0x59, 0x4C, 0x69),
+    /* macRed     */ RGB(0xFF, 0x5F, 0x57),
+    /* macYellow  */ RGB(0xFE, 0xBC, 0x2E),
+    /* macGreen   */ RGB(0x28, 0xC8, 0x40),
+    /* macGlyph   */ RGB(0x00, 0x00, 0x00),
+    /* capStyle   */ CAP_SYS,
+    /* dark       */ false
+    },
+    // ---- High contrast dark: black / cyan / white ---
+    {
+    /* ribbonBg   */ RGB(0x00, 0x00, 0x00),
+    /* card       */ RGB(0x0A, 0x0A, 0x0A),
+    /* cardBorder */ RGB(0xFF, 0xFF, 0xFF),
+    /* accent     */ RGB(0x00, 0xE5, 0xFF),
+    /* accentDeep */ RGB(0x00, 0xA0, 0xB4),
+    /* text       */ RGB(0xFF, 0xFF, 0xFF),
+    /* textDim    */ RGB(0xD8, 0xD8, 0xD8),
+    /* btnHover   */ RGB(0x1E, 0x1E, 0x1E),
+    /* btnDown    */ RGB(0x33, 0x33, 0x33),
+    /* btnBorder  */ RGB(0xFF, 0xFF, 0xFF),
+    /* thumbBg    */ RGB(0x05, 0x05, 0x05),
+    /* canvasBg   */ RGB(0x00, 0x00, 0x00),
+    /* pageFrame  */ RGB(0xFF, 0xFF, 0xFF),
+    /* split      */ RGB(0xFF, 0xFF, 0xFF),
+    /* statusBg   */ RGB(0x00, 0x00, 0x00),
+    /* statusTxt  */ RGB(0xFF, 0xFF, 0xFF),
+    /* treeBg     */ RGB(0x00, 0x00, 0x00),
+    /* treeTxt    */ RGB(0xFF, 0xFF, 0xFF),
+    /* emptyHint  */ RGB(0xC0, 0xC0, 0xC0),
+    /* capTop     */ RGB(0x00, 0x00, 0x00),
+    /* capBottom  */ RGB(0x00, 0x00, 0x00),
+    /* capText    */ RGB(0xFF, 0xFF, 0xFF),
+    /* capLine    */ RGB(0xFF, 0xFF, 0xFF),
+    /* capBtn     */ RGB(0x33, 0x33, 0x33),
+    /* capBtnHover */ RGB(0xFF, 0xFF, 0xFF),
+    /* capGlyph   */ RGB(0x00, 0x00, 0x00),
+    /* macRed     */ RGB(0xFF, 0x59, 0x00),
+    /* macYellow  */ RGB(0xFF, 0xD5, 0x00),
+    /* macGreen   */ RGB(0x00, 0xE0, 0x00),
+    /* macGlyph   */ RGB(0x00, 0x00, 0x00),
+    /* capStyle   */ CAP_SYS,
+    /* dark       */ true
+    },
+    // ---- High contrast light: white / blue / black ---
+    {
+    /* ribbonBg   */ RGB(0xFF, 0xFF, 0xFF),
+    /* card       */ RGB(0xFF, 0xFF, 0xFF),
+    /* cardBorder */ RGB(0x00, 0x00, 0x00),
+    /* accent     */ RGB(0x00, 0x00, 0xC8),
+    /* accentDeep */ RGB(0x00, 0x00, 0x66),
+    /* text       */ RGB(0x00, 0x00, 0x00),
+    /* textDim    */ RGB(0x33, 0x33, 0x33),
+    /* btnHover   */ RGB(0xE0, 0xE0, 0xFF),
+    /* btnDown    */ RGB(0xC0, 0xC0, 0xF0),
+    /* btnBorder  */ RGB(0x00, 0x00, 0x00),
+    /* thumbBg    */ RGB(0xF0, 0xF0, 0xF0),
+    /* canvasBg   */ RGB(0xB0, 0xB0, 0xB0),
+    /* pageFrame  */ RGB(0x00, 0x00, 0x00),
+    /* split      */ RGB(0x00, 0x00, 0x00),
+    /* statusBg   */ RGB(0x00, 0x00, 0x00),
+    /* statusTxt  */ RGB(0xFF, 0xFF, 0xFF),
+    /* treeBg     */ RGB(0xFF, 0xFF, 0xFF),
+    /* treeTxt    */ RGB(0x00, 0x00, 0x00),
+    /* emptyHint  */ RGB(0x40, 0x40, 0x40),
+    /* capTop     */ RGB(0xFF, 0xFF, 0xFF),
+    /* capBottom  */ RGB(0xEE, 0xEE, 0xEE),
+    /* capText    */ RGB(0x00, 0x00, 0x00),
+    /* capLine    */ RGB(0xE6, 0xE6, 0xE6),
+    /* capBtn     */ RGB(0xFF, 0xFF, 0xFF),
+    /* capBtnHover */ RGB(0xE6, 0xE6, 0xFF),
+    /* capGlyph   */ RGB(0x00, 0x00, 0x00),
+    /* macRed     */ RGB(0xFF, 0x59, 0x00),
+    /* macYellow  */ RGB(0xFF, 0xD5, 0x00),
+    /* macGreen   */ RGB(0x00, 0xE0, 0x00),
+    /* macGlyph   */ RGB(0x00, 0x00, 0x00),
+    /* capStyle   */ CAP_SYS,
+    /* dark       */ false
+    },
+    // ---- Windows XP: Luna colours, blue gradient caption ---
+    {
+    /* ribbonBg   */ RGB(0xEC, 0xE9, 0xD8),
+    /* card       */ RGB(0xF5, 0xF2, 0xE6),
+    /* cardBorder */ RGB(0xD6, 0xD0, 0xC2),
+    /* accent     */ RGB(0x0A, 0x24, 0x6A),
+    /* accentDeep */ RGB(0x1E, 0x4E, 0x9C),
+    /* text       */ RGB(0x1A, 0x1A, 0x1A),
+    /* textDim    */ RGB(0x55, 0x55, 0x4E),
+    /* btnHover   */ RGB(0xFD, 0xF7, 0xD4),
+    /* btnDown    */ RGB(0xE3, 0xD8, 0xB0),
+    /* btnBorder  */ RGB(0xC6, 0xC0, 0xB2),
+    /* thumbBg    */ RGB(0xEF, 0xEB, 0xDE),
+    /* canvasBg   */ RGB(0xA6, 0xA6, 0xA6),
+    /* pageFrame  */ RGB(0x64, 0x64, 0x64),
+    /* split      */ RGB(0xC6, 0xC0, 0xB2),
+    /* statusBg   */ RGB(0x0A, 0x24, 0x6A),
+    /* statusTxt  */ RGB(0xFF, 0xFF, 0xFF),
+    /* treeBg     */ RGB(0xFF, 0xFF, 0xFF),
+    /* treeTxt    */ RGB(0x00, 0x00, 0x00),
+    /* emptyHint  */ RGB(0x4A, 0x4A, 0x42),
+    /* capTop     */ RGB(0x0A, 0x24, 0x6A),
+    /* capBottom  */ RGB(0xA6, 0xCA, 0xF0),
+    /* capText    */ RGB(0xFF, 0xFF, 0xFF),
+    /* capLine    */ RGB(0x08, 0x1E, 0x50),
+    /* capBtn     */ RGB(0x21, 0x5D, 0xAA),
+    /* capBtnHover */ RGB(0x5C, 0x8A, 0xD6),
+    /* capGlyph   */ RGB(0xFF, 0xFF, 0xFF),
+    /* macRed     */ RGB(0xFF, 0x5F, 0x57),
+    /* macYellow  */ RGB(0xFE, 0xBC, 0x2E),
+    /* macGreen   */ RGB(0x28, 0xC8, 0x40),
+    /* macGlyph   */ RGB(0x00, 0x00, 0x00),
+    /* capStyle   */ CAP_XP,
+    /* dark       */ false
+    },
+    // ---- macOS: light chrome with traffic-light caption ---
+    {
+    /* ribbonBg   */ RGB(0xF2, 0xF2, 0xF2),
+    /* card       */ RGB(0xFF, 0xFF, 0xFF),
+    /* cardBorder */ RGB(0xD6, 0xD6, 0xD6),
+    /* accent     */ RGB(0x0A, 0x7A, 0xFF),
+    /* accentDeep */ RGB(0x00, 0x60, 0xDF),
+    /* text       */ RGB(0x1D, 0x1D, 0x1F),
+    /* textDim    */ RGB(0x63, 0x63, 0x68),
+    /* btnHover   */ RGB(0xE3, 0xE3, 0xE8),
+    /* btnDown    */ RGB(0xD2, 0xD2, 0xD7),
+    /* btnBorder  */ RGB(0xD6, 0xD6, 0xD6),
+    /* thumbBg    */ RGB(0xED, 0xED, 0xF0),
+    /* canvasBg   */ RGB(0xC3, 0xC3, 0xC8),
+    /* pageFrame  */ RGB(0x86, 0x86, 0x8B),
+    /* split      */ RGB(0xD6, 0xD6, 0xD6),
+    /* statusBg   */ RGB(0x2C, 0x2C, 0x2E),
+    /* statusTxt  */ RGB(0xF5, 0xF5, 0xF7),
+    /* treeBg     */ RGB(0xFF, 0xFF, 0xFF),
+    /* treeTxt    */ RGB(0x1D, 0x1D, 0x1F),
+    /* emptyHint  */ RGB(0x86, 0x86, 0x8B),
+    /* capTop     */ RGB(0xE8, 0xE8, 0xE8),
+    /* capBottom  */ RGB(0xE0, 0xE0, 0xE0),
+    /* capText    */ RGB(0x2B, 0x2B, 0x2D),
+    /* capLine    */ RGB(0xC8, 0xC8, 0xC8),
+    /* capBtn     */ RGB(0xE0, 0xE0, 0xE0),
+    /* capBtnHover */ RGB(0xD0, 0xD0, 0xD0),
+    /* capGlyph   */ RGB(0x2B, 0x2B, 0x2D),
+    /* macRed     */ RGB(0xFF, 0x5F, 0x57),
+    /* macYellow  */ RGB(0xFE, 0xBC, 0x2E),
+    /* macGreen   */ RGB(0x28, 0xC8, 0x40),
+    /* macGlyph   */ RGB(0x00, 0x00, 0x00),
+    /* capStyle   */ CAP_MAC,
+    /* dark       */ false
+    },
+};
 
-static Theme DarkTheme()
-{
-  Theme t{};
-  t.ribbonBg   = RGB(0x20, 0x20, 0x20);
-  t.card       = RGB(0x28, 0x28, 0x28);
-  t.cardBorder = RGB(0x3A, 0x3A, 0x3A);
-  t.accent     = RGB(0x4C, 0xA0, 0xFF);
-  t.accentDeep = RGB(0x1E, 0x6F, 0xC9);
-  t.text       = RGB(0xE8, 0xE8, 0xE8);
-  t.textDim    = RGB(0x9A, 0x9A, 0x9A);
-  t.btnHover   = RGB(0x33, 0x39, 0x43);
-  t.btnDown    = RGB(0x3D, 0x46, 0x54);
-  t.btnBorder  = RGB(0x3A, 0x3A, 0x3A);
-  t.thumbBg    = RGB(0x23, 0x23, 0x23);
-  t.canvasBg   = RGB(0x1B, 0x1B, 0x1B);
-  t.pageFrame  = RGB(0x6A, 0x6A, 0x6A);
-  t.split      = RGB(0x2E, 0x2E, 0x2E);
-  t.statusBg   = RGB(0x16, 0x16, 0x16);
-  t.statusTxt  = RGB(0xC9, 0xC9, 0xC9);
-  t.treeBg     = RGB(0x20, 0x20, 0x20);
-  t.treeTxt    = RGB(0xE0, 0xE0, 0xE0);
-  return t;
-}
+static const wchar_t* kThemeNames[THEME_COUNT] = {
+    L"Light Grey", L"Dark", L"Dark Blue", L"Pastel",
+    L"High Contrast (Dark)", L"High Contrast (Light)",
+    L"Windows XP", L"macOS"};
 
-static Theme ThemeNow() { return g_dark ? DarkTheme() : LightTheme(); }
+static const UiTheme& ThemeNow() { return kThemes[g_themeId]; }
+static bool ThemeIsDark() { return kThemes[g_themeId].dark; }
 
 static void ApplyTreeTheme()
 {
   if (!g.bookmarks) return;
-  const Theme& th = ThemeNow();
+  const UiTheme& th = ThemeNow();
   SendMessageW(g.bookmarks, TVM_SETBKCOLOR, 0, (LPARAM)th.treeBg);
   SendMessageW(g.bookmarks, TVM_SETTEXTCOLOR, 0, (LPARAM)th.treeTxt);
   SendMessageW(g.bookmarks, TVM_SETLINECOLOR, 0, (LPARAM)th.treeTxt);
   InvalidateRect(g.bookmarks, nullptr, TRUE);
 }
 
-static void ToggleTheme()
+// Let the OS chrome (scrollbars, tree view, the system's own dark handling)
+// follow the active theme.
+static void ApplyOsTheme()
 {
-  g_dark = !g_dark;
-  if (g.toolbar)  InvalidateRect(g.toolbar, nullptr, TRUE);
-  if (g.thumbs)   InvalidateRect(g.thumbs, nullptr, TRUE);
-  if (g.split)    InvalidateRect(g.split, nullptr, TRUE);
-  if (g.canvas)   InvalidateRect(g.canvas, nullptr, TRUE);
-  if (g.status)   InvalidateRect(g.status, nullptr, TRUE);
+  if (!g.frame) return;
+  const UiTheme& th = ThemeNow();
+  // Modern (flat, thin) scrollbars; dark themes use the dark variant.
+  const wchar_t* scrollSub = th.dark ? L"DarkMode_Explorer" : L"Explorer";
+  SetWindowTheme(g.canvas, scrollSub, nullptr);
+  SetWindowTheme(g.thumbs, scrollSub, nullptr);
+  SetWindowTheme(g.bookmarks, L"Explorer", nullptr);
+  SetWindowTheme(g.split, L"", L"");
+  // Ask DWM for a dark title bar / dark dialog surfaces where supported.
+  BOOL dark = th.dark ? TRUE : FALSE;
+  if (g.frame)
+  {
+    // 20 = DWMWA_USE_IMMERSIVE_DARK_MODE (Win10 2004+/11),
+    // 19 = the earlier build-name value; try both, ignore failures.
+    DwmSetWindowAttribute(g.frame, 20, &dark, sizeof(dark));
+    DwmSetWindowAttribute(g.frame, 19, &dark, sizeof(dark));
+  }
+}
+
+static void SyncThemeMenuChecks()
+{
+  HMENU sub = g_themeMenu;
+  if (!sub) return;
+  CheckMenuRadioItem(sub, ID_THEME_FIRST, ID_THEME_FIRST + THEME_COUNT - 1,
+                     ID_THEME_FIRST + g_themeId, MF_BYCOMMAND);
+  CheckMenuItem(sub, ID_THEME,
+                MF_BYCOMMAND | (ThemeIsDark() ? MF_CHECKED : MF_UNCHECKED));
+}
+
+static void RefreshAllSurfaces()
+{
+  if (g.toolbar) InvalidateRect(g.toolbar, nullptr, TRUE);
+  if (g.thumbs)  InvalidateRect(g.thumbs, nullptr, TRUE);
+  if (g.split)   InvalidateRect(g.split, nullptr, TRUE);
+  if (g.canvas)  InvalidateRect(g.canvas, nullptr, TRUE);
+  if (g.status)  InvalidateRect(g.status, nullptr, TRUE);
+  if (g.paneTabs) InvalidateRect(g.paneTabs, nullptr, TRUE);
+  if (g.frame)   InvalidateRect(g.frame, nullptr, TRUE);
   for (HWND hw : g.ribbonBtns)
     InvalidateRect(hw, nullptr, TRUE);
+  for (HWND hw : g.tabBtns)
+    if (hw) InvalidateRect(hw, nullptr, TRUE);
   ApplyTreeTheme();
+  ApplyOsTheme();
+}
+
+static void SetTheme(int id, bool persist)
+{
+  if (id < 0 || id >= THEME_COUNT) return;
+  g_themeId = id;
+  RefreshAllSurfaces();
+  SyncThemeMenuChecks();
+  if (!persist) return;
   HKEY key = nullptr;
-  if (RegCreateKeyExW(HKEY_CURRENT_USER,
-                      L"Software\\StitchupPDFEditor", 0, nullptr, 0,
-                      KEY_SET_VALUE, nullptr, &key, nullptr) == ERROR_SUCCESS)
+  if (RegCreateKeyExW(HKEY_CURRENT_USER, L"Software\\StitchupPDFEditor", 0,
+                      nullptr, 0, KEY_SET_VALUE, nullptr, &key, nullptr)
+      == ERROR_SUCCESS)
   {
-    DWORD v = g_dark ? 1 : 0;
-    RegSetValueExW(key, L"Dark", 0, REG_DWORD, (const BYTE*)&v, sizeof(v));
+    DWORD v = (DWORD)id;
+    RegSetValueExW(key, L"Theme", 0, REG_DWORD, (const BYTE*)&v, sizeof(v));
     RegCloseKey(key);
   }
-  CheckMenuItem(GetMenu(g.frame), ID_THEME,
-                MF_BYCOMMAND | (g_dark ? MF_CHECKED : MF_UNCHECKED));
+}
+
+// Ctrl+D: quick toggle between the light and dark schemes.
+static void ToggleTheme()
+{
+  SetTheme(ThemeIsDark() ? THEME_LIGHT : THEME_DARK, true);
 }
 
 static void ApplyInitialThemePref()
 {
   HKEY key = nullptr;
-  if (RegOpenKeyExW(HKEY_CURRENT_USER, L"Software\\StitchupPDFEditor",
-                    0, KEY_QUERY_VALUE, &key) == ERROR_SUCCESS)
+  if (RegOpenKeyExW(HKEY_CURRENT_USER, L"Software\\StitchupPDFEditor", 0,
+                    KEY_QUERY_VALUE, &key) == ERROR_SUCCESS)
   {
-    DWORD v = 0, sz = sizeof(v);
-    if (RegQueryValueExW(key, L"Dark", nullptr, nullptr,
-                         (LPBYTE)&v, &sz) == ERROR_SUCCESS && v)
-      g_dark = true;
+    DWORD v = 0, sz = sizeof(v), legacy = 0, lsz = sizeof(legacy);
+    if (RegQueryValueExW(key, L"Theme", nullptr, nullptr, (LPBYTE)&v, &sz)
+          == ERROR_SUCCESS && v < THEME_COUNT)
+      g_themeId = (int)v;
+    else if (RegQueryValueExW(key, L"Dark", nullptr, nullptr, (LPBYTE)&legacy,
+                              &lsz) == ERROR_SUCCESS && legacy)
+      g_themeId = THEME_DARK;   // migrate the old light/dark pref
     RegCloseKey(key);
   }
 }
@@ -563,6 +907,7 @@ static void RefreshTabBar();
 static void RefreshState();
 static void UpdateScrollbars();
 static void ResetThumbScroll();
+static void FitWidth();
 
 static void RestoreTab(int i)
 {
@@ -793,11 +1138,8 @@ static void LoadDoc(const std::wstring& file)
   g_curTab = (int)g_tabs.size() - 1;
   SetWindowTextW(g.frame, (g.name + L" - Stitchup PDF Editor").c_str());
   RefreshState();
-  double mx = std::max(1.0, MaxPageW());
-  RECT rc{};
-  if (g.canvas) GetClientRect(g.canvas, &rc);
-  double cw = std::max(200, (int)(rc.right - rc.left));
-  g.zoom = std::min(2.5, std::max(0.35, (cw - 60.0) / mx));
+  // Open at the real fit-page-width zoom, not an approximation.
+  FitWidth();
   g.scrollX = g.scrollY = 0;
   InvalidateRect(g.canvas, nullptr, TRUE);
   InvalidateRect(g.thumbs, nullptr, TRUE);
@@ -1860,12 +2202,43 @@ static void ReorderDoc(int from, int to)
 static void UpdateScrollbars()
 {
   if (!g.canvas) return;
+  // Showing/hiding a scrollbar resizes the canvas, which re-enters this
+  // function through WM_SIZE. Guard against that, then settle the bars.
+  static bool inUpdate = false;
+  if (inUpdate) return;
+  inUpdate = true;
+
   RECT rc{};
   GetClientRect(g.canvas, &rc);
   int cw = rc.right - rc.left, ch = rc.bottom - rc.top;
   std::vector<RECT> rects;
   int contentW = 0, contentH = 0;
   LayoutPages(cw, rects, contentW, contentH);
+  const bool hasDoc = g.doc && g.pageCount > 0;
+
+  // Only show a bar when the document actually overflows that axis, so the
+  // empty view and single pages stay completely clean. Two passes is enough to
+  // settle after the client area has been resized by the first one. The current
+  // state is read from the window (ShowScrollBar keeps the style bits in sync)
+  // so the very first call still hides bars that WS_HSCROLL/WS_VSCROLL created.
+  bool barH = (GetWindowLongW(g.canvas, GWL_STYLE) & WS_HSCROLL) != 0;
+  bool barV = (GetWindowLongW(g.canvas, GWL_STYLE) & WS_VSCROLL) != 0;
+  for (int pass = 0; pass < 2; ++pass)
+  {
+    const bool needH = hasDoc && contentW > cw;
+    const bool needV = hasDoc && contentH > ch;
+    if (needH == barH && needV == barV) break;
+    barH = needH;
+    barV = needV;
+    ShowScrollBar(g.canvas, SB_HORZ, needH ? TRUE : FALSE);
+    ShowScrollBar(g.canvas, SB_VERT, needV ? TRUE : FALSE);
+    GetClientRect(g.canvas, &rc);
+    cw = rc.right - rc.left;
+    ch = rc.bottom - rc.top;
+    rects.clear();
+    LayoutPages(cw, rects, contentW, contentH);
+  }
+
   contentW = std::max(contentW, 24);
   contentH = std::max(contentH, 24);
 
@@ -1884,13 +2257,13 @@ static void UpdateScrollbars()
   if (g.scrollY > si.nMax - 1) g.scrollY = si.nMax - 1;
   si.nPos = g.scrollY;
   SetScrollInfo(g.canvas, SB_VERT, &si, TRUE);
+  inUpdate = false;
 }
 
 // ---------------------------------------------------------------------------
 // Status bar
 // ---------------------------------------------------------------------------
-static LRESULT CALLBACK StatusProc(HWND hw, UINT msg, WPARAM wp, LPARAM lp,
-                                   UINT_PTR, DWORD_PTR)
+static LRESULT CALLBACK StatusProc(HWND hw, UINT msg, WPARAM wp, LPARAM lp)
 {
   switch (msg)
   {
@@ -1902,7 +2275,7 @@ static LRESULT CALLBACK StatusProc(HWND hw, UINT msg, WPARAM wp, LPARAM lp,
       HDC dc = BeginPaint(hw, &ps);
       RECT rc;
       GetClientRect(hw, &rc);
-      const Theme& th = ThemeNow();
+      const UiTheme& th = ThemeNow();
       HBRUSH bg = CreateSolidBrush(th.statusBg);
       FillRect(dc, &rc, bg);
       DeleteObject(bg);
@@ -1913,10 +2286,14 @@ static LRESULT CALLBACK StatusProc(HWND hw, UINT msg, WPARAM wp, LPARAM lp,
       RECT lrc = rc;
       lrc.left += 10;
       DrawTextW(dc, left.c_str(), -1, &lrc, DT_SINGLELINE | DT_VCENTER);
-      std::wstring right =
-        L"Page " + std::to_wstring(g.pageCount ? g.selected + 1 : 0) + L" of " +
-        std::to_wstring(g.pageCount) + L"      Zoom " +
-        std::to_wstring((int)std::lround(g.zoom * 100.0)) + L"%";
+      std::wstring right;
+      if (g.pageCount > 0)
+        right = L"Page " + std::to_wstring(g.selected + 1) + L" of " +
+                std::to_wstring(g.pageCount) + L"      Zoom " +
+                std::to_wstring((int)std::lround(g.zoom * 100.0)) + L"%";
+      else
+        right = L"No document      Zoom " +
+                std::to_wstring((int)std::lround(g.zoom * 100.0)) + L"%";
       RECT rrc = rc;
       rrc.right -= 10;
       SetTextAlign(dc, TA_RIGHT | TA_TOP);
@@ -1925,7 +2302,7 @@ static LRESULT CALLBACK StatusProc(HWND hw, UINT msg, WPARAM wp, LPARAM lp,
       return 0;
     }
   }
-  return DefSubclassProc(hw, msg, wp, lp);
+  return DefWindowProc(hw, msg, wp, lp);
 }
 
 // ---------------------------------------------------------------------------
@@ -2035,7 +2412,7 @@ static LRESULT CALLBACK ThumbsProc(HWND hw, UINT msg, WPARAM wp, LPARAM lp)
       HBITMAP bmp = CreateCompatibleBitmap(dc, rc.right - rc.left,
                                            rc.bottom - rc.top);
       HGDIOBJ oldBmp = SelectObject(mem, bmp);
-      const Theme& thm = ThemeNow();
+      const UiTheme& thm = ThemeNow();
       HBRUSH bgb = CreateSolidBrush(thm.thumbBg);
       FillRect(mem, &rc, bgb);
       DeleteObject(bgb);
@@ -2109,9 +2486,9 @@ static LRESULT CALLBACK ThumbsProc(HWND hw, UINT msg, WPARAM wp, LPARAM lp)
           DeleteObject(pn);
         }
       }
-      SelectObject(mem, oldBmp);
       BitBlt(dc, 0, 0, rc.right - rc.left, rc.bottom - rc.top, mem, 0, 0,
              SRCCOPY);
+      SelectObject(mem, oldBmp);
       DeleteObject(bmp);
       DeleteDC(mem);
       EndPaint(hw, &ps);
@@ -2659,13 +3036,42 @@ static void EditSelectedText()
 
 static void CanvasPaint(HDC dc, int cw, int ch)
 {
-  const Theme& th = ThemeNow();
+  const UiTheme& th = ThemeNow();
   HBRUSH bg = CreateSolidBrush(th.canvasBg);
   RECT rc{0, 0, cw, ch};
   FillRect(dc, &rc, bg);
   DeleteObject(bg);
 
-  if (!g.doc || g.pageCount == 0) return;
+  if (!g.doc || g.pageCount == 0)
+  {
+    // Empty state: a soft "open a document" hint centred on the canvas.
+    const wchar_t* line1 = L"No document open";
+    const wchar_t* line2 = L"Use File \x2013 Open (Ctrl+O) to open a PDF, "
+                          L"or drop one here";
+    HFONT f1 = CreateFontW(-MulDiv(15, g.dpi, 72), 0, 0, 0, FW_SEMIBOLD, FALSE,
+                            FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS,
+                            CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
+                            DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI");
+    HFONT f2 = CreateFontW(-MulDiv(10, g.dpi, 72), 0, 0, 0, FW_NORMAL, FALSE,
+                            FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS,
+                            CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
+                            DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI");
+    SetTextColor(dc, th.textDim);
+    SetBkMode(dc, TRANSPARENT);
+    RECT box{0, 0, cw, ch};
+    HFONT w1 = (HFONT)SelectObject(dc, f1);
+    DrawTextW(dc, line1, -1, &box,
+              DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+    RECT box2{0, box.bottom / 2 + MulDiv(18, g.dpi, 72), cw, ch};
+    HFONT w2 = (HFONT)SelectObject(dc, f2);
+    DrawTextW(dc, line2, -1, &box2,
+              DT_CENTER | DT_TOP | DT_SINGLELINE | DT_NOPREFIX);
+    SelectObject(dc, w1);
+    SelectObject(dc, w2);
+    DeleteObject(f1);
+    DeleteObject(f2);
+    return;
+  }
   double s = g.zoom;
   std::vector<RECT> rects;
   int contentW = 0, contentH = 0;
@@ -2799,8 +3205,8 @@ static LRESULT CALLBACK CanvasProc(HWND hw, UINT msg, WPARAM wp, LPARAM lp)
       HBITMAP bmp = CreateCompatibleBitmap(dc, cw, ch);
       HGDIOBJ oldBmp = SelectObject(mem, bmp);
       CanvasPaint(mem, cw, ch);
-      SelectObject(mem, oldBmp);
       BitBlt(dc, 0, 0, cw, ch, mem, 0, 0, SRCCOPY);
+      SelectObject(mem, oldBmp);
       DeleteObject(bmp);
       DeleteDC(mem);
       EndPaint(hw, &ps);
@@ -3117,7 +3523,7 @@ static void BtnPaint(HWND hw)
   HDC dc = BeginPaint(hw, &ps);
   RECT rc;
   GetClientRect(hw, &rc);
-  const Theme& th = ThemeNow();
+  const UiTheme& th = ThemeNow();
   const int R = 6;  // corner diameter for rounded 3px radius
   if (b->tab)
   {
@@ -3726,15 +4132,15 @@ static void RelayoutPanes(int w, int h)
 {
   if (!g.toolbar) return;
   int paneY = TAB_H + RIB_H + PANE_TAB_H;
-  int paneH = std::max(10, h - paneY - 28);
-  int canvasH = std::max(10, h - TAB_H - RIB_H - 28);
+  int paneH = std::max(10, h - paneY - STATUS_H);
+  int canvasH = std::max(10, h - TAB_H - RIB_H - STATUS_H);
   bool sb = g.showSidebar;
   int sw = sb ? g.thumbsW : 0;
   SetWindowPos(g.tabbar, nullptr, 0, 0, w, TAB_H, SWP_NOZORDER);
   SetWindowPos(g.toolbar, nullptr, 0, TAB_H, w, RIB_H, SWP_NOZORDER);
   SetWindowPos(g.paneTabs, nullptr, 0, TAB_H + RIB_H, sw, PANE_TAB_H,
                SWP_NOZORDER);
-  SetWindowPos(g.status, nullptr, 0, h - 28, w, 28, SWP_NOZORDER);
+  SetWindowPos(g.status, nullptr, 0, h - STATUS_H, w, STATUS_H, SWP_NOZORDER);
   SetWindowPos(g.thumbs, nullptr, 0, paneY, sw, paneH, SWP_NOZORDER);
   SetWindowPos(g.bookmarks, nullptr, 0, paneY, sw, paneH, SWP_NOZORDER);
   SetWindowPos(g.split, nullptr, sw, TAB_H + RIB_H, 6,
@@ -3748,6 +4154,7 @@ static void RelayoutPanes(int w, int h)
   InvalidateRect(g.thumbs, nullptr, FALSE);
   InvalidateRect(g.canvas, nullptr, FALSE);
   InvalidateRect(g.tabbar, nullptr, FALSE);
+  InvalidateRect(g.status, nullptr, FALSE);
   UpdateScrollbars();
 }
 
@@ -3838,6 +4245,16 @@ static void DoCommand(int id)
     case ID_EXPORT_CSV:   ExportCsvAll(); break;
     case ID_WATERMARK:    WatermarkCurrentDoc(); break;
     case ID_THEME:        ToggleTheme(); break;
+    case ID_THEME_FIRST:
+    case ID_THEME_DARK:
+    case ID_THEME_DARKBLUE:
+    case ID_THEME_PASTEL:
+    case ID_THEME_HC_DARK:
+    case ID_THEME_HC_LIGHT:
+    case ID_THEME_XP:
+    case ID_THEME_MAC:
+      SetTheme(id - ID_THEME_FIRST, true);
+      break;
     case ID_ABOUT:
       MessageBoxW(g.frame,
         L"Stitchup PDF Editor\n\nPortable PDF viewer/editor\n"
@@ -3925,12 +4342,19 @@ static HMENU BuildMenu()
   addItem(view, ID_SPREAD, L"Two-Page Spread\tF5");
   addItem(view, ID_SIDEBAR, L"Sidebar\tF8");
   AppendMenuW(view, MF_SEPARATOR, 0, nullptr);
-  addItem(view, ID_THEME, L"Dark Mode\tCtrl+D");
+
+  HMENU themes = CreatePopupMenu();
+  for (int i = 0; i < THEME_COUNT; ++i)
+    addItem(themes, ID_THEME_FIRST + i, kThemeNames[i]);
+  AppendMenuW(themes, MF_SEPARATOR, 0, nullptr);
+  addItem(themes, ID_THEME, L"Dark Mode\tCtrl+D");
+  AppendMenuW(view, MF_POPUP, (UINT_PTR)themes, L"&Colour Scheme");
+  g_themeMenu = themes;
+
   AppendMenuW(bar, MF_POPUP, (UINT_PTR)view, L"&View");
 
   addItem(bar, ID_TAB_HOME, L"Ho&me");
   addItem(bar, ID_TAB_TOOLS, L"&Tools");
-  addItem(bar, ID_SIDEBAR, L"&Sidebar\tF8");
 
   HMENU help = CreatePopupMenu();
   addItem(help, ID_ABOUT, L"About");
@@ -3984,8 +4408,8 @@ static LRESULT CALLBACK FrameProc(HWND hw, UINT msg, WPARAM wp, LPARAM lp)
                                  g.thumbsW + 6, RIB_H, 600, 300,
                                  hw, nullptr, g.inst, nullptr);
       g.status = CreateWindowExW(0, L"SKStatus", nullptr, WS_CHILD | WS_VISIBLE,
-                                 0, 0, 800, 28, hw, nullptr, g.inst, nullptr);
-      SetWindowSubclass(g.status, StatusProc, 1, 0);
+                                 0, 0, 800, STATUS_H, hw, nullptr, g.inst,
+                                 nullptr);
       DragAcceptFiles(hw, TRUE);
       SetFocus(hw);
       break;
@@ -5925,7 +6349,7 @@ static LRESULT CALLBACK TabBarProc(HWND hw, UINT msg, WPARAM wp, LPARAM lp)
       HDC dc = BeginPaint(hw, &ps);
       RECT rc;
       GetClientRect(hw, &rc);
-      const Theme& th = ThemeNow();
+      const UiTheme& th = ThemeNow();
       HBRUSH bg = CreateSolidBrush(th.ribbonBg);
       FillRect(dc, &rc, bg);
       DeleteObject(bg);
@@ -6029,7 +6453,7 @@ static LRESULT CALLBACK ToolbarProc(HWND hw, UINT msg, WPARAM wp, LPARAM lp)
       HDC dc = BeginPaint(hw, &ps);
       RECT rc;
       GetClientRect(hw, &rc);
-      const Theme& th = ThemeNow();
+      const UiTheme& th = ThemeNow();
       HBRUSH bg = CreateSolidBrush(th.ribbonBg);
       FillRect(dc, &rc, bg);
       DeleteObject(bg);
@@ -6056,16 +6480,16 @@ static LRESULT CALLBACK ToolbarProc(HWND hw, UINT msg, WPARAM wp, LPARAM lp)
         RECT cap{card.left + 4, RIB_CAP_Y, card.right - 4, RIB_H - 2};
         SetBkMode(dc, TRANSPARENT);
         SetTextColor(dc, th.textDim);
-        HFONT small = CreateFontW(-MulDiv(8, g.dpi, 72), 0, 0, 0, FW_NORMAL,
-                                  FALSE, FALSE, FALSE, DEFAULT_CHARSET,
-                                  OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
-                                  CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE,
-                                  L"Segoe UI");
-        HFONT was = (HFONT)SelectObject(dc, small);
+        HFONT capFont = CreateFontW(-MulDiv(8, g.dpi, 72), 0, 0, 0, FW_NORMAL,
+                                    FALSE, FALSE, FALSE, DEFAULT_CHARSET,
+                                    OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+                                    CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE,
+                                    L"Segoe UI");
+        HFONT was = (HFONT)SelectObject(dc, capFont);
         DrawTextW(dc, gb.name.c_str(), -1, &cap,
                   DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
         SelectObject(dc, was);
-        DeleteObject(small);
+        DeleteObject(capFont);
       }
 
       if (GroupCount(g.ribbonTab) == 0)
@@ -6168,6 +6592,11 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int)
   wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
   RegisterClassExW(&wc);
 
+  wc.lpfnWndProc = StatusProc;
+  wc.lpszClassName = L"SKStatus";
+  wc.hbrBackground = nullptr;
+  RegisterClassExW(&wc);
+
   g.font = CreateFontW(-MulDiv(9, g.dpi, 72), 0, 0, 0, FW_NORMAL, FALSE, FALSE,
                        FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS,
                        CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
@@ -6189,12 +6618,14 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int)
   g.frame = frame;
 
   ApplyTreeTheme();
-  CheckMenuItem(GetMenu(g.frame), ID_THEME,
-                MF_BYCOMMAND | (g_dark ? MF_CHECKED : MF_UNCHECKED));
+  ApplyOsTheme();
+  SyncThemeMenuChecks();
   SetTabPressed();
 
-  if (openFile.empty()) NewDoc();
-  else LoadDoc(openFile);
+  // Start empty: no document means the calm "open a PDF" state, not a blank
+  // page. File > New still creates one.
+  if (!openFile.empty()) LoadDoc(openFile);
+  else RefreshState();
   ShowWindow(frame, SW_SHOW);
   UpdateWindow(frame);
 
