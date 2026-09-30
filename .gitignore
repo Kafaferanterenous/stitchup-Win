@@ -4,3 +4,6 @@ build.log
 test_result.txt
 *.user
 .vs/
+archive/
+backup.cmd
+backup.ps1

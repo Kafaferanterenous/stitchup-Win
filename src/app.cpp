@@ -28,6 +28,7 @@
 #include <cmath>
 #include <algorithm>
 #include <map>
+#include <random>
 #include <string>
 #include <vector>
 
@@ -54,9 +55,15 @@ enum
   ID_NEXT,
   ID_ABOUT,
   ID_EXIT,
-  ID_TAB_HOME,
-  ID_TAB_VIEW,
-  ID_TAB_TOOLS,
+  ID_TAB_FIRST,          // one ribbon tab per tool group, contiguous block
+  ID_TAB_DOCUMENT = ID_TAB_FIRST,
+  ID_TAB_PAGES,
+  ID_TAB_ANNOTATE,
+  ID_TAB_CONTENT,
+  ID_TAB_ZOOM,
+  ID_TAB_NAVIGATE,
+  ID_TAB_SECURITY,
+  ID_TAB_LAST = ID_TAB_SECURITY,
   ID_PANE_THUMBS,
   ID_PANE_BOOKMARKS,
   ID_ANN_HL,
@@ -93,18 +100,26 @@ enum
   ID_THEME_HC_LIGHT,
   ID_THEME_XP,
   ID_THEME_MAC,
+  // Canvas context menu (right-click). Kept after the radio group so the
+  // contiguous theme block above is untouched.
+  ID_BM_PAGE,
+  ID_BM_VIEW,
 };
 
 enum
 {
   TAB_H = 30,       // document tab strip height
-  RIB_BTN_Y = 8,    // button row top
-  RIB_BTN_H = 34,   // button height
-  RIB_CAP_Y = 48,   // group caption row top
-  RIB_H = 66,       // full ribbon height
+  RIB_TAB_H = 30,   // ribbon tab strip: one tab per tool group
+  RIB_BTN_Y = 38,   // button row top
+  RIB_BTN_H = 40,   // button height (icon over caption)
+  RIB_H = 102,      // full ribbon height (buttons + group caption band)
   PANE_TAB_H = 26,  // navigation-pane header height
   STATUS_H = 28,    // status bar height
 };
+
+// App identity shown in the title bar. The open file's name already lives on
+// the document tab below the title bar, so it is not repeated in the caption.
+const wchar_t* const kAppTitle = L"Stitchup PDF Editor  v0.9.0";
 
 // ---------------------------------------------------------------------------
 // Application state
@@ -116,8 +131,9 @@ struct Btn
   bool pressed = false;  // active tab state
   bool hover = false;
   bool down = false;
-  int rtab = -1;         // owning ribbon tab (ID_TAB_*), -1 = not a ribbon btn
-  int rgroup = -1;       // group index within that tab
+  int rtab = -1;         // owning ribbon tab index, -1 = not a ribbon btn
+  wchar_t icon = 0;      // Segoe MDL2 Assets codepoint, 0 = no icon
+  bool mirror = false;   // draw the glyph flipped (counter-clockwise arrows)
 };
 
 struct PageCache
@@ -134,6 +150,18 @@ struct FileWriter
   std::vector<unsigned char> buf;
 };
 
+// A bookmark the user created in the UI. pdfium can read outlines but not write
+// them, so these are held in memory and persisted into the file as a PDF
+// incremental update by AppendOutlines() at save time.
+struct UserBookmark
+{
+  std::wstring title;
+  int page = 0;        // 0-based page index
+  bool atView = false; // /XYZ at the current scroll position instead of top
+  double x = 0, y = 0; // PDF user-space point, PDF origin is bottom-left
+  double zoom = 0;     // 0 = keep the reader's default zoom
+};
+
 struct App
 {
   HINSTANCE inst = nullptr;
@@ -148,6 +176,8 @@ struct App
   HWND tabbar = nullptr;
   HFONT font = nullptr;
   HFONT treeFont = nullptr;
+  HFONT iconFont = nullptr;   // Segoe MDL2 Assets, null when the font is absent
+  bool haveMdl2 = false;      // resolved at startup by inspecting the face name
   int dpi = 96;
 
   FPDF_DOCUMENT doc = nullptr;
@@ -163,6 +193,7 @@ struct App
   int pane = 0;        // 0 = thumbnails, 1 = bookmarks
   int ribbonTab = 0;   // 0 = Home, 1 = View, 2 = Tools
   bool bmDirty = true;
+  std::vector<UserBookmark> marks;  // user bookmarks not yet written to disk
   bool showSidebar = false;  // hidden until the user asks for it (View / F8)
   bool spread = false;  // two-page side-by-side layout
 
@@ -174,7 +205,9 @@ struct App
   };
   std::vector<GroupBox> groups;
   std::vector<HWND> ribbonBtns;
-  HWND tabBtns[3] = {};
+  std::vector<RECT> ribbonTabRects;   // hit-test + paint rects for the tab strip
+  int ribbonTabHover = -1;
+  HWND tips = nullptr;                // tooltip control, null when unavailable
 
   std::map<int, PageCache> canvasCache;
   std::map<int, HBITMAP> thumbCache;
@@ -214,6 +247,7 @@ struct TabDoc
   double zoom = 1.0;
   int scrollX = 0;
   int scrollY = 0;
+  std::vector<UserBookmark> marks;
 };
 static std::vector<TabDoc> g_tabs;
 static int g_curTab = -1;
@@ -283,9 +317,30 @@ struct UiTheme
 
 static int g_themeId = THEME_LIGHT;
 static HMENU g_themeMenu = nullptr;   // "Colour Scheme" popup, for check marks
+// Easter egg: one quip per run, shown in the middle of the title bar.
+static std::wstring g_capPhrase;
+
+static void PickCapPhrase()
+{
+  static const wchar_t* kQuips[] = {
+      L"Don't Panic",
+      L"Time is an illusion. Lunchtime doubly so.",
+      L"42",
+      L"Mostly Harmless",
+      L"Improbability Drive engaged",
+      L"Never panic. Panic is simply the response to a trivial threat.",
+      L"You are unlikely to be eaten by a grue",
+      L"So long, and thanks for all the fish",
+  };
+  const int n = static_cast<int>(sizeof(kQuips) / sizeof(kQuips[0]));
+  std::random_device rd;
+  std::mt19937 rng(rd());
+  std::uniform_int_distribution<int> pick(0, n - 1);
+  g_capPhrase = kQuips[pick(rng)];
+}
 
 static const UiTheme kThemes[THEME_COUNT] = {
-    // ---- Light grey (default): soft light UI, medium-grey canvas ---
+    // ---- Light grey (default): soft light UI, light-grey canvas ---
     {
     /* ribbonBg   */ RGB(0xF2, 0xF3, 0xF5),
     /* card       */ RGB(0xFF, 0xFF, 0xFF),
@@ -298,8 +353,8 @@ static const UiTheme kThemes[THEME_COUNT] = {
     /* btnDown    */ RGB(0xC9, 0xDD, 0xF7),
     /* btnBorder  */ RGB(0xD5, 0xD9, 0xDE),
     /* thumbBg    */ RGB(0xE9, 0xEB, 0xEE),
-    /* canvasBg   */ RGB(0xC6, 0xCA, 0xD1),
-    /* pageFrame  */ RGB(0x76, 0x7E, 0x88),
+    /* canvasBg   */ RGB(0xDE, 0xE1, 0xE5),
+    /* pageFrame  */ RGB(0x8D, 0x94, 0x9D),
     /* split      */ RGB(0xDC, 0xDE, 0xE3),
     /* statusBg   */ RGB(0x2B, 0x2F, 0x36),
     /* statusTxt  */ RGB(0xEC, 0xEE, 0xF3),
@@ -618,6 +673,9 @@ static void SyncThemeMenuChecks()
                 MF_BYCOMMAND | (ThemeIsDark() ? MF_CHECKED : MF_UNCHECKED));
 }
 
+static void LayoutCaption(HWND hw);
+static void InvalidateCaption();
+
 static void RefreshAllSurfaces()
 {
   if (g.toolbar) InvalidateRect(g.toolbar, nullptr, TRUE);
@@ -629,8 +687,8 @@ static void RefreshAllSurfaces()
   if (g.frame)   InvalidateRect(g.frame, nullptr, TRUE);
   for (HWND hw : g.ribbonBtns)
     InvalidateRect(hw, nullptr, TRUE);
-  for (HWND hw : g.tabBtns)
-    if (hw) InvalidateRect(hw, nullptr, TRUE);
+  LayoutCaption(g.frame);
+  InvalidateCaption();
   ApplyTreeTheme();
   ApplyOsTheme();
 }
@@ -907,7 +965,10 @@ static void RefreshTabBar();
 static void RefreshState();
 static void UpdateScrollbars();
 static void ResetThumbScroll();
+static void SyncThumbScroll();
 static void FitWidth();
+static void RelayoutPanes(int w, int h);
+static void GotoPageIndex(int idx);
 
 static void RestoreTab(int i)
 {
@@ -924,9 +985,7 @@ static void RestoreTab(int i)
   g.zoom = t.zoom;
   g.scrollX = t.scrollX;
   g.scrollY = t.scrollY;
-  SetWindowTextW(g.frame, ((g.name.empty() ? std::wstring(L"Stitchup PDF Editor")
-                                            : g.name + L" - Stitchup PDF Editor"))
-                              .c_str());
+  SetWindowTextW(g.frame, kAppTitle);
   RefreshState();
   g.bmDirty = true;
   UpdateScrollbars();
@@ -947,7 +1006,7 @@ static void CloseTab(int i)
   {
     CloseDoc();
     g_curTab = -1;
-    if (g.frame) SetWindowTextW(g.frame, L"Stitchup PDF Editor");
+    if (g.frame) SetWindowTextW(g.frame, kAppTitle);
     RefreshTabBar();
     return;
   }
@@ -970,7 +1029,17 @@ static void NextTab(int d)
 
 static void RefreshTabBar()
 {
-  if (g.tabbar) InvalidateRect(g.tabbar, nullptr, TRUE);
+  if (!g.tabbar) return;
+  // The document tab strip is only worth its 30px when a document is open; with
+  // no tabs it was leaving a blank band between the menu bar and the ribbon.
+  ShowWindow(g.tabbar, g_tabs.empty() ? SW_HIDE : SW_SHOW);
+  if (g.frame)
+  {
+    RECT cr{};
+    GetClientRect(g.frame, &cr);
+    RelayoutPanes(cr.right - cr.left, cr.bottom - cr.top);
+  }
+  InvalidateRect(g.tabbar, nullptr, TRUE);
 }
 
 static void RefreshState()
@@ -1136,7 +1205,7 @@ static void LoadDoc(const std::wstring& file)
   g.dirty = false;
   g_tabs.push_back(nd);
   g_curTab = (int)g_tabs.size() - 1;
-  SetWindowTextW(g.frame, (g.name + L" - Stitchup PDF Editor").c_str());
+  SetWindowTextW(g.frame, kAppTitle);
   RefreshState();
   // Open at the real fit-page-width zoom, not an approximation.
   FitWidth();
@@ -1165,7 +1234,7 @@ static void NewDoc()
   g.scrollX = g.scrollY = 0;
   g_tabs.push_back(nd);
   g_curTab = (int)g_tabs.size() - 1;
-  SetWindowTextW(g.frame, L"Stitchup PDF Editor");
+  SetWindowTextW(g.frame, kAppTitle);
   RefreshState();
   g.bmDirty = true;
   InvalidateRect(g.canvas, nullptr, TRUE);
@@ -1439,6 +1508,126 @@ static bool ApplyWatermarkDoc(FPDF_DOCUMENT doc, const wchar_t* text,
   return any;
 }
 
+// ---------------------------------------------------------------------------
+// Bookmark dialog: name for a new user bookmark
+// ---------------------------------------------------------------------------
+struct BmCtx
+{
+  HWND edit = nullptr;
+  HWND label = nullptr;
+  bool ok = false;
+  std::wstring text;
+};
+
+static LRESULT CALLBACK BmProc(HWND h, UINT m, WPARAM w, LPARAM l)
+{
+  switch (m)
+  {
+    case WM_CREATE:
+    {
+      BmCtx* ctx = reinterpret_cast<BmCtx*>(
+        reinterpret_cast<CREATESTRUCTW*>(l)->lpCreateParams);
+      SetWindowLongPtrW(h, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(ctx));
+      ctx->label = CreateWindowExW(0, L"STATIC", L"Bookmark name:",
+        WS_CHILD | WS_VISIBLE, 16, 14, 300, 16, h, nullptr, g.inst, nullptr);
+      ctx->edit = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
+        WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL,
+        16, 34, 300, 24, h, nullptr, g.inst, nullptr);
+      CreateWindowExW(0, L"BUTTON", L"Ok",
+        WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_DEFPUSHBUTTON,
+        154, 70, 74, 28, h, (HMENU)1, g.inst, nullptr);
+      CreateWindowExW(0, L"BUTTON", L"Cancel",
+        WS_CHILD | WS_VISIBLE | WS_TABSTOP,
+        240, 70, 74, 28, h, (HMENU)2, g.inst, nullptr);
+      SetFocus(ctx->edit);
+      SetWindowTextW(ctx->edit, ctx->text.c_str());
+      SendMessageW(ctx->edit, EM_SETSEL, 0, -1);
+      return 0;
+    }
+    case WM_COMMAND:
+      if (LOWORD(w) == 1 || LOWORD(w) == 2)
+      {
+        BmCtx* ctx = reinterpret_cast<BmCtx*>(GetWindowLongPtrW(h, GWLP_USERDATA));
+        if (ctx)
+        {
+          if (LOWORD(w) == 1)
+          {
+            wchar_t buf[512] = { 0 };
+            ctx->text = GetWindowTextW(ctx->edit, buf, 512) > 0 ? buf : L"";
+          }
+          ctx->ok = (LOWORD(w) == 1);
+        }
+        DestroyWindow(h);
+        return 0;
+      }
+      break;
+    case WM_CLOSE:
+    {
+      BmCtx* ctx = reinterpret_cast<BmCtx*>(GetWindowLongPtrW(h, GWLP_USERDATA));
+      if (ctx) ctx->ok = false;
+      DestroyWindow(h);
+      return 0;
+    }
+  }
+  return DefWindowProcW(h, m, w, l);
+}
+
+static bool PromptBookmarkName(std::wstring& out, const std::wstring& deflt)
+{
+  const wchar_t cls[] = L"SKBmWnd";
+  static bool reg = false;
+  if (!reg)
+  {
+    WNDCLASSEXW wc{};
+    wc.cbSize = sizeof(wc);
+    wc.lpfnWndProc = BmProc;
+    wc.hInstance = g.inst;
+    wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+    wc.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
+    wc.lpszClassName = cls;
+    RegisterClassExW(&wc);
+    reg = true;
+  }
+  BmCtx ctx;
+  ctx.text = deflt;
+  HWND hw = CreateWindowExW(WS_EX_DLGMODALFRAME, cls, L"Add Bookmark",
+                            WS_POPUP | WS_CAPTION | WS_SYSMENU,
+                            CW_USEDEFAULT, CW_USEDEFAULT, 332, 138,
+                            g.frame, nullptr, g.inst, &ctx);
+  if (!hw) return false;
+  RECT fr, rc;
+  GetWindowRect(g.frame, &fr);
+  GetWindowRect(hw, &rc);
+  SetWindowPos(hw, nullptr,
+               fr.left + (fr.right - fr.left - (rc.right - rc.left)) / 2,
+               fr.top + (fr.bottom - fr.top - (rc.bottom - rc.top)) / 2,
+               0, 0, SWP_NOSIZE | SWP_NOZORDER);
+  ShowWindow(hw, SW_SHOW);
+  UpdateWindow(hw);
+  EnableWindow(g.frame, FALSE);
+  MSG msg;
+  while (IsWindow(hw))
+  {
+    const BOOL r = GetMessageW(&msg, nullptr, 0, 0);
+    if (r <= 0) break;
+    if (!IsDialogMessageW(hw, &msg))
+    {
+      TranslateMessage(&msg);
+      DispatchMessageW(&msg);
+    }
+  }
+  EnableWindow(g.frame, TRUE);
+  SetActiveWindow(g.frame);
+  SetFocus(g.frame);
+  if (!ctx.ok) return false;
+  // trim
+  std::wstring t = ctx.text;
+  const size_t a = t.find_first_not_of(L" \t");
+  const size_t b = t.find_last_not_of(L" \t");
+  out = (a == std::wstring::npos) ? L"" : t.substr(a, b - a + 1);
+  return !out.empty();
+}
+
 struct WmCtx
 {
   HWND edit = nullptr, size = nullptr, pos = nullptr;
@@ -1620,26 +1809,704 @@ static void WatermarkCurrentDoc()
   InvalidateRect(g.thumbs, nullptr, TRUE);
 }
 
-static bool SaveDocTo(const std::wstring& target)
+// ---------------------------------------------------------------------------
+// PDF outline (bookmark) writer
+// ---------------------------------------------------------------------------
+// pdfium exposes no API for creating outlines, so user bookmarks are appended to
+// the saved bytes as a PDF incremental update: the existing objects are left
+// untouched and a new catalog, outline tree and cross-reference stream are
+// appended after the original %%EOF.
+//
+// This relies on two properties of FPDF_SaveAsCopy output, both asserted by the
+// self-test: every object is a plain uncompressed "N G obj ... endobj" and the
+// file ends with an xref stream. That lets the object map be rebuilt by scanning
+// for object headers instead of decoding the (compressed) xref stream.
+namespace pdfout {
+
+inline bool IsWs(char c)
 {
-  if (!g.doc) return false;
+  return c == ' ' || c == '\r' || c == '\n' || c == '\t' || c == '\f' || c == '\0';
+}
+
+inline void SkipWs(const std::string& s, size_t& p)
+{
+  while (p < s.size() && IsWs(s[p])) ++p;
+}
+
+inline long long ReadInt(const std::string& s, size_t& p)
+{
+  SkipWs(s, p);
+  bool neg = false;
+  if (p < s.size() && (s[p] == '-' || s[p] == '+')) { neg = s[p] == '-'; ++p; }
+  long long v = 0;
+  bool any = false;
+  while (p < s.size() && s[p] >= '0' && s[p] <= '9')
+  {
+    v = v * 10 + (s[p] - '0');
+    ++p;
+    any = true;
+  }
+  if (!any) return -1;
+  return neg ? -v : v;
+}
+
+// A located indirect object: num/gen plus the span of its body.
+struct Obj
+{
+  int num = 0;
+  int gen = 0;
+  size_t body = 0;   // first byte after "obj"
+  size_t end = 0;    // offset of "endobj"
+  bool dict = false; // body starts with "<<"
+};
+
+inline bool IsDelim(char c)
+{
+  return c == '/' || c == '(' || c == '<' || c == '>' || c == '[' || c == ']' ||
+         c == '{' || c == '}' || c == '%';
+}
+
+// Reads the "N G obj" header at o. Returns false when the bytes there are not an
+// object header, which is what rejects false hits inside stream data.
+bool ReadObjHeader(const std::string& s, size_t o, Obj& out)
+{
+  if (o >= s.size()) return false;
+  size_t p = o;
+  const long long num = ReadInt(s, p);
+  if (num < 0 || num > 100000000) return false;
+  const long long gen = ReadInt(s, p);
+  if (gen < 0) return false;
+  SkipWs(s, p);
+  if (s.compare(p, 3, "obj") != 0) return false;
+  p += 3;
+  SkipWs(s, p);
+  out.num = (int)num;
+  out.gen = (int)gen;
+  out.body = p;
+  out.dict = s.compare(p, 2, "<<") == 0;
+  return true;
+}
+
+// Rebuilds objnum -> offset by scanning. Later definitions win, which is the
+// right rule for incrementally updated files.
+bool ScanObjects(const std::string& s, std::map<int, size_t>& out)
+{
+  bool any = false;
+  for (size_t i = 0; i + 3 <= s.size(); ++i)
+  {
+    if (s[i] != 'o' || s.compare(i, 3, "obj") != 0) continue;
+    if (i + 3 < s.size() && !IsWs(s[i + 3])) continue;
+    size_t back = i;
+    // step back over whitespace to the generation number
+    while (back > 0 && IsWs(s[back - 1])) --back;
+    size_t gend = back;
+    while (back > 0 && s[back - 1] >= '0' && s[back - 1] <= '9') --back;
+    if (back == gend) continue;
+    size_t save = back;
+    while (back > 0 && IsWs(s[back - 1])) --back;
+    size_t numend = back;
+    while (back > 0 && s[back - 1] >= '0' && s[back - 1] <= '9') --back;
+    if (back == numend) continue;
+    if (back > 0 && !IsWs(s[back - 1]) && !IsDelim(s[back - 1])) continue;
+    Obj o;
+    if (!ReadObjHeader(s, back, o)) continue;
+    out[o.num] = back;
+    any = true;
+    (void)save;
+  }
+  return any;
+}
+
+// End offset of the balanced construct starting at p ('<' '<' '[' or '(').
+bool SkipContainer(const std::string& s, size_t p, size_t limit, size_t& end)
+{
+  const bool d = s.compare(p, 2, "<<") == 0;
+  const char open = d ? '<' : s[p];
+  const char close = d ? '>' : (s[p] == '[' ? ']' : ')');
+  int depth = 0;
+  while (p < limit)
+  {
+    const char c = s[p];
+    if (c == '(')
+    {  // literal string: honour escapes and nesting
+      int nest = 0;
+      while (p < limit)
+      {
+        if (s[p] == '\\') { p += 2; continue; }
+        if (s[p] == '(') ++nest;
+        else if (s[p] == ')')
+        {
+          --nest;
+          if (nest == 0) { ++p; break; }
+        }
+        ++p;
+      }
+      continue;
+    }
+    if (c == '<' && s[p + 1] == '<') { depth += 2; p += 2; continue; }
+    if (c == '>' && s[p + 1] == '>') { depth -= 2; p += 2; if (depth <= 0) { end = p; return true; } continue; }
+    if (c == open && !d) { ++depth; ++p; continue; }
+    if (c == close && !d) { --depth; ++p; if (depth <= 0) { end = p; return true; } continue; }
+    ++p;
+  }
+  return false;
+}
+
+// Finds /key at dictionary top level within [b, e) and returns the value span.
+// The range may start at the dictionary's own "<<", which is stepped over so its
+// keys are treated as top level; nested dictionaries are still skipped whole.
+bool FindKey(const std::string& s, size_t b, size_t e, const char* key,
+             size_t& vs, size_t& ve)
+{
+  const std::string k = std::string("/") + key;
+  if (b + 1 < e && s.compare(b, 2, "<<") == 0) b += 2;
+  size_t p = b;
+  int depth = 0;
+  while (p < e)
+  {
+    const char c = s[p];
+    if (c == '(')
+    {
+      int nest = 0;
+      while (p < e)
+      {
+        if (s[p] == '\\') { p += 2; continue; }
+        if (s[p] == '(') ++nest;
+        else if (s[p] == ')') { --nest; if (nest == 0) { ++p; break; } }
+        ++p;
+      }
+      continue;
+    }
+    if (c == '<' && s.compare(p, 2, "<<") == 0)
+    {
+      size_t tmp;
+      if (!SkipContainer(s, p, e, tmp)) return false;
+      p = tmp;
+      continue;
+    }
+    if (c == '<' && s[p + 1] != '<')
+    {  // hex string
+      while (p < e && s[p] != '>') ++p;
+      ++p;
+      continue;
+    }
+    if (c == '[')
+    {
+      size_t tmp;
+      if (!SkipContainer(s, p, e, tmp)) return false;
+      p = tmp;
+      continue;
+    }
+    if (c == '/' && depth == 0)
+    {
+      if (s.compare(p, k.size(), k) == 0)
+      {
+        const char after = p + k.size() < e ? s[p + k.size()] : ' ';
+        if (IsWs(after) || IsDelim(after))
+        {
+          size_t q = p + k.size();
+          SkipWs(s, q);
+          vs = q;
+          if (q < e && (s.compare(q, 2, "<<") == 0 || s[q] == '[' || s[q] == '('))
+          {
+            if (!SkipContainer(s, q, e, ve)) return false;
+          }
+          else
+          {
+            ve = q;
+            while (ve < e && !IsWs(s[ve]) && !IsDelim(s[ve])) ++ve;
+            if (ve == q) return false;
+            // "N G R" is one value, not three tokens: extend over the reference
+            if (ve - q <= 12 && s.find_first_not_of("0123456789", q) == ve)
+            {
+              size_t r = ve;
+              SkipWs(s, r);
+              const size_t genStart = r;
+              while (r < e && s[r] >= '0' && s[r] <= '9') ++r;
+              if (r > genStart)
+              {
+                SkipWs(s, r);
+                if (r < e && s[r] == 'R' &&
+                    (r + 1 >= e || IsWs(s[r + 1]) || IsDelim(s[r + 1])))
+                  ve = r + 1;
+              }
+            }
+          }
+          return true;
+        }
+      }
+    }
+    ++p;
+  }
+  return false;
+}
+
+bool GetIntEntry(const std::string& s, size_t b, size_t e, const char* key,
+                 long long& out)
+{
+  size_t vs, ve;
+  if (!FindKey(s, b, e, key, vs, ve)) return false;
+  size_t p = vs;
+  const long long v = ReadInt(s, p);
+  if (v < 0) return false;
+  out = v;
+  return true;
+}
+
+bool GetRefEntry(const std::string& s, size_t b, size_t e, const char* key,
+                 int& num)
+{
+  size_t vs, ve;
+  if (!FindKey(s, b, e, key, vs, ve)) return false;
+  size_t p = vs;
+  const long long n = ReadInt(s, p);
+  if (n < 0) return false;
+  SkipWs(s, p);
+  if (ReadInt(s, p) < 0) return false;   // generation
+  SkipWs(s, p);
+  if (p >= ve || s[p] != 'R') return false;
+  num = (int)n;
+  return true;
+}
+
+// Body span of a located object, i.e. between "obj" and "endobj", with the
+// trailing whitespace before "endobj" trimmed so the dict can be rewritten.
+bool ObjBody(const std::string& s, const std::map<int, size_t>& offs, int num,
+             Obj& out)
+{
+  const auto it = offs.find(num);
+  if (it == offs.end()) return false;
+  if (!ReadObjHeader(s, it->second, out)) return false;
+  out.end = s.find("endobj", out.body);
+  if (out.end == std::string::npos) return false;
+  while (out.end > out.body && IsWs(s[out.end - 1])) --out.end;
+  return out.dict;
+}
+
+// PDF text string as a literal string holding UTF-16BE with a BOM, which pdfium
+// decodes on read-back. The delimiters and backslash are escaped.
+std::string TextString(const std::wstring& s)
+{
+  std::string out = "(\xFE\xFF";
+  auto put = [&](unsigned char c) {
+    if (c == '(' || c == ')' || c == '\\') out += '\\';
+    out += (char)c;
+  };
+  for (wchar_t c : s)
+  {
+    const unsigned u = (unsigned)(c & 0xFFFF);
+    put((unsigned char)((u >> 8) & 0xFF));
+    put((unsigned char)(u & 0xFF));
+  }
+  out += ")";
+  return out;
+}
+
+std::string Num(double v)
+{
+  char buf[48];
+  if (std::fabs(v - std::llround(v)) < 0.0005)
+    _snprintf_s(buf, _TRUNCATE, "%lld", std::llround(v));
+  else
+    _snprintf_s(buf, _TRUNCATE, "%.3f", v);
+  return buf;
+}
+
+// Collects page object numbers in reading order by walking /Kids.
+bool CollectPages(const std::string& s, const std::map<int, size_t>& offs,
+                  int pagesObj, std::vector<int>& out, int depth = 0)
+{
+  if (depth > 64 || out.size() > 200000) return false;
+  Obj o;
+  if (!ObjBody(s, offs, pagesObj, o)) return false;
+  // A node without /Kids is a leaf page; that is the only distinction needed.
+  size_t vs, ve;
+  const bool hasKids = FindKey(s, o.body, o.end, "Kids", vs, ve);
+  if (!hasKids)
+  {
+    out.push_back(pagesObj);
+    return true;
+  }
+  // iterate the /Kids array of "N G R"
+  size_t p = vs;
+  if (p >= ve || s[p] != '[') return false;
+  ++p;
+  while (p < ve)
+  {
+    SkipWs(s, p);
+    if (p >= ve) break;
+    if (s[p] == ']') break;
+    const long long n = ReadInt(s, p);
+    if (n < 0) return false;
+    SkipWs(s, p);
+    if (ReadInt(s, p) < 0) return false;   // generation
+    SkipWs(s, p);
+    if (p >= ve) return false;
+    if (s[p] != 'R') return false;
+    if (!CollectPages(s, offs, (int)n, out, depth + 1)) return false;
+    ++p;
+  }
+  return true;
+}
+
+// Removes "/Key value" from a dictionary body so a key can be replaced without
+// leaving a duplicate behind. The value span starts after any whitespace that
+// follows the key, so the key start is found by walking back over that space.
+std::string RemoveKey(const std::string& d, const char* key)
+{
+  size_t vs, ve;
+  if (!FindKey(d, 0, d.size(), key, vs, ve)) return d;
+  size_t ks = vs;
+  while (ks > 0 && IsWs(d[ks - 1])) --ks;
+  const size_t klen = std::string(key).size() + 1;   // include the '/'
+  if (ks < klen) return d;
+  ks -= klen;
+  if (d.compare(ks, klen, std::string("/") + key) != 0) return d;   // sanity
+  return d.substr(0, ks) + d.substr(ve);
+}
+
+// The last cross-reference section of the file.
+struct XrefBase
+{
+  bool table = false;                    // classic "xref" table vs xref stream
+  long long size = 0;                    // /Size
+  int rootObj = 0;                       // /Root
+  std::map<int, size_t> offs;            // objnum -> byte offset, in-use only
+};
+
+// Parses the section at xrefOff. pdfium writes a classic table with a trailer
+// dictionary; a cross-reference stream is also accepted, in which case the
+// object map is rebuilt by scanning because its table is compressed.
+bool ParseBase(const std::string& pdf, size_t xrefOff, XrefBase& b)
+{
+  if (xrefOff >= pdf.size()) return false;
+  size_t p = xrefOff;
+  SkipWs(pdf, p);
+  if (pdf.compare(p, 4, "xref") == 0)
+  {
+    b.table = true;
+    p += 4;
+    for (;;)
+    {
+      size_t save = p;
+      SkipWs(pdf, p);
+      if (pdf.compare(p, 7, "trailer") == 0) { p += 7; break; }
+      const long long first = ReadInt(pdf, p);
+      if (first < 0) { p = save; break; }
+      SkipWs(pdf, p);
+      const long long count = ReadInt(pdf, p);
+      if (count < 0 || count > 10000000) return false;
+      for (long long i = 0; i < count; ++i)
+      {
+        SkipWs(pdf, p);
+        const long long off = ReadInt(pdf, p);
+        if (off < 0) return false;
+        SkipWs(pdf, p);
+        (void)ReadInt(pdf, p);   // generation
+        SkipWs(pdf, p);
+        if (p >= pdf.size()) return false;
+        const char kind = pdf[p++];
+        if (kind == 'n' && off > 0) b.offs[(int)(first + i)] = (size_t)off;
+        else if (kind != 'n' && kind != 'f') return false;
+      }
+    }
+    SkipWs(pdf, p);
+    const size_t dictEnd = pdf.find(">>", p);
+    if (dictEnd == std::string::npos) return false;
+    if (!GetIntEntry(pdf, p, dictEnd, "Size", b.size)) return false;
+    if (!GetRefEntry(pdf, p, dictEnd, "Root", b.rootObj)) return false;
+    return b.size > 0 && b.rootObj > 0;
+  }
+  // cross-reference stream
+  Obj o;
+  if (!ReadObjHeader(pdf, xrefOff, o) || !o.dict) return false;
+  const size_t dictEnd = pdf.find(">>", o.body);
+  if (dictEnd == std::string::npos) return false;
+  if (!GetIntEntry(pdf, o.body, dictEnd, "Size", b.size)) return false;
+  if (!GetRefEntry(pdf, o.body, dictEnd, "Root", b.rootObj)) return false;
+  if (b.size <= 0 || b.rootObj <= 0) return false;
+  return ScanObjects(pdf, b.offs);
+}
+
+}  // namespace pdfout
+
+// Appends the bookmarks as an incremental update. `expectPages` is the page
+// count the caller believes the document has; a mismatch aborts the write
+// rather than risking a damaged file.
+static bool AppendOutlines(std::string& pdf, const std::vector<UserBookmark>& bms,
+                           int expectPages, std::wstring* err)
+{
+  using namespace pdfout;
+  auto fail = [&](const wchar_t* m) {
+    if (err) *err = m;
+    return false;
+  };
+  if (bms.empty()) return true;
+  long long size = 0;
+  int rootObj = 0;
+  bool isTable = true;
+
+  // --- base file: startxref, /Size, /Root -----------------------------------
+  const size_t sx = pdf.rfind("startxref");
+  if (sx == std::string::npos) return fail(L"The saved file has no startxref.");
+  size_t sp = sx + 9;
+  const long long baseXref = ReadInt(pdf, sp);
+  if (baseXref <= 0 || baseXref >= (long long)pdf.size())
+    return fail(L"The saved file has a broken startxref.");
+
+  std::map<int, size_t> offs;
+  {
+    XrefBase base;
+    if (!ParseBase(pdf, (size_t)baseXref, base))
+      return fail(L"The saved file's cross-reference section is unreadable.");
+    offs.swap(base.offs);
+    size = base.size;
+    rootObj = base.rootObj;
+    isTable = base.table;
+  }
+  if (offs.find(rootObj) == offs.end() && !ScanObjects(pdf, offs))
+    return fail(L"No objects found in the saved file.");
+
+  // --- catalog and page objects --------------------------------------------
+  Obj cat;
+  if (!ObjBody(pdf, offs, rootObj, cat)) return fail(L"Catalog object not found.");
+  int pagesObj = 0;
+  if (!GetRefEntry(pdf, cat.body, cat.end, "Pages", pagesObj))
+    return fail(L"Catalog has no /Pages reference.");
+  std::vector<int> pageObjs;
+  if (!CollectPages(pdf, offs, pagesObj, pageObjs))
+    return fail(L"Could not walk the page tree.");
+  if (expectPages > 0 && (int)pageObjs.size() != expectPages)
+    return fail(L"Page tree does not match the open document.");
+
+  // --- existing outline, so user bookmarks are appended, not destructive ----
+  int oldOutline = 0;
+  GetRefEntry(pdf, cat.body, cat.end, "Outlines", oldOutline);
+  int oldFirst = 0, oldLast = 0;
+  long long oldCount = 0;
+  if (oldOutline)
+  {
+    Obj oo;
+    if (ObjBody(pdf, offs, oldOutline, oo))
+    {
+      GetRefEntry(pdf, oo.body, oo.end, "First", oldFirst);
+      GetRefEntry(pdf, oo.body, oo.end, "Last", oldLast);
+      if (!GetIntEntry(pdf, oo.body, oo.end, "Count", oldCount)) oldCount = 0;
+    }
+    if (!oldFirst) oldOutline = 0;   // unusable: start a fresh tree instead
+  }
+
+  // --- allocate object numbers ---------------------------------------------
+  long long next = size;
+  if (next < 1) next = 1;
+  const int newCatalog = rootObj;          // rewrite in place
+  const int outlineRoot = oldOutline ? oldOutline : (int)next++;
+  std::vector<int> itemNums;
+  itemNums.reserve(bms.size());
+  for (size_t i = 0; i < bms.size(); ++i) itemNums.push_back((int)next++);
+  const int oldLastNum = (oldOutline && oldLast) ? oldLast : 0;
+  const long long newSize = next;
+
+  // Leading newline so every object header is preceded by one, which is how the
+  // offsets below are recovered.
+  std::string add = "\n";
+  auto emitObj = [&](int num, const std::string& body) {
+    add += std::to_string(num) + " 0 obj\n" + body + "\nendobj\n";
+  };
+
+  // catalog: original dict with any /Outlines replaced
+  {
+    // rewrite the catalog with /Outlines replaced, never duplicated
+    std::string clean = RemoveKey(pdf.substr(cat.body, cat.end - cat.body), "Outlines");
+    if (clean.size() < 2 || clean.compare(clean.size() - 2, 2, ">>") != 0)
+      return fail(L"Catalog dictionary is malformed.");
+    clean.insert(clean.size() - 2,
+                 " /Outlines " + std::to_string(outlineRoot) + " 0 R ");
+    emitObj(newCatalog, clean);
+  }
+
+  // outline items
+  for (size_t i = 0; i < bms.size(); ++i)
+  {
+    const UserBookmark& b = bms[i];
+    if (b.page < 0 || b.page >= (int)pageObjs.size()) continue;
+    std::string d = "<< /Title " + TextString(b.title) +
+                    " /Parent " + std::to_string(outlineRoot) + " 0 R";
+    if (i > 0) d += " /Prev " + std::to_string(itemNums[i - 1]) + " 0 R";
+    if (i + 1 < bms.size())
+      d += " /Next " + std::to_string(itemNums[i + 1]) + " 0 R";
+    if (oldOutline && i == 0 && oldLastNum)
+      d += " /Prev " + std::to_string(oldLastNum) + " 0 R";
+    d += " /Dest [" + std::to_string(pageObjs[b.page]) + " 0 R";
+    if (b.atView)
+      d += " /XYZ " + Num(b.x) + " " + Num(b.y);
+      if (b.zoom > 0) d += " " + Num(b.zoom);
+    else
+      d += " /Fit";
+    d += "] >>";
+    emitObj(itemNums[i], d);
+  }
+
+  // old last item gains a /Next so the original outline stays linked
+  if (oldOutline && oldLastNum)
+  {
+    Obj lo;
+    if (ObjBody(pdf, offs, oldLastNum, lo))
+    {
+      std::string d = pdf.substr(lo.body, lo.end - lo.body);
+      size_t vs, ve;
+      if (!FindKey(d, 0, d.size(), "Next", vs, ve) &&
+          d.size() >= 2 && d.compare(d.size() - 2, 2, ">>") == 0)
+      {
+        d.insert(d.size() - 2,
+                 " /Next " + std::to_string(itemNums.front()) + " 0 R ");
+        emitObj(oldLastNum, d);
+      }
+    }
+  }
+
+  // outline root with the merged first/last/count
+  {
+    const long long count = oldCount + (long long)bms.size();
+    // When extending an existing tree the head stays put and the new items are
+    // chained onto its tail.
+    const int head = oldOutline ? oldFirst : itemNums.front();
+    std::string d = "<< /Type /Outlines";
+    d += " /First " + std::to_string(head) + " 0 R";
+    d += " /Last " + std::to_string(itemNums.back()) + " 0 R";
+    d += " /Count " + std::to_string(count);
+    d += " >>";
+    emitObj(outlineRoot, d);
+  }
+
+  // --- cross-reference section for the appended objects ---------------------
+  std::vector<int> nums;
+  nums.push_back(newCatalog);
+  if (oldOutline && oldLastNum) nums.push_back(oldLastNum);
+  for (int n : itemNums) nums.push_back(n);
+  if (outlineRoot != newCatalog) nums.push_back(outlineRoot);
+  std::sort(nums.begin(), nums.end());
+  nums.erase(std::unique(nums.begin(), nums.end()), nums.end());
+
+  // Every object above was emitted, so its offset is where its "N 0 obj" header
+  // starts inside the appended block.
+  std::map<int, size_t> newOffs;
+  for (int n : nums)
+  {
+    const std::string pat = "\n" + std::to_string(n) + " 0 obj\n";
+    const size_t at = add.find(pat);
+    if (at == std::string::npos) return fail(L"Internal: lost an object.");
+    newOffs[n] = pdf.size() + at + 1;
+  }
+
+  if (isTable)
+  {
+    // classic table, matching the form pdfium wrote
+    const size_t tableAt = pdf.size() + add.size();
+    add += "xref\n";
+    for (size_t i = 0; i < nums.size();)
+    {
+      size_t j = i;
+      while (j + 1 < nums.size() && nums[j + 1] == nums[j] + 1) ++j;
+      add += std::to_string(nums[i]) + " " + std::to_string(j - i + 1) + "\n";
+      for (size_t k = i; k <= j; ++k)
+      {
+        char row[32];
+        _snprintf_s(row, _TRUNCATE, "%010llu 00000 n \n", (unsigned long long)newOffs[nums[k]]);
+        add += row;
+      }
+      i = j + 1;
+    }
+    add += "trailer\n<< /Size " + std::to_string(newSize) + " /Root " +
+           std::to_string(rootObj) + " 0 R /Prev " + std::to_string(baseXref) +
+           " >>\nstartxref\n" + std::to_string(tableAt) + "\n%%EOF\n";
+    pdf += add;
+    return true;
+  }
+
+  // cross-reference stream, for a base file that used one. Written uncompressed,
+  // which is legal, so no inflate is needed.
+  const int xrefNum = (int)newSize;
+  std::string index, rows;
+  for (size_t i = 0; i < nums.size(); ++i)
+  {
+    if (i) index += " ";
+    index += std::to_string(nums[i]) + " 1";
+    const unsigned use = (unsigned)newOffs[nums[i]];
+    rows += (char)1;
+    rows += (char)((use >> 24) & 0xFF);
+    rows += (char)((use >> 16) & 0xFF);
+    rows += (char)((use >> 8) & 0xFF);
+    rows += (char)(use & 0xFF);
+    rows += (char)0;
+    rows += (char)0;   // gen 0
+  }
+  const size_t xrefObjOffset = pdf.size() + add.size();
+  add += std::to_string(xrefNum) + " 0 obj\n<< /Type /XRef /Size " +
+         std::to_string(newSize + 1) + " /Root " + std::to_string(rootObj) +
+         " 0 R /Prev " + std::to_string(baseXref) + " /W [1 4 2] /Index [" +
+         index + "] /Length " + std::to_string(rows.size()) + " >>\nstream\n" +
+         rows + "\nendstream\nendobj\nstartxref\n" +
+         std::to_string(xrefObjOffset) + "\n%%EOF\n";
+
+  pdf += add;
+  return true;
+}
+
+// Serializes the open document to memory, folding in any user bookmarks that
+// have been added but not yet written to disk. Returns false (with a message
+// when interactive) if serialization or the outline write failed, so a bookmark
+// failure never produces a file that silently lost them.
+static bool SerializeForSave(std::vector<unsigned char>& out, bool interactive)
+{
   FileWriter fw{};
   fw.buf.reserve(65536);
   fw.base.version = 1;
   fw.base.WriteBlock = [](FPDF_FILEWRITE* self, const void* data, unsigned long size) -> int
   {
-    FileWriter* fw = reinterpret_cast<FileWriter*>(self);
+    FileWriter* f = reinterpret_cast<FileWriter*>(self);
     const unsigned char* p = static_cast<const unsigned char*>(data);
-    fw->buf.insert(fw->buf.end(), p, p + size);
+    f->buf.insert(f->buf.end(), p, p + size);
     return 1;
   };
   if (!FPDF_SaveAsCopy(g.doc, &fw.base, FPDF_NO_INCREMENTAL))
+  {
+    if (interactive)
+      MessageBoxW(g.frame, L"Save failed: the document could not be serialized.",
+                  L"Stitchup", MB_OK | MB_ICONWARNING);
     return false;
+  }
+  if (g.marks.empty())
+  {
+    out.swap(fw.buf);
+    return true;
+  }
+  std::string pdf(reinterpret_cast<const char*>(fw.buf.data()), fw.buf.size());
+  std::wstring err;
+  if (!AppendOutlines(pdf, g.marks, FPDF_GetPageCount(g.doc), &err))
+  {
+    if (interactive)
+    {
+      const std::wstring msg =
+          L"Save failed: your bookmarks could not be written into the PDF,\n"
+          L"so the file was left untouched.\n\n" + err;
+      MessageBoxW(g.frame, msg.c_str(), L"Stitchup", MB_OK | MB_ICONWARNING);
+    }
+    return false;
+  }
+  out.assign(pdf.begin(), pdf.end());
+  return true;
+}
 
+static bool SaveDocTo(const std::wstring& target)
+{
+  if (!g.doc) return false;
+  std::vector<unsigned char> buf;
+  if (!SerializeForSave(buf, true)) return false;
   std::wstring tmp = target + L".tmp";
   FILE* f = nullptr;
   if (_wfopen_s(&f, tmp.c_str(), L"wb") != 0) return false;
-  bool ok = fwrite(fw.buf.data(), 1, fw.buf.size(), f) == fw.buf.size();
+  bool ok = fwrite(buf.data(), 1, buf.size(), f) == buf.size();
   fclose(f);
   if (!ok) { DeleteFileW(tmp.c_str()); return false; }
   if (!MoveFileExW(tmp.c_str(), target.c_str(),
@@ -1652,6 +2519,8 @@ static bool SaveDocTo(const std::wstring& target)
     MessageBoxW(g.frame, msg.c_str(), L"Stitchup", MB_OK | MB_ICONWARNING);
     return false;
   }
+  g.marks.clear();
+  g.bmDirty = true;
   return true;
 }
 
@@ -1681,7 +2550,7 @@ static void SaveAs()
     g.dirty = false;
     size_t p = f.find_last_of(L"\\/");
     g.name = (p == std::wstring::npos) ? f : f.substr(p + 1);
-    SetWindowTextW(g.frame, (g.name + L" - Stitchup PDF Editor").c_str());
+    SetWindowTextW(g.frame, kAppTitle);
     RefreshState();
     InvalidateRect(g.status, nullptr, TRUE);
   }
@@ -1692,26 +2561,12 @@ static void SaveInPlace()
   if (g.path.empty()) { SaveAs(); return; }
   if (!g.doc) return;
   std::wstring target = g.path;
-  FileWriter fw{};
-  fw.buf.reserve(65536);
-  fw.base.version = 1;
-  fw.base.WriteBlock = [](FPDF_FILEWRITE* self, const void* data, unsigned long size) -> int
-  {
-    FileWriter* fw2 = reinterpret_cast<FileWriter*>(self);
-    const unsigned char* p = static_cast<const unsigned char*>(data);
-    fw2->buf.insert(fw2->buf.end(), p, p + size);
-    return 1;
-  };
-  if (!FPDF_SaveAsCopy(g.doc, &fw.base, FPDF_NO_INCREMENTAL))
-  {
-    MessageBoxW(g.frame, L"Save failed: the document could not be serialized.",
-                L"Stitchup", MB_OK | MB_ICONWARNING);
-    return;
-  }
+  std::vector<unsigned char> buf;
+  if (!SerializeForSave(buf, true)) return;
   std::wstring tmp = target + L".tmp";
   FILE* f = nullptr;
   if (_wfopen_s(&f, tmp.c_str(), L"wb") != 0) return;
-  bool okw = fwrite(fw.buf.data(), 1, fw.buf.size(), f) == fw.buf.size();
+  bool okw = fwrite(buf.data(), 1, buf.size(), f) == buf.size();
   fclose(f);
   if (!okw) { DeleteFileW(tmp.c_str()); return; }
   // PDFium keeps the source file handle open; release it before replacing the
@@ -1727,6 +2582,8 @@ static void SaveInPlace()
   }
   g.dirty = false;
   LoadDoc(target);
+  g.marks.clear();   // they are in the file now, and the reload reads them back
+  g.bmDirty = true;
   InvalidateRect(g.status, nullptr, TRUE);
 }
 
@@ -1871,6 +2728,24 @@ static void SaveAsEncrypted()
   {
     MessageBoxW(g.frame, L"No document open.", L"Stitchup", MB_OK | MB_ICONINFORMATION);
     return;
+  }
+  // The outline writer appends plain objects, which an encrypted copy would
+  // have to encrypt too, so say so rather than quietly dropping the bookmarks.
+  if (!g.marks.empty())
+  {
+    const std::wstring msg =
+        L"This document has " + std::to_wstring(g.marks.size()) +
+        L" bookmark(s) that are not saved yet.\n\n"
+        L"Save the document first so they are written into the PDF?";
+    const int r = MessageBoxW(g.frame, msg.c_str(), L"Save As Encrypted",
+                              MB_YESNOCANCEL | MB_ICONQUESTION);
+    if (r == IDCANCEL) return;
+    if (r == IDYES)
+    {
+      if (g.path.empty()) SaveAs();
+      else SaveInPlace();
+      if (!g.marks.empty()) return;   // save did not clear them: stop here
+    }
   }
   std::wstring userPw, ownerPw;
   if (!PromptSetPassword(userPw, ownerPw)) return;
@@ -2258,6 +3133,7 @@ static void UpdateScrollbars()
   si.nPos = g.scrollY;
   SetScrollInfo(g.canvas, SB_VERT, &si, TRUE);
   inUpdate = false;
+  SyncThumbScroll();
 }
 
 // ---------------------------------------------------------------------------
@@ -2269,16 +3145,16 @@ static LRESULT CALLBACK StatusProc(HWND hw, UINT msg, WPARAM wp, LPARAM lp)
   {
     case WM_ERASEBKGND:
       return 1;
-    case WM_PAINT:
+case WM_PAINT:
     {
       PAINTSTRUCT ps;
       HDC dc = BeginPaint(hw, &ps);
       RECT rc;
       GetClientRect(hw, &rc);
       const UiTheme& th = ThemeNow();
-      HBRUSH bg = CreateSolidBrush(th.statusBg);
+      HBRUSH bg = CreateSolidBrush(th.ribbonBg);
       FillRect(dc, &rc, bg);
-      DeleteObject(bg);
+DeleteObject(bg);
       SetBkMode(dc, TRANSPARENT);
       SetTextColor(dc, th.statusTxt);
       std::wstring left = g.name.empty() ? L"Stitchup PDF Editor"
@@ -2359,6 +3235,75 @@ static void ResetThumbScroll()
   SetScrollInfo(g.thumbs, SB_VERT, &si, TRUE);
 }
 
+// The thumbnails pane has no scrollbar of its own; it auto-follows the page
+// nearest the top of the main view so the canvas bar stays the only vertical
+// scrollbar. Range/pos are still stored so ThumbForY hit-testing (and
+// drag-to-reorder) keeps working with the same geometry as WM_PAINT.
+static void SyncThumbScroll()
+{
+  if (!g.thumbs || !g.doc || g.pageCount <= 0) return;
+  if (g.dragPage >= 0) return; // let a drag reorder stabilise
+
+  int target = g.selected;
+  if (target >= 0 && target < g.pageCount)
+  {
+    RECT cr{};
+    GetClientRect(g.canvas, &cr);
+    int cw = std::max(120, (int)(cr.right - cr.left));
+    std::vector<RECT> rects;
+    int cw2 = 0, ch2 = 0;
+    LayoutPages(cw, rects, cw2, ch2);
+    if (!rects.empty())
+    {
+      POINT org = PageOrigin((int)std::lround(g.scrollX),
+                             (int)std::lround(g.scrollY));
+      target = 0;
+      for (int i = 0; i < (int)rects.size(); ++i)
+        if (rects[i].top + org.y <= 0) target = i;
+    }
+  }
+  if (target < 0 || target >= g.pageCount) return;
+
+  RECT rc;
+  GetClientRect(g.thumbs, &rc);
+  int view = rc.bottom - rc.top;
+  if (view < 10) return;
+  int w = rc.right - rc.left;
+  int thumbW = w - 26;
+  if (thumbW < 50) thumbW = 50;
+
+  int yTop = 34, slotH = 0;
+  int content = 34;
+  for (int i = 0; i < g.pageCount; ++i)
+  {
+    float pw = PageW(i), ph = PageH(i);
+    if (pw < 1 || ph < 1) continue;
+    double scale = std::min((double)(thumbW - 8) / (double)pw, 220.0 / (double)ph);
+    int hi = (int)std::ceil(ph * scale) + 16;
+    content += hi;
+    if (i < target) yTop += hi;
+    else if (i == target) slotH = hi;
+  }
+
+  int pos = 0;
+  if (yTop < 0) pos = 0;
+  else if (yTop + slotH > view) pos = yTop + slotH - view + 8;
+  else pos = yTop - 8;
+  pos = std::max(0, std::min(std::max(0, content - view), pos));
+
+  SCROLLINFO si{};
+  si.cbSize = sizeof(si);
+  si.fMask = SIF_POS;
+  GetScrollInfo(g.thumbs, SB_VERT, &si);
+  if (si.nPos != pos)
+  {
+    si.fMask = SIF_POS;
+    si.nPos = pos;
+    SetScrollInfo(g.thumbs, SB_VERT, &si, TRUE);
+    InvalidateRect(g.thumbs, nullptr, FALSE);
+  }
+}
+
 static HBITMAP GetThumb(int i)
 {
   auto it = g.thumbCache.find(i);
@@ -2376,19 +3321,6 @@ static HBITMAP GetThumb(int i)
   return hb;
 }
 
-static void ThumbScroll(int delta)
-{
-  SCROLLINFO si{};
-  si.cbSize = sizeof(si);
-  si.fMask = SIF_RANGE | SIF_PAGE | SIF_POS;
-  GetScrollInfo(g.thumbs, SB_VERT, &si);
-  si.nPos -= delta;
-  si.nPos = std::max(si.nMin, std::min((int)si.nMax, si.nPos));
-  si.fMask = SIF_POS;
-  SetScrollInfo(g.thumbs, SB_VERT, &si, TRUE);
-  InvalidateRect(g.thumbs, nullptr, FALSE);
-}
-
 static LRESULT CALLBACK ThumbsProc(HWND hw, UINT msg, WPARAM wp, LPARAM lp)
 {
   switch (msg)
@@ -2396,7 +3328,11 @@ static LRESULT CALLBACK ThumbsProc(HWND hw, UINT msg, WPARAM wp, LPARAM lp)
     case WM_ERASEBKGND:
       return 1;
     case WM_CREATE:
-      ShowScrollBar(hw, SB_VERT, TRUE);
+      // The thumbnails pane deliberately has no scrollbar of its own: the main
+      // canvas scrollbar is the single vertical bar, and SyncThumbScroll() keeps
+      // the active page's thumbnail in view. The hidden range is still used for
+      // hit-testing and drag-to-reorder.
+      ShowScrollBar(hw, SB_VERT, FALSE);
       return 0;
     case WM_SIZE:
       ResetThumbScroll();
@@ -2521,7 +3457,22 @@ static LRESULT CALLBACK ThumbsProc(HWND hw, UINT msg, WPARAM wp, LPARAM lp)
     case WM_MOUSEWHEEL:
     {
       short d = GET_WHEEL_DELTA_WPARAM(wp);
-      if (d != 0) ThumbScroll(d / WHEEL_DELTA * 40);
+      if (d != 0 && g.canvas)
+      {
+        int step = (int)(-(d / WHEEL_DELTA) * 60);
+        SCROLLINFO si{};
+        si.cbSize = sizeof(si);
+        si.fMask = SIF_RANGE | SIF_PAGE | SIF_POS;
+        GetScrollInfo(g.canvas, SB_VERT, &si);
+        int pos = std::max(si.nMin, std::min(si.nMax, si.nPos + step));
+        g.scrollY = pos;
+        si.fMask = SIF_POS;
+        si.nPos = pos;
+        SetScrollInfo(g.canvas, SB_VERT, &si, TRUE);
+        UpdateScrollbars();
+        InvalidateRect(g.canvas, nullptr, FALSE);
+        InvalidateRect(hw, nullptr, FALSE);
+      }
       return 0;
     }
     case WM_LBUTTONDOWN:
@@ -2580,6 +3531,24 @@ static LRESULT CALLBACK ThumbsProc(HWND hw, UINT msg, WPARAM wp, LPARAM lp)
         g.dragCursor = -1;
         if (from >= 0 && to >= 0 && from != to && from != to - 1)
           ReorderDoc(from, to);
+        InvalidateRect(hw, nullptr, FALSE);
+      }
+      return 0;
+    }
+    case WM_LBUTTONDBLCLK:
+    {
+      // Double-click a thumbnail: make that page the focus of the main display.
+      POINT pt{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
+      SCROLLINFO si{};
+      si.cbSize = sizeof(si);
+      si.fMask = SIF_POS;
+      GetScrollInfo(hw, SB_VERT, &si);
+      const int pi = ThumbForY(pt.y + si.nPos);
+      if (pi >= 0)
+      {
+        g.selected = pi;
+        GotoPageIndex(pi);
+        SetFocus(g.canvas);
         InvalidateRect(hw, nullptr, FALSE);
       }
       return 0;
@@ -3187,6 +4156,72 @@ static bool HitPage(POINT pt, HitInfo& out);
 static bool GetLinkAtDevice(FPDF_PAGE page, POINT pt, FPDF_LINK& link);
 static bool FollowLink(FPDF_PAGE page, POINT pt);
 
+// Maps the canvas viewport onto a destination for a "bookmark this view" entry.
+// |pageLeftClient|/|pageTopClient| place the page's top-left in canvas client
+// coordinates, and |pw|/|ph| are its size in points. PDF y grows upward from the
+// page bottom, hence the flip, and the result is clamped into the page so a
+// partly scrolled page still gets a sane target. |zoom| is screen pixels per PDF
+// point; the PDF /Zoom factor is per 72. Pure, so the self-test can exercise it.
+static void ViewDestForPage(double pw, double ph, int pageLeftClient,
+                            int pageTopClient, double zoom, double& x, double& y,
+                            double& pdfZoom)
+{
+  if (!(zoom > 0)) zoom = 1.0;
+  const double dx = (0.0 - pageLeftClient) / zoom;
+  const double dy = ph - (0.0 - pageTopClient) / zoom;
+  x = dx < 0 ? 0 : (dx > pw ? pw : dx);
+  y = dy < 0 ? 0 : (dy > ph ? ph : dy);
+  pdfZoom = zoom * 96.0 / 72.0;
+}
+
+// Adds a user bookmark for `page`. When atView is set the destination also
+// records the current scroll position and zoom, so reopening it returns to the
+// same spot rather than the top of the page. The bookmark is held in memory and
+// written into the PDF by AppendOutlines() on save; the user is asked to save now.
+static void AddUserBookmark(int page, bool atView)
+{
+  if (!g.doc || page < 0 || page >= g.pageCount) return;
+
+  UserBookmark bm;
+  bm.page = page;
+  bm.atView = atView;
+  if (atView)
+  {
+    RECT cr{};
+    GetClientRect(g.canvas, &cr);
+    std::vector<RECT> rects;
+    int cw2 = 0, ch2 = 0;
+    LayoutPages(cr.right - cr.left, rects, cw2, ch2);
+    if (page < (int)rects.size())
+    {
+      const POINT org = PageOrigin((int)std::lround(g.scrollX),
+                                   (int)std::lround(g.scrollY));
+      ViewDestForPage(PageW(page), PageH(page), rects[page].left + org.x,
+                      rects[page].top + org.y, g.zoom, bm.x, bm.y, bm.zoom);
+    }
+  }
+
+  std::wstring deflt = L"Page " + std::to_wstring(page + 1);
+  std::wstring name;
+  if (!PromptBookmarkName(name, deflt)) return;
+  bm.title = name;
+
+  g.marks.push_back(bm);
+  g.dirty = true;
+  g.bmDirty = true;
+  RefreshState();
+  InvalidateRect(g.status, nullptr, TRUE);
+
+  const std::wstring msg =
+      L"Bookmark \"" + name + L"\" added.\n\nWrite it into the PDF now?";
+  if (MessageBoxW(g.frame, msg.c_str(), L"Add Bookmark",
+                  MB_YESNO | MB_ICONQUESTION) == IDYES)
+  {
+    if (g.path.empty()) SaveAs();
+    else SaveInPlace();
+  }
+}
+
 static LRESULT CALLBACK CanvasProc(HWND hw, UINT msg, WPARAM wp, LPARAM lp)
 {
   switch (msg)
@@ -3309,6 +4344,35 @@ static LRESULT CALLBACK CanvasProc(HWND hw, UINT msg, WPARAM wp, LPARAM lp)
         }
       }
       return DefWindowProcW(hw, msg, wp, lp);
+    }
+    case WM_CONTEXTMENU:
+    {
+      // Right-click (or Shift+F10 / the menu key) offers to bookmark the page
+      // under the pointer, or the current view of it.
+      if (!g.doc || g.pageCount <= 0) return 0;
+      POINT pt{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
+      if (pt.x == -1 && pt.y == -1)   // keyboard invocation: no pointer position
+      {
+        RECT cr{};
+        GetClientRect(hw, &cr);
+        pt = POINT{ cr.right / 2, cr.top + 8 };
+      }
+      HitInfo hi;
+      const int page = HitPage(pt, hi) ? hi.page : g.selected;
+      if (page < 0 || page >= g.pageCount) return 0;
+      HMENU m = CreatePopupMenu();
+      if (!m) return 0;
+      AppendMenuW(m, MF_STRING, ID_BM_PAGE,
+                  (L"Bookmark page " + std::to_wstring(page + 1)).c_str());
+      AppendMenuW(m, MF_STRING, ID_BM_VIEW, L"Bookmark this view");
+      SetForegroundWindow(hw);
+      const int cmd = (int)TrackPopupMenu(
+          m, TPM_RETURNCMD | TPM_RIGHTBUTTON | TPM_LEFTBUTTON,
+          pt.x, pt.y, 0, hw, nullptr);
+      DestroyMenu(m);
+      if (cmd == ID_BM_PAGE) AddUserBookmark(page, false);
+      else if (cmd == ID_BM_VIEW) AddUserBookmark(page, true);
+      return 0;
     }
     case WM_LBUTTONDOWN:
     {
@@ -3513,6 +4577,84 @@ static LRESULT CALLBACK SplitProc(HWND hw, UINT msg, WPARAM wp, LPARAM lp)
 // ---------------------------------------------------------------------------
 // Toolbar custom buttons
 // ---------------------------------------------------------------------------
+
+// Paints one ribbon glyph centred in `box`. GDI cannot flip text, so mirrored
+// glyphs are rendered into a DIB and blitted with a negative destination width.
+// When the icon font is missing, `label` supplies a tinted initial-letter chip.
+static void DrawRibbonIcon(HDC dc, const RECT& box, wchar_t glyph,
+                           const std::wstring& label, COLORREF fg, COLORREF bg,
+                           bool mirror)
+{
+  const int w = box.right - box.left;
+  const int h = box.bottom - box.top;
+  if (w <= 0 || h <= 0) return;
+
+  if (!g.haveMdl2 || !glyph)
+  {
+    const UiTheme& th = ThemeNow();
+    int cx = (box.left + box.right) / 2;
+    int cy = (box.top + box.bottom) / 2;
+    int s = w < h ? w : h;
+    RECT chip{cx - s / 2, cy - s / 2, cx + s / 2, cy + s / 2};
+    HBRUSH fill = CreateSolidBrush(fg);
+    HPEN nopen = (HPEN)GetStockObject(NULL_PEN);
+    HBRUSH wb = (HBRUSH)SelectObject(dc, fill);
+    HPEN wp = (HPEN)SelectObject(dc, nopen);
+    RoundRect(dc, chip.left, chip.top, chip.right, chip.bottom, s, s);
+    SelectObject(dc, wb);
+    SelectObject(dc, wp);
+    DeleteObject(fill);
+    if (!label.empty())
+    {
+      wchar_t ch[2] = {label[0], 0};
+      SetBkMode(dc, TRANSPARENT);
+      SetTextColor(dc, th.card);
+      HFONT wf = (HFONT)SelectObject(dc, g.font);
+      DrawTextW(dc, ch, -1, &chip, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+      SelectObject(dc, wf);
+    }
+    return;
+  }
+
+  wchar_t t[2] = {glyph, 0};
+  SetBkMode(dc, TRANSPARENT);
+  HGDIOBJ of = SelectObject(dc, g.iconFont);
+  SetTextColor(dc, fg);
+  // Centre the glyph by its real ink box; MDL2 glyphs carry a lot of internal
+  // leading, so plain DT_CENTER makes them ride far too high in the chip.
+  SIZE ext{};
+  GetTextExtentPoint32W(dc, t, 1, &ext);
+  int gx = box.left + (w - ext.cx) / 2;
+  int gy = box.top + (h - ext.cy) / 2 + MulDiv(2, g.dpi, 72);
+  if (!mirror)
+  {
+    TextOutW(dc, gx, gy, t, 1);
+    SelectObject(dc, of);
+    return;
+  }
+
+  HDC mem = CreateCompatibleDC(dc);
+  if (!mem) { SelectObject(dc, of); return; }
+  HBITMAP bmp = CreateCompatibleBitmap(dc, w, h);
+  if (!bmp) { DeleteDC(mem); SelectObject(dc, of); return; }
+  HGDIOBJ obmp = SelectObject(mem, bmp);
+  RECT zb{0, 0, w, h};
+  HBRUSH back = CreateSolidBrush(bg);
+  FillRect(mem, &zb, back);
+  DeleteObject(back);
+  SetBkMode(mem, TRANSPARENT);
+  HGDIOBJ of2 = SelectObject(mem, g.iconFont);
+  SetTextColor(mem, fg);
+  TextOutW(mem, gx, gy, t, 1);
+  SelectObject(mem, of2);
+  SetStretchBltMode(dc, HALFTONE);
+  StretchBlt(dc, box.right, box.top, -w, h, mem, 0, 0, w, h, SRCCOPY);
+  SelectObject(mem, obmp);
+  DeleteObject(bmp);
+  DeleteDC(mem);
+  SelectObject(dc, of);
+}
+
 static void BtnPaint(HWND hw)
 {
   HWND parent = GetParent(hw);
@@ -3552,9 +4694,25 @@ static void BtnPaint(HWND hw)
     }
     SetBkMode(dc, TRANSPARENT);
     HFONT was = (HFONT)SelectObject(dc, g.font);
-    SetTextColor(dc, b->pressed ? th.accent : (b->hover ? th.text : th.textDim));
-    DrawTextW(dc, b->label.c_str(), -1, &rc,
-              DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+    const COLORREF tfg = b->pressed ? th.accent : (b->hover ? th.text : th.textDim);
+    SetTextColor(dc, tfg);
+    if (b->icon)
+    {
+      int s = MulDiv(16, g.dpi, 72);
+      int cy = (rc.top + rc.bottom) / 2;
+      RECT ib{rc.left + MulDiv(4, g.dpi, 72), cy - s / 2,
+              rc.left + MulDiv(4, g.dpi, 72) + s, cy + s / 2};
+      DrawRibbonIcon(dc, ib, b->icon, b->label, tfg,
+                     b->hover ? th.btnHover : th.card, false);
+      RECT lb{ib.right + MulDiv(4, g.dpi, 72), rc.top, rc.right - 2, rc.bottom};
+      DrawTextW(dc, b->label.c_str(), -1, &lb,
+                DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+    }
+    else
+    {
+      DrawTextW(dc, b->label.c_str(), -1, &rc,
+                DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+    }
     SelectObject(dc, was);
   }
   else
@@ -3579,9 +4737,27 @@ static void BtnPaint(HWND hw)
       DeleteObject(pen);
     }
     SetBkMode(dc, TRANSPARENT);
-    SetTextColor(dc, b->down ? th.accent : th.text);
-    DrawTextW(dc, b->label.c_str(), -1, &rc,
-              DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+    const COLORREF fg = b->down ? th.accent : th.text;
+    const COLORREF back = active ? (b->down ? th.btnDown : th.btnHover) : th.card;
+    HFONT wf = (HFONT)SelectObject(dc, g.font);
+    if (b->icon)
+    {
+      int iconPx = MulDiv(20, g.dpi, 72);
+      int top = rc.top + MulDiv(1, g.dpi, 72);
+      RECT ibox{rc.left, top, rc.right, top + iconPx};
+      RECT lbox{rc.left, top + iconPx, rc.right, rc.bottom};
+      DrawRibbonIcon(dc, ibox, b->icon, b->label, fg, back, b->mirror);
+      SetTextColor(dc, fg);
+      DrawTextW(dc, b->label.c_str(), -1, &lbox,
+                DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+    }
+    else
+    {
+      SetTextColor(dc, fg);
+      DrawTextW(dc, b->label.c_str(), -1, &rc,
+                DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+    }
+    SelectObject(dc, wf);
   }
   EndPaint(hw, &ps);
 }
@@ -3645,6 +4821,27 @@ static LRESULT CALLBACK ToolBtnProc(HWND hw, UINT msg, WPARAM wp, LPARAM lp)
   return DefWindowProcW(hw, msg, wp, lp);
 }
 
+// Attach a hover-help string to a control. Silently does nothing when the
+// tooltip control could not be created.
+static void AddTip(HWND target, const wchar_t* text)
+{
+  if (!g.tips || !target || !text) return;
+  TOOLINFOW ti{};
+  ti.cbSize = sizeof(ti);
+  ti.uFlags = TTF_TRANSPARENT;
+  ti.hwnd = g.frame;
+  ti.hinst = g.inst;
+  ti.lpszText = const_cast<wchar_t*>(text);
+  ti.uId = static_cast<UINT_PTR>(GetWindowLongPtrW(target, GWLP_ID));
+  // whole-control hit area; the tooltip tracks the cursor, so an empty rect is
+  // not usable here
+  GetWindowRect(target, &ti.rect);
+  ScreenToClient(g.frame, reinterpret_cast<POINT*>(&ti.rect.left));
+  ti.rect.right = ti.rect.left;
+  ti.rect.bottom = ti.rect.top;
+  SendMessageW(g.tips, TTM_ADDTOOLW, 0, reinterpret_cast<LPARAM>(&ti));
+}
+
 static HWND MakeBtn(HWND parent, int id, const wchar_t* label, int x, int y,
                     int w, int h, bool tabStyle)
 {
@@ -3672,127 +4869,183 @@ struct RibbonSpec
   int id;
   const wchar_t* label;
   int w;
-  int tab;
-  int grp;
+  int tab;      // ribbon tab index, one per tool group
+  wchar_t icon; // Segoe MDL2 Assets codepoint
+  bool mirror;  // flip horizontally (counter-clockwise)
+  const wchar_t* tip;  // hover help
 };
 
 static void BuildToolbar(HWND)
 {
   static const RibbonSpec specs[] = {
-    {ID_NEW,          L"New",        54, 0, 0},
-    {ID_OPEN,         L"Open",       58, 0, 0},
-    {ID_SAVE,         L"Save",       56, 0, 0},
-    {ID_SAVEAS,       L"Save As",    74, 0, 0},
-    {ID_IMPORT,       L"Import",     68, 0, 0},
-    {ID_ROTL,         L"Rotate CCW", 88, 0, 1},
-    {ID_ROTR,         L"Rotate CW",  86, 0, 1},
-    {ID_DELETE,       L"Delete",     66, 0, 1},
-    {ID_ADD,          L"Add Page",   80, 0, 1},
-    {ID_PAGE_EXTRACT, L"Extract",    70, 0, 1},
-    {ID_PAGE_SPLIT,   L"Split",      60, 0, 1},
-    {ID_PAGE_CROP,    L"Auto-Crop",  84, 0, 1},
-    {ID_ZOOM_OUT,     L"Zoom -",     62, 1, 0},
-    {ID_ZOOM_IN,      L"Zoom +",     62, 1, 0},
-    {ID_ZOOM100,      L"100%",       54, 1, 0},
-    {ID_FITW,         L"Fit Width",  80, 1, 0},
-    {ID_FITP,         L"Fit Page",   76, 1, 0},
-    {ID_PREV,         L"Previous",   78, 1, 1},
-    {ID_NEXT,         L"Next",       62, 1, 1},
-    {ID_SPREAD,       L"Spread",     70, 1, 1},
-    {ID_PANE_THUMBS,  L"Thumbnails", 92, 1, 2},
-    {ID_PANE_BOOKMARKS, L"Bookmarks", 90, 1, 2},
-    {ID_SIDEBAR,      L"Sidebar",    72, 1, 2},
-    {ID_ANN_HL,       L"Highlight",  80, 0, 2},
-    {ID_ANN_UL,       L"Underline",  80, 0, 2},
-    {ID_ANN_NOTE,     L"Note",       56, 0, 2},
-    {ID_ANN_TEXT,     L"Text Box",   78, 0, 2},
-    {ID_ANN_SHAPE,    L"Shape",      62, 0, 2},
-    {ID_ANN_STAMP,    L"Stamp",      62, 0, 2},
-    {ID_TOOL_SELECT,  L"Select",     62, 0, 3},
-    {ID_OBJ_EDIT,     L"Edit Text",  78, 0, 3},
-    {ID_OBJ_DELETE,   L"Delete",     62, 0, 3},
-  {ID_OBJ_RECOLOR,  L"Recolor",    66, 0, 3},
-  {ID_WATERMARK,    L"Watermark",  76, 2, 0},
-  {ID_SAVEENC,      L"Encrypt",    66, 2, 0},
-  {ID_EXPORT_TEXT,  L"Export Text",80, 2, 1},
-  {ID_EXPORT_CSV,   L"Export CSV", 66, 2, 1},
-};
+    {ID_NEW,          L"New",        54, 0, 0xE8A5, false,
+     L"Create a new empty document (Ctrl+N)"},
+    {ID_OPEN,         L"Open",       58, 0, 0xE8E5, false,
+     L"Open an existing PDF file (Ctrl+O)"},
+    {ID_SAVE,         L"Save",       56, 0, 0xE74E, false,
+     L"Save changes to the current file (Ctrl+S)"},
+    {ID_SAVEAS,       L"Save As",    74, 0, 0xE792, false,
+     L"Save to a new file name (Ctrl+Shift+S)"},
+    {ID_IMPORT,       L"Import",     68, 0, 0xE8B5, false,
+     L"Insert pages from another PDF into this one"},
+    {ID_EXPORT_TEXT,  L"Export Text",80, 0, 0xE8C3, false,
+     L"Write the document text out to a .txt file"},
+    {ID_EXPORT_CSV,   L"Export CSV", 66, 0, 0xE8FD, false,
+     L"Write page data out to a .csv file"},
+    {ID_ROTL,         L"Rotate CCW", 88, 1, 0xE7AD, true,
+     L"Rotate the current page 90 degrees counter-clockwise (Ctrl+Shift+R)"},
+    {ID_ROTR,         L"Rotate CW",  86, 1, 0xE7AD, false,
+     L"Rotate the current page 90 degrees clockwise (Ctrl+R)"},
+    {ID_DELETE,       L"Delete",     66, 1, 0xE74D, false,
+     L"Delete the current page (Del)"},
+    {ID_ADD,          L"Add Page",   80, 1, 0xE710, false,
+     L"Append a blank page to the end of the document"},
+    {ID_PAGE_EXTRACT, L"Extract",    70, 1, 0xE896, false,
+     L"Save the current page as its own PDF file"},
+    {ID_PAGE_SPLIT,   L"Split",      60, 1, 0xE8EE, false,
+     L"Split the document into one file per page"},
+    {ID_PAGE_CROP,    L"Auto-Crop",  84, 1, 0xE7A8, false,
+     L"Trim the white margin around the current page"},
+    {ID_ZOOM_OUT,     L"Zoom -",     62, 4, 0xE71F, false,
+     L"Zoom out one step (Ctrl+-)"},
+    {ID_ZOOM_IN,      L"Zoom +",     62, 4, 0xE8A3, false,
+     L"Zoom in one step (Ctrl+=)"},
+    {ID_ZOOM100,      L"100%",       54, 4, 0xE71E, false,
+     L"Reset the zoom to 100% (Ctrl+1)"},
+    {ID_FITW,         L"Fit Width",  80, 4, 0xE8A9, false,
+     L"Scale the page so its width fills the window (Ctrl+W)"},
+    {ID_FITP,         L"Fit Page",   76, 4, 0xE740, false,
+     L"Scale the page so the whole page is visible (Ctrl+0)"},
+    {ID_PREV,         L"Previous",   78, 5, 0xE892, false,
+     L"Go to the previous page (Ctrl+PgUp)"},
+    {ID_NEXT,         L"Next",       62, 5, 0xE893, false,
+     L"Go to the next page (Ctrl+PgDn)"},
+    {ID_SPREAD,       L"Spread",     70, 5, 0xE89A, false,
+     L"Show facing pages side by side (F5)"},
+    {ID_ANN_HL,       L"Highlight",  80, 2, 0xE82A, false,
+     L"Draw a translucent highlight across the page"},
+    {ID_ANN_UL,       L"Underline",  80, 2, 0xE8D2, false,
+     L"Draw an underline annotation on the page"},
+    {ID_ANN_NOTE,     L"Note",       56, 2, 0xE70B, false,
+     L"Attach a sticky note comment at the click point"},
+    {ID_ANN_TEXT,     L"Text Box",   78, 2, 0xE8C1, false,
+     L"Place free text on the page"},
+    {ID_ANN_SHAPE,    L"Shape",      62, 2, 0xE8EC, false,
+     L"Draw a rectangle or oval shape"},
+    {ID_ANN_STAMP,    L"Stamp",      62, 2, 0xE735, false,
+     L"Stamp the page number or a custom mark"},
+    {ID_TOOL_SELECT,  L"Select",     62, 3, 0xE8B0, false,
+     L"Click a content object to select it, then drag to move it"},
+    {ID_OBJ_EDIT,     L"Edit Text",  78, 3, 0xE70F, false,
+     L"Change the wording of the selected text object (double-click)"},
+    {ID_OBJ_DELETE,   L"Delete",     62, 3, 0xE74D, false,
+     L"Remove the selected content object (Ctrl+Del)"},
+    {ID_OBJ_RECOLOR,  L"Recolor",    66, 3, 0xE790, false,
+     L"Change the fill or stroke colour of the selected object"},
+    {ID_WATERMARK,    L"Watermark",  76, 6, 0xE7C3, false,
+     L"Stamp a diagonal text watermark across every page"},
+    {ID_SAVEENC,      L"Encrypt",    66, 6, 0xE72E, false,
+     L"Save a copy protected by a 128-bit RC4 password"},
+  };
   for (const RibbonSpec& s : specs)
   {
     HWND hw = MakeBtn(s.id, s.label, 0, 0, s.w, RIB_BTN_H);
     Btn* b = reinterpret_cast<Btn*>(GetWindowLongPtrW(hw, GWLP_USERDATA));
-    if (b) { b->rtab = s.tab; b->rgroup = s.grp; }
+    if (b) { b->rtab = s.tab; b->icon = s.icon; b->mirror = s.mirror; }
+    AddTip(hw, s.tip);
     g.ribbonBtns.push_back(hw);
   }
 }
 
-static const wchar_t* GroupName(int tab, int grp)
+static const wchar_t* RibbonTabName(int tab)
 {
-  if (tab == 0)
-    return grp == 0 ? L"Document" : (grp == 1 ? L"Pages" : (grp == 2 ? L"Annotate" : L"Content"));
-  if (tab == 1)
-    return grp == 0 ? L"Zoom" : (grp == 1 ? L"Navigate" : L"Panes");
-  if (tab == 2)
-    return grp == 0 ? L"Security" : L"Export";
-  return nullptr;
+  static const wchar_t* names[] = {L"Document", L"Pages", L"Annotate", L"Content",
+                                   L"Zoom",    L"Navigate", L"Security"};
+  return (tab >= 0 && tab <= ID_TAB_LAST - ID_TAB_FIRST) ? names[tab] : L"";
 }
 
-static int GroupCount(int tab)
+static int RibbonTabCount()
 {
-  return tab == 0 ? 4 : (tab == 1 ? 3 : 2);
+  return ID_TAB_LAST - ID_TAB_FIRST + 1;
 }
 
 static void SetTabPressed()
 {
   HMENU bar = GetMenu(g.frame);
   if (!bar) return;
-  CheckMenuRadioItem(bar, ID_TAB_HOME, ID_TAB_TOOLS, g.ribbonTab, MF_BYCOMMAND);
+  CheckMenuRadioItem(bar, ID_TAB_FIRST, ID_TAB_LAST,
+                     ID_TAB_FIRST + g.ribbonTab, MF_BYCOMMAND);
   CheckMenuItem(bar, ID_SIDEBAR,
                 MF_BYCOMMAND | (g.showSidebar ? MF_CHECKED : MF_UNCHECKED));
   CheckMenuItem(bar, ID_SPREAD,
                 MF_BYCOMMAND | (g.spread ? MF_CHECKED : MF_UNCHECKED));
 }
 
+// Measures the tab strip; the same pass feeds painting and hit-testing.
+static void LayoutRibbonTabs(HDC measure, HFONT font, std::vector<RECT>& out)
+{
+  out.clear();
+  HGDIOBJ old = SelectObject(measure, font);
+  int x = 8;
+  for (int i = 0; i < RibbonTabCount(); ++i)
+  {
+    SIZE cxt{};
+    GetTextExtentPoint32W(measure, RibbonTabName(i), (int)wcslen(RibbonTabName(i)),
+                          &cxt);
+    RECT r{x, 4, x + cxt.cx + MulDiv(28, g.dpi, 72), RIB_TAB_H - 4};
+    out.push_back(r);
+    x = r.right + 2;
+  }
+  SelectObject(measure, old);
+}
+
 static void LayoutRibbon()
 {
   g.groups.clear();
-  int x = 6;
-  int nc = GroupCount(g.ribbonTab);
-  for (int gi = 0; gi < nc; ++gi)
+
+  // Tab strip
+  HDC probe = CreateCompatibleDC(nullptr);
+  if (probe)
   {
-    int gx = x;
-    for (HWND hw : g.ribbonBtns)
-    {
-      Btn* b = reinterpret_cast<Btn*>(GetWindowLongPtrW(hw, GWLP_USERDATA));
-      if (!b || b->rtab != g.ribbonTab || b->rgroup != gi) continue;
-      RECT rc2{};
-      GetWindowRect(hw, &rc2);
-      int w = rc2.right - rc2.left;
-      SetWindowPos(hw, nullptr, x, RIB_BTN_Y, w, RIB_BTN_H, SWP_NOZORDER);
-      ShowWindow(hw, SW_SHOW);
-      x += w + 6;
-    }
-    int groupW = x - gx;
-    App::GroupBox gb;
-    gb.tab = g.ribbonTab;
-    gb.name = GroupName(g.ribbonTab, gi) ? GroupName(g.ribbonTab, gi) : L"";
-    gb.rc = {gx - 4, RIB_CAP_Y, gx + groupW - 2, RIB_H};
-    g.groups.push_back(gb);
-    x += 14;
+    HFONT f = CreateFontW(-MulDiv(10, g.dpi, 72), 0, 0, 0, FW_SEMIBOLD, FALSE,
+                          FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS,
+                          CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
+                          DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI");
+    LayoutRibbonTabs(probe, f, g.ribbonTabRects);
+    DeleteObject(f);
+    DeleteDC(probe);
   }
+
+  // Only the active tab's buttons are visible, laid out left to right.
+  int x = 6;
+  int gx = x;
   for (HWND hw : g.ribbonBtns)
   {
     Btn* b = reinterpret_cast<Btn*>(GetWindowLongPtrW(hw, GWLP_USERDATA));
-    if (b && (b->rtab != g.ribbonTab || b->rgroup >= GroupCount(g.ribbonTab)))
-      ShowWindow(hw, SW_HIDE);
+    if (!b || b->rtab != g.ribbonTab) { ShowWindow(hw, SW_HIDE); continue; }
+    RECT rc2{};
+    GetWindowRect(hw, &rc2);
+    int w = rc2.right - rc2.left;
+    SetWindowPos(hw, nullptr, x, RIB_BTN_Y, w, RIB_BTN_H, SWP_NOZORDER);
+    ShowWindow(hw, SW_SHOW);
+    x += w + 6;
   }
+  if (x > gx)
+  {
+    App::GroupBox gb;
+    gb.tab = g.ribbonTab;
+    gb.name = RibbonTabName(g.ribbonTab);
+    gb.rc = {gx - 4, RIB_TAB_H + 2, x - 6, RIB_H - 2};
+    g.groups.push_back(gb);
+  }
+
   SetTabPressed();
   InvalidateRect(g.toolbar, nullptr, TRUE);
 }
 
 static void SwitchRibbonTab(int tab)
 {
-  if (tab < 0 || tab > 2) return;
+  if (tab < 0 || tab >= RibbonTabCount()) return;
   if (g.ribbonTab == tab) return;
   g.ribbonTab = tab;
   LayoutRibbon();
@@ -3984,6 +5237,24 @@ static void EnsureBookmarks()
   if (!g.bookmarks || g.doc == nullptr) return;
   TreeView_DeleteAllItems(g.bookmarks);
   if (g.pageCount > 0) AddBookmarkTree(nullptr, nullptr, 0);
+  // Bookmarks added in this session that are not on disk yet, so the user can
+  // see and jump to them before saving. Encoded as a negative page+1.
+  for (size_t i = 0; i < g.marks.size(); ++i)
+  {
+    const UserBookmark& bm = g.marks[i];
+    if (bm.page < 0 || bm.page >= g.pageCount) continue;
+    std::wstring label = bm.title;
+    if (bm.atView) label += L"  (view)";
+    std::vector<wchar_t> tmp(label.begin(), label.end());
+    tmp.push_back(0);
+    TVINSERTSTRUCTW ti{};
+    ti.hParent = TVI_ROOT;
+    ti.hInsertAfter = TVI_LAST;
+    ti.item.mask = TVIF_TEXT | TVIF_PARAM;
+    ti.item.pszText = tmp.data();
+    ti.item.lParam = (LPARAM)(-(bm.page + 1));
+    TreeView_InsertItem(g.bookmarks, &ti);
+  }
   g.bmDirty = false;
 }
 
@@ -4131,22 +5402,25 @@ static void SetPane(int p)
 static void RelayoutPanes(int w, int h)
 {
   if (!g.toolbar) return;
-  int paneY = TAB_H + RIB_H + PANE_TAB_H;
+  const int tabY = g_tabs.empty() ? 0 : TAB_H;   // collapsed when no documents
+  int paneY = tabY + RIB_H + PANE_TAB_H;
   int paneH = std::max(10, h - paneY - STATUS_H);
-  int canvasH = std::max(10, h - TAB_H - RIB_H - STATUS_H);
+  int canvasH = std::max(10, h - tabY - RIB_H - STATUS_H);
   bool sb = g.showSidebar;
   int sw = sb ? g.thumbsW : 0;
   SetWindowPos(g.tabbar, nullptr, 0, 0, w, TAB_H, SWP_NOZORDER);
-  SetWindowPos(g.toolbar, nullptr, 0, TAB_H, w, RIB_H, SWP_NOZORDER);
-  SetWindowPos(g.paneTabs, nullptr, 0, TAB_H + RIB_H, sw, PANE_TAB_H,
+  SetWindowPos(g.toolbar, nullptr, 0, tabY, w, RIB_H, SWP_NOZORDER);
+  SetWindowPos(g.paneTabs, nullptr, 0, tabY + RIB_H, sw, PANE_TAB_H,
                SWP_NOZORDER);
   SetWindowPos(g.status, nullptr, 0, h - STATUS_H, w, STATUS_H, SWP_NOZORDER);
   SetWindowPos(g.thumbs, nullptr, 0, paneY, sw, paneH, SWP_NOZORDER);
   SetWindowPos(g.bookmarks, nullptr, 0, paneY, sw, paneH, SWP_NOZORDER);
-  SetWindowPos(g.split, nullptr, sw, TAB_H + RIB_H, 6,
+  ShowScrollBar(g.thumbs, SB_VERT, FALSE); // thumbnails follow the canvas bar
+  SetWindowPos(g.split, nullptr, sw, tabY + RIB_H, 6,
                PANE_TAB_H + paneH, SWP_NOZORDER);
-  SetWindowPos(g.canvas, nullptr, sb ? sw + 6 : 0, TAB_H + RIB_H,
+  SetWindowPos(g.canvas, nullptr, sb ? sw + 6 : 0, tabY + RIB_H,
                std::max(100, w - (sb ? sw + 6 : 0)), canvasH, SWP_NOZORDER);
+  ShowWindow(g.tabbar, g_tabs.empty() ? SW_HIDE : SW_SHOW);
   ShowWindow(g.paneTabs, sb ? SW_SHOW : SW_HIDE);
   ShowWindow(g.thumbs, sb && g.pane == 0 ? SW_SHOW : SW_HIDE);
   ShowWindow(g.bookmarks, sb && g.pane == 1 ? SW_SHOW : SW_HIDE);
@@ -4227,9 +5501,13 @@ static void DoCommand(int id)
     case ID_CLOSE_TAB: CloseTab(g_curTab); break;
     case ID_PREV_TAB: NextTab(-1); break;
     case ID_NEXT_TAB: NextTab(1); break;
-    case ID_TAB_HOME:    SwitchRibbonTab(0); break;
-    case ID_TAB_VIEW:    SwitchRibbonTab(1); break;
-    case ID_TAB_TOOLS:   SwitchRibbonTab(2); break;
+    case ID_TAB_DOCUMENT: SwitchRibbonTab(0); break;
+    case ID_TAB_PAGES:    SwitchRibbonTab(1); break;
+    case ID_TAB_ANNOTATE: SwitchRibbonTab(2); break;
+    case ID_TAB_CONTENT:  SwitchRibbonTab(3); break;
+    case ID_TAB_ZOOM:     SwitchRibbonTab(4); break;
+    case ID_TAB_NAVIGATE: SwitchRibbonTab(5); break;
+    case ID_TAB_SECURITY: SwitchRibbonTab(6); break;
     case ID_PANE_THUMBS: SetPane(0); break;
     case ID_PANE_BOOKMARKS: SetPane(1); break;
     case ID_ANN_HL:    InsertAnnotCurrent(ID_ANN_HL); break;
@@ -4336,9 +5614,6 @@ static HMENU BuildMenu()
   addItem(view, ID_PREV, L"Previous Page\tCtrl+PgUp");
   addItem(view, ID_NEXT, L"Next Page\tCtrl+PgDn");
   AppendMenuW(view, MF_SEPARATOR, 0, nullptr);
-  addItem(view, ID_PANE_THUMBS, L"Page Thumbnails");
-  addItem(view, ID_PANE_BOOKMARKS, L"Bookmarks");
-  AppendMenuW(view, MF_SEPARATOR, 0, nullptr);
   addItem(view, ID_SPREAD, L"Two-Page Spread\tF5");
   addItem(view, ID_SIDEBAR, L"Sidebar\tF8");
   AppendMenuW(view, MF_SEPARATOR, 0, nullptr);
@@ -4353,13 +5628,375 @@ static HMENU BuildMenu()
 
   AppendMenuW(bar, MF_POPUP, (UINT_PTR)view, L"&View");
 
-  addItem(bar, ID_TAB_HOME, L"Ho&me");
-  addItem(bar, ID_TAB_TOOLS, L"&Tools");
+  HMENU ribbon = CreatePopupMenu();
+  for (int i = 0; i < RibbonTabCount(); ++i)
+    addItem(ribbon, ID_TAB_FIRST + i, RibbonTabName(i));
+  AppendMenuW(bar, MF_POPUP, (UINT_PTR)ribbon, L"Ta&bs");
 
   HMENU help = CreatePopupMenu();
   addItem(help, ID_ABOUT, L"About");
   AppendMenuW(bar, MF_POPUP, (UINT_PTR)help, L"&Help");
   return bar;
+}
+
+enum CapBtnId
+{
+  CAPB_MIN = 0,
+  CAPB_MAX,
+  CAPB_CLOSE,
+  CAPB_COUNT
+};
+
+// Caption lives in the non-client area so Windows keeps drag, snap, resize and
+// maximise for us; we only take over the pixels and the button hit-testing.
+struct CapState
+{
+  RECT band{};
+  RECT btn[CAPB_COUNT]{};
+  bool hover[CAPB_COUNT]{};
+  bool down[CAPB_COUNT]{};
+  bool active = true;
+  bool drag = false;   // a caption button currently owns the mouse capture
+  bool tracked = false;
+};
+
+static CapState g_cap;
+
+static int CaptionHeight()
+{
+  return GetSystemMetrics(SM_CYFRAME) + GetSystemMetrics(SM_CYCAPTION);
+}
+
+// Height of the caption band: the strip the system reserves above the menu bar.
+static int CapBandH()
+{
+  return CaptionHeight();
+}
+
+static void LayoutCaption(HWND hw)
+{
+  RECT wr{};
+  if (!hw) return;
+  GetWindowRect(hw, &wr);
+  const int ch = CapBandH();
+  // Window-relative: the caption is part of the frame, and the non-client mouse
+  // messages carry screen coordinates.
+  g_cap.band = {0, 0, wr.right - wr.left, ch};
+  const UiTheme& th = ThemeNow();
+  if (th.capStyle == CAP_MAC)
+  {
+    const int d = MulDiv(12, g.dpi, 72);
+    const int gap = MulDiv(20, g.dpi, 72);
+    const int cy = g_cap.band.top + ch / 2;
+    const int order[CAPB_COUNT] = {CAPB_CLOSE, CAPB_MIN, CAPB_MAX};
+    int x = g_cap.band.left + MulDiv(14, g.dpi, 72);
+    for (int k = 0; k < CAPB_COUNT; ++k)
+    {
+      g_cap.btn[order[k]] = {x, cy - d / 2, x + d, cy + d / 2};
+      x += gap;
+    }
+  }
+  else
+  {
+    const int bw = MulDiv(th.capStyle == CAP_XP ? 24 : 46, g.dpi, 72);
+    int x = g_cap.band.right;
+    for (int i = CAPB_COUNT - 1; i >= 0; --i)
+    {
+      g_cap.btn[i] = {x - bw, g_cap.band.top, x, g_cap.band.bottom};
+      x -= bw;
+    }
+  }
+}
+
+static void InvalidateCaption()
+{
+  if (!g.frame) return;
+  RedrawWindow(g.frame, &g_cap.band, nullptr,
+               RDW_INVALIDATE | RDW_UPDATENOW);
+}
+
+static void CapBrushRect(HDC dc, RECT r, COLORREF c)
+{
+  HBRUSH b = CreateSolidBrush(c);
+  FillRect(dc, &r, b);
+  DeleteObject(b);
+}
+
+static void DrawCapGlyph(HDC dc, int i, COLORREF fg, RECT rc)
+{
+  const int cx = (rc.left + rc.right) / 2;
+  const int cy = (rc.top + rc.bottom) / 2;
+  HPEN pen = CreatePen(PS_SOLID, 1, fg);
+  HPEN was = (HPEN)SelectObject(dc, pen);
+  if (i == CAPB_MIN)
+  {
+    MoveToEx(dc, cx - MulDiv(5, g.dpi, 72), cy + MulDiv(1, g.dpi, 72), nullptr);
+    LineTo(dc, cx + MulDiv(5, g.dpi, 72), cy + MulDiv(1, g.dpi, 72));
+  }
+  else if (i == CAPB_MAX)
+  {
+    const int s = MulDiv(5, g.dpi, 72);
+    if (IsZoomed(g.frame))
+    {
+      RECT back{cx - s + MulDiv(2, g.dpi, 72), cy - s,
+                cx + s + MulDiv(2, g.dpi, 72), cy + s};
+      RECT front{cx - s, cy - s + MulDiv(2, g.dpi, 72), cx + s, cy + s};
+      MoveToEx(dc, back.left, back.top + s, nullptr);
+      LineTo(dc, back.right, back.top + s);
+      MoveToEx(dc, back.right - MulDiv(2, g.dpi, 72), back.top, nullptr);
+      LineTo(dc, back.right, back.top);
+      MoveToEx(dc, back.right, back.top, nullptr);
+      LineTo(dc, back.right, back.bottom);
+      MoveToEx(dc, front.left, front.top, nullptr);
+      LineTo(dc, front.right, front.top);
+      MoveToEx(dc, front.left, front.top, nullptr);
+      LineTo(dc, front.left, front.bottom);
+      MoveToEx(dc, front.left, front.bottom, nullptr);
+      LineTo(dc, front.right, front.bottom);
+      MoveToEx(dc, front.right, front.top, nullptr);
+      LineTo(dc, front.right, front.bottom);
+    }
+    else
+    {
+      RECT box{cx - s, cy - s + MulDiv(1, g.dpi, 72), cx + s, cy + s};
+      MoveToEx(dc, box.left, box.top, nullptr);
+      LineTo(dc, box.right, box.top);
+      MoveToEx(dc, box.left, box.top, nullptr);
+      LineTo(dc, box.left, box.bottom);
+      MoveToEx(dc, box.right, box.top, nullptr);
+      LineTo(dc, box.right, box.bottom);
+      MoveToEx(dc, box.left, box.bottom, nullptr);
+      LineTo(dc, box.right, box.bottom);
+    }
+  }
+  else
+  {
+    const int s = MulDiv(4, g.dpi, 72);
+    MoveToEx(dc, cx - s, cy - s, nullptr);
+    LineTo(dc, cx + s, cy + s);
+    MoveToEx(dc, cx - s, cy + s, nullptr);
+    LineTo(dc, cx + s, cy - s);
+  }
+  SelectObject(dc, was);
+  DeleteObject(pen);
+}
+
+static void DrawCapMacGlyph(HDC dc, int i, RECT rc)
+{
+  const int cx = (rc.left + rc.right) / 2;
+  const int cy = (rc.top + rc.bottom) / 2;
+  const int s = MulDiv(2, g.dpi, 72);
+  HPEN pen = CreatePen(PS_SOLID, 1, RGB(0x40, 0x20, 0x10));
+  HPEN was = (HPEN)SelectObject(dc, pen);
+  if (i == CAPB_MIN)
+  {
+    MoveToEx(dc, cx - s, cy, nullptr);
+    LineTo(dc, cx + s, cy);
+  }
+  else if (i == CAPB_MAX)
+  {
+    MoveToEx(dc, cx - s, cy, nullptr);
+    LineTo(dc, cx + s, cy);
+    MoveToEx(dc, cx, cy - s, nullptr);
+    LineTo(dc, cx, cy + s);
+  }
+  else
+  {
+    MoveToEx(dc, cx - s, cy - s, nullptr);
+    LineTo(dc, cx + s, cy + s);
+    MoveToEx(dc, cx - s, cy + s, nullptr);
+    LineTo(dc, cx + s, cy - s);
+  }
+  SelectObject(dc, was);
+  DeleteObject(pen);
+}
+
+static void PaintCaption(HDC dc, HWND hw, bool active)
+{
+  LayoutCaption(hw);
+  const UiTheme& th = ThemeNow();
+  const RECT band = g_cap.band;
+  RECT capBtn[CAPB_COUNT];
+  for (int i = 0; i < CAPB_COUNT; ++i) capBtn[i] = g_cap.btn[i];
+  const COLORREF top = active ? th.capTop : th.card;
+  const COLORREF bot = active ? th.capBottom : th.card;
+  const COLORREF fg = active ? th.capText : th.textDim;
+  const COLORREF glyph = active ? th.capGlyph : th.textDim;
+
+  // Band background: vertical gradient, or a flat fill when both stops match.
+  if (top == bot)
+  {
+    CapBrushRect(dc, band, top);
+  }
+  else
+  {
+    for (int y = band.top; y < band.bottom; ++y)
+    {
+      const int t = (band.bottom - band.top) > 1
+                        ? MulDiv(y - band.top, 255, band.bottom - band.top - 1)
+                        : 0;
+      const int rr = GetRValue(top) + MulDiv(GetRValue(bot) - GetRValue(top), t, 255);
+      const int gg = GetGValue(top) + MulDiv(GetGValue(bot) - GetGValue(top), t, 255);
+      const int bb = GetBValue(top) + MulDiv(GetBValue(bot) - GetBValue(top), t, 255);
+      HBRUSH lb = CreateSolidBrush(RGB(rr, gg, bb));
+      RECT lr{band.left, y, band.right, y + 1};
+      FillRect(dc, &lr, lb);
+      DeleteObject(lb);
+    }
+  }
+
+  HPEN line = CreatePen(PS_SOLID, 1, th.capLine);
+  HPEN wasp = (HPEN)SelectObject(dc, line);
+  MoveToEx(dc, band.left, band.bottom - 1, nullptr);
+  LineTo(dc, band.right, band.bottom - 1);
+  SelectObject(dc, wasp);
+  DeleteObject(line);
+
+  // Caption buttons
+  if (th.capStyle == CAP_MAC)
+  {
+    static const COLORREF macColors[CAPB_COUNT] = {RGB(0xFE, 0xBC, 0x2E),
+                                                   RGB(0x28, 0xC8, 0x40),
+                                                   RGB(0xFF, 0x5F, 0x57)};
+    for (int i = 0; i < CAPB_COUNT; ++i)
+    {
+      RECT r = capBtn[i];
+      HBRUSH b = CreateSolidBrush(macColors[i]);
+      HBRUSH wb = (HBRUSH)SelectObject(dc, b);
+      HPEN nopen = (HPEN)GetStockObject(NULL_PEN);
+      HPEN wp2 = (HPEN)SelectObject(dc, nopen);
+      Ellipse(dc, r.left, r.top, r.right, r.bottom);
+      SelectObject(dc, wb);
+      SelectObject(dc, wp2);
+      DeleteObject(b);
+      if (g_cap.hover[i] || g_cap.down[i]) DrawCapMacGlyph(dc, i, r);
+    }
+  }
+  else
+  {
+    for (int i = 0; i < CAPB_COUNT; ++i)
+    {
+      RECT r = capBtn[i];
+      if (g_cap.hover[i] || g_cap.down[i])
+        CapBrushRect(dc, r, g_cap.down[i] ? th.card : th.capBtnHover);
+      DrawCapGlyph(dc, i, glyph, r);
+    }
+  }
+
+  // App icon + title, inset past whichever controls lead the band.
+  HICON ic = (HICON)SendMessageW(hw, WM_GETICON, ICON_SMALL, 0);
+  if (!ic) ic = LoadIconW(g.inst, MAKEINTRESOURCEW(101));
+  const int pad = MulDiv(8, g.dpi, 72);
+  int tx = band.left + pad;
+  if (th.capStyle == CAP_MAC)
+    tx = capBtn[CAPB_MAX].right + MulDiv(8, g.dpi, 72);
+  if (ic)
+  {
+    const int isz = MulDiv(16, g.dpi, 72);
+    const int iy = band.top + (CaptionHeight() - isz) / 2;
+    DrawIconEx(dc, tx, iy, ic, isz, isz, 0, nullptr, DI_NORMAL);
+    tx += isz + MulDiv(6, g.dpi, 72);
+  }
+  wchar_t title[256] = {};
+  GetWindowTextW(hw, title, 256);
+  RECT tr{tx, band.top, capBtn[CAPB_MIN].left - pad, band.bottom};
+  if (th.capStyle == CAP_MAC) tr.right = band.right - pad;
+  if (tr.right > tr.left)
+  {
+    SetBkMode(dc, TRANSPARENT);
+    SetTextColor(dc, fg);
+    HFONT tf = CreateFontW(-MulDiv(9, g.dpi, 72), 0, 0, 0, FW_SEMIBOLD, FALSE,
+                           FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS,
+                           CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
+                           DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI");
+    HFONT wasf = (HFONT)SelectObject(dc, tf);
+    DrawTextW(dc, title, -1, &tr,
+              DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS |
+                  DT_NOPREFIX);
+
+    // A quip from the universe, centred in whatever the title left free. Only
+    // drawn when there is genuinely room for it, so a long document name can
+    // never be pushed into the caption buttons.
+    if (!g_capPhrase.empty())
+    {
+      RECT calc{};
+      DrawTextW(dc, title, -1, &calc,
+                DT_CALCRECT | DT_SINGLELINE | DT_NOPREFIX);
+      const int freeL = tr.left + (calc.right - calc.left) + MulDiv(18, g.dpi, 72);
+      const int freeR = tr.right;
+      RECT pc{};
+      DrawTextW(dc, g_capPhrase.c_str(), -1, &pc,
+                DT_CALCRECT | DT_SINGLELINE | DT_NOPREFIX);
+      const int pw = pc.right - pc.left;
+      if (freeR - freeL > pw + MulDiv(18, g.dpi, 72))
+      {
+        RECT pr{0, band.top, 0, band.bottom};
+        pr.left = freeL + (freeR - freeL - pw) / 2;
+        pr.right = pr.left + pw;
+        // Sit back from the title: an aside, not a second title.
+        COLORREF qc = active ? th.textDim : th.textDim;
+        if (!th.dark) qc = RGB((GetRValue(qc) + 0xF0) / 2,
+                               (GetGValue(qc) + 0xF0) / 2,
+                               (GetBValue(qc) + 0xF0) / 2);
+        SetTextColor(dc, qc);
+        DrawTextW(dc, g_capPhrase.c_str(), -1, &pr,
+                  DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+      }
+    }
+
+    SelectObject(dc, wasf);
+    DeleteObject(tf);
+  }
+}
+
+// Non-client mouse messages arrive in screen coordinates; the caption keeps
+// window-relative ones.
+static POINT CapWindowPoint(HWND hw, int sx, int sy)
+{
+  RECT wr{};
+  GetWindowRect(hw, &wr);
+  return POINT{sx - wr.left, sy - wr.top};
+}
+
+static int CapHitTest(HWND hw, int sx, int sy)
+{
+  const POINT p = CapWindowPoint(hw, sx, sy);
+  for (int i = 0; i < CAPB_COUNT; ++i)
+    if (PtInRect(&g_cap.btn[i], p)) return i;
+  return -1;
+}
+
+static void CapClick(HWND hw, int hit)
+{
+  if (hit == CAPB_MIN) PostMessageW(hw, WM_SYSCOMMAND, SC_MINIMIZE, 0);
+  else if (hit == CAPB_MAX)
+    PostMessageW(hw, WM_SYSCOMMAND, IsZoomed(hw) ? SC_RESTORE : SC_MAXIMIZE, 0);
+  else PostMessageW(hw, WM_SYSCOMMAND, SC_CLOSE, 0);
+}
+
+// Returns true when the hover state actually changed, so the caller can swallow
+// the message instead of passing it on.
+static bool CapTrackHover(HWND hw, int sx, int sy)
+{
+  LayoutCaption(hw);
+  const POINT p = CapWindowPoint(hw, sx, sy);
+  const int hit = p.y < g_cap.band.bottom ? CapHitTest(hw, sx, sy) : -1;
+  bool changed = false;
+  for (int i = 0; i < CAPB_COUNT; ++i)
+  {
+    const bool on = (i == hit);
+    if (g_cap.hover[i] != on) { g_cap.hover[i] = on; changed = true; }
+  }
+  if (changed) InvalidateCaption();
+  return changed;
+}
+
+static bool CapClearHover()
+{
+  bool changed = false;
+  for (int i = 0; i < CAPB_COUNT; ++i)
+    if (g_cap.hover[i]) { g_cap.hover[i] = false; changed = true; }
+  return changed;
 }
 
 static LRESULT CALLBACK FrameProc(HWND hw, UINT msg, WPARAM wp, LPARAM lp)
@@ -4368,8 +6005,88 @@ static LRESULT CALLBACK FrameProc(HWND hw, UINT msg, WPARAM wp, LPARAM lp)
   {
     case WM_GETICON:
       return (LRESULT)LoadIconW(g.inst, MAKEINTRESOURCEW(101));
+    case WM_NCPAINT:
+    {
+      // DefWindowProc paints the frame and the system menu bar - suppressing it
+      // is what left the menu text blank until a hover forced a repaint. Our
+      // caption then has to go down inside the same non-client paint cycle:
+      // DWM throws away frame pixels drawn on a GetWindowDC outside BeginPaint.
+      const LRESULT r = DefWindowProcW(hw, msg, wp, lp);
+      PAINTSTRUCT ps{};
+      HDC dc = BeginPaint(hw, &ps);
+      PaintCaption(dc, hw, g_cap.active);
+      EndPaint(hw, &ps);
+      return r;
+    }
+    case WM_NCACTIVATE:
+      g_cap.active = (wp != FALSE);
+      InvalidateCaption();
+      return DefWindowProcW(hw, msg, wp, lp);
+    case WM_NCMOUSEMOVE:
+    {
+      if (CapTrackHover(hw, GET_X_LPARAM(lp), GET_Y_LPARAM(lp)))
+        return 0;
+      return DefWindowProcW(hw, msg, wp, lp);
+    }
+    case WM_NCMOUSELEAVE:
+      if (CapClearHover())
+      {
+        InvalidateCaption();
+        return 0;
+      }
+      return 0;
+    case WM_NCLBUTTONDOWN:
+    {
+      const int hit = CapHitTest(hw, GET_X_LPARAM(lp), GET_Y_LPARAM(lp));
+      if (hit >= 0)
+      {
+        g_cap.down[hit] = true;
+        g_cap.drag = true;
+        InvalidateCaption();
+        return 0;  // swallow so the window never drags from a button
+      }
+      return DefWindowProcW(hw, msg, wp, lp);  // HTCAPTION: drag + snap
+    }
+    case WM_NCLBUTTONUP:
+    {
+      const int hit = CapHitTest(hw, GET_X_LPARAM(lp), GET_Y_LPARAM(lp));
+      const bool wasDown = g_cap.drag;
+      g_cap.drag = false;
+      for (int i = 0; i < CAPB_COUNT; ++i) g_cap.down[i] = false;
+      InvalidateCaption();
+      if (wasDown)
+      {
+        if (hit >= 0 && g_cap.hover[hit]) CapClick(hw, hit);
+        return 0;
+      }
+      return DefWindowProcW(hw, msg, wp, lp);
+    }
+    case WM_CAPTURECHANGED:
+      g_cap.drag = false;
+      for (int i = 0; i < CAPB_COUNT; ++i) g_cap.down[i] = false;
+      return 0;
+    case WM_SYSCOMMAND:
+      if ((wp & 0xFFF0) == SC_CLOSE) LayoutCaption(hw);
+      break;
     case WM_CREATE:
     {
+      // Publish the frame handle first: AddTip() registers tools against
+      // g.frame, and BuildToolbar() runs later in this same handler.
+      g.frame = hw;
+      // Styles below are the documented values; this SDK's CommCtrl.h does not
+      // expose the TTS_NOFOCUS / TWS_ALPHA names.
+      g.tips = CreateWindowExW(WS_EX_TRANSPARENT, TOOLTIPS_CLASSW, nullptr,
+                               WS_POPUP | 0x00020000 /*TTS_NOFOCUS*/ |
+                                   0x00000020 /*TWS_ALPHA*/,
+                               0, 0, 0, 0, hw, nullptr, g.inst, nullptr);
+      if (g.tips)
+      {
+        SendMessageW(g.tips, TTM_SETDELAYTIME, TTDT_AUTOMATIC, 400);
+        SendMessageW(g.tips, TTM_SETDELAYTIME, TTDT_RESHOW, 120);
+        SendMessageW(g.tips, TTM_SETDELAYTIME, TTDT_INITIAL, 600);
+        SendMessageW(g.tips, TTM_SETMAXTIPWIDTH, 0, 320);
+      }
+
       g.tabbar = CreateWindowExW(0, L"SKTabBar", nullptr, WS_CHILD | WS_VISIBLE,
                                  0, 0, 600, TAB_H, hw, nullptr, g.inst, nullptr);
       g.toolbar = CreateWindowExW(0, L"SKToolbar", nullptr, WS_CHILD | WS_VISIBLE,
@@ -4382,10 +6099,18 @@ static LRESULT CALLBACK FrameProc(HWND hw, UINT msg, WPARAM wp, LPARAM lp)
                                    0, RIB_H, g.thumbsW, PANE_TAB_H,
                                    hw, nullptr, g.inst, nullptr);
       int ha = std::max(30, g.thumbsW / 2 - 4);
-      MakeBtn(g.paneTabs, ID_PANE_THUMBS, L"Page Thumbnails",
-              2, 3, ha, 20, true);
-      MakeBtn(g.paneTabs, ID_PANE_BOOKMARKS, L"Bookmarks",
-              g.thumbsW - ha - 2, 3, ha, 20, true);
+      HWND ht = MakeBtn(g.paneTabs, ID_PANE_THUMBS, L"Thumbnails",
+                        2, 3, ha, 20, true);
+      HWND hb = MakeBtn(g.paneTabs, ID_PANE_BOOKMARKS, L"Bookmarks",
+                        g.thumbsW - ha - 2, 3, ha, 20, true);
+      for (HWND h : {ht, hb})
+      {
+        Btn* pb = reinterpret_cast<Btn*>(GetWindowLongPtrW(h, GWLP_USERDATA));
+        if (pb) pb->icon = (GetWindowLongPtrW(h, GWLP_ID) == ID_PANE_THUMBS)
+                               ? wchar_t(0xE8B9) : wchar_t(0xE8A4);
+      }
+      AddTip(ht, L"Show page thumbnails in the sidebar");
+      AddTip(hb, L"Show the document bookmark outline in the sidebar");
 
       g.thumbs = CreateWindowExW(0, L"SKThumbs", nullptr, WS_CHILD | WS_VISIBLE |
                                  WS_VSCROLL, 0, RIB_H + PANE_TAB_H,
@@ -4435,9 +6160,29 @@ static LRESULT CALLBACK FrameProc(HWND hw, UINT msg, WPARAM wp, LPARAM lp)
         NMTREEVIEWW* tv = reinterpret_cast<NMTREEVIEWW*>(lp);
         if (tv)
         {
-          LRESULT page = tv->itemNew.lParam - 1;
-          if (page >= 0 && page < g.pageCount)
-            GotoPageIndex((int)page);
+          const LPARAM key = tv->itemNew.lParam;
+          if (key < 0)
+          {
+            // pending bookmark: jump to the page and restore the saved view
+            const size_t idx = (size_t)(-key - 1);
+            if (idx < g.marks.size() && g.marks[idx].page < g.pageCount)
+            {
+              GotoPageIndex(g.marks[idx].page);
+              if (g.marks[idx].atView && g.marks[idx].zoom > 0)
+              {
+                g.zoom = std::max(0.1, std::min(8.0, g.marks[idx].zoom * 72.0 / 96.0));
+                UpdateScrollbars();
+                InvalidateRect(g.canvas, nullptr, FALSE);
+                InvalidateRect(g.status, nullptr, TRUE);
+              }
+            }
+          }
+          else
+          {
+            const LRESULT page = key - 1;
+            if (page >= 0 && page < g.pageCount)
+              GotoPageIndex((int)page);
+          }
         }
         return 0;
       }
@@ -4454,6 +6199,8 @@ static LRESULT CALLBACK FrameProc(HWND hw, UINT msg, WPARAM wp, LPARAM lp)
     {
       int w = LOWORD(lp), h = HIWORD(lp);
       if (g.toolbar) RelayoutPanes(w, h);
+      LayoutCaption(g.frame);
+      InvalidateCaption();
       return 0;
     }
     case WM_SETFOCUS:
@@ -5308,9 +7055,69 @@ check("saved %PDF header", bytes.size() > 8 &&
             std::string(bytes.end() - std::min<size_t>(16, bytes.size()),
                         bytes.end())
                   .find("%%EOF") != std::string::npos);
+    {
+      // AppendOutlines() depends on these properties of FPDF_SaveAsCopy output.
+      std::string pdf(bytes.begin(), bytes.end());
+      const size_t sx = pdf.rfind("startxref");
+      check("writer: has startxref", sx != std::string::npos);
+      size_t sp = sx != std::string::npos ? sx + 9 : 0;
+      const long long xo = sx != std::string::npos ? pdfout::ReadInt(pdf, sp) : -1;
+      check("writer: startxref in range", xo > 0 && xo < (long long)pdf.size());
+      pdfout::XrefBase base;
+      check("writer: base xref parses", pdfout::ParseBase(pdf, (size_t)xo, base));
+      check("writer: base is a classic table", base.table);
+      check("writer: base /Size found", base.size > 0);
+      check("writer: base /Root found", base.rootObj > 0);
+      check("writer: base has catalog offset", base.offs.count(base.rootObj) == 1);
+      check("writer: base offsets are valid",
+            base.offs.count(2) == 1 && base.offs[2] < pdf.size() &&
+            pdf.compare(base.offs[2], 2, "2 ") == 0);
+    }
     FPDF_DOCUMENT r = FPDF_LoadMemDocument(bytes.data(), (int)bytes.size(), nullptr);
     check("roundtrip reopen", r != nullptr);
     if (r) { checkEq("reopened has 1 page", FPDF_GetPageCount(r), 1); }
+
+    // Bookmark persistence: inject an outline, reopen, and read it back with
+    // pdfium. This is the end-to-end proof that the incremental update is valid.
+    if (r)
+    {
+      std::vector<UserBookmark> bms;
+      bms.push_back({L"Top of page", 0, false, 0, 0, 0});
+      bms.push_back({L"Mid view \u00e9\u00fc", 0, true, 72, 500, 2.5});
+      std::wstring err;
+      std::string outp(bytes.begin(), bytes.end());
+      const bool inj = AppendOutlines(outp, bms, 1, &err);
+      std::string why;
+      for (wchar_t c : err)
+        why += (c < 128) ? (char)c : '?';
+      check("outline inject ok" + (inj ? std::string() : " [" + why + "]"), inj);
+      FPDF_DOCUMENT r2 =
+          FPDF_LoadMemDocument(outp.data(), (int)outp.size(), nullptr);
+      check("outline file reopens", r2 != nullptr);
+      if (r2)
+      {
+        checkEq("reopened page count kept", FPDF_GetPageCount(r2), 1);
+        FPDF_BOOKMARK top = FPDFBookmark_GetFirstChild(r2, nullptr);
+        check("outline root exists", top != nullptr);
+        int n = 0;
+        for (FPDF_BOOKMARK bm = top; bm; bm = FPDFBookmark_GetNextSibling(r2, bm))
+        {
+          ++n;
+          wchar_t title[128] = L"";
+          FPDFBookmark_GetTitle(bm, title, 128);
+          const std::wstring got = title;
+          const std::wstring want = bms[n - 1].title;
+          std::string gs;
+          for (wchar_t c : got) gs += (c < 128) ? (char)c : '?';
+          check("outline title " + std::to_string(n) + " got[" + gs + "]", got == want);
+          FPDF_DEST dest = FPDFBookmark_GetDest(r2, bm);
+          const int pg = dest ? FPDFDest_GetDestPageIndex(r2, dest) : -1;
+          checkEq("outline dest page " + std::to_string(n), pg, bms[n - 1].page);
+        }
+        checkEq("outline item count", n, 2);
+        FPDF_CloseDocument(r2);
+      }
+    }
     if (r) FPDF_CloseDocument(r);
     FPDF_CloseDocument(d);
   }
@@ -5421,6 +7228,89 @@ check("saved %PDF header", bytes.size() > 8 &&
       checkEq("bookmark dest Details page", d1 ? FPDFDest_GetDestPageIndex(od, d1) : -1, 1);
     }
     if (od) FPDF_CloseDocument(od);
+  }
+
+  {
+    // "Bookmark this view" geometry: the viewport's top-left in page space.
+    double x = 0, y = 0, z = 0;
+    // Page fully visible, top edge at the viewport top: y = full page height.
+    ViewDestForPage(612, 792, 0, 0, 1.0, x, y, z);
+    check("viewdest: unscrolled y is page top", std::abs(y - 792.0) < 0.01);
+    check("viewdest: unscrolled x is page left", std::abs(x) < 0.01);
+    check("viewdest: 100% zoom is 96/72", std::abs(z - 96.0 / 72.0) < 0.0001);
+    // Scrolled 100 px into the page (its top edge is 100 px above the viewport).
+    ViewDestForPage(612, 792, 0, -100, 1.0, x, y, z);
+    check("viewdest: scrolled y shifts down", std::abs(y - 692.0) < 0.01);
+    // Zoom 2.0 means 200 screen px per point, so 100 px is only 50 pt.
+    ViewDestForPage(612, 792, 0, -100, 2.0, x, y, z);
+    check("viewdest: zoom halves the point offset", std::abs(y - 742.0) < 0.01);
+    check("viewdest: zoom 2 is 192/72", std::abs(z - 192.0 / 72.0) < 0.0001);
+    // Page pushed right of the viewport clamps x to the page's left edge.
+    ViewDestForPage(612, 792, 300, 0, 1.0, x, y, z);
+    check("viewdest: x clamped to page", std::abs(x) < 0.01);
+    // Page top below the viewport: the visible part starts at the page top.
+    ViewDestForPage(612, 792, 0, 100, 1.0, x, y, z);
+    check("viewdest: page below viewport anchors to page top",
+          std::abs(y - 792.0) < 0.01);
+    // Scrolled well past the page bottom clamps y to 0.
+    ViewDestForPage(612, 792, 0, -5000, 1.0, x, y, z);
+    check("viewdest: y clamped to page bottom", std::abs(y) < 0.01);
+    // A degenerate zoom must not produce infinities.
+    ViewDestForPage(612, 792, 0, 0, 0.0, x, y, z);
+    check("viewdest: zero zoom is guarded",
+          x >= 0 && x <= 612 && y >= 0 && y <= 792 && z > 0);
+  }
+
+  {
+    // Adding a bookmark to a file that already has an outline must extend the
+    // existing tree, not replace it.
+    std::string outline = MakeOutlinePdf();
+    FPDF_DOCUMENT od = FPDF_LoadMemDocument(outline.data(), (int)outline.size(), nullptr);
+    check("merge: load outline pdf", od != nullptr);
+    std::vector<unsigned char> base;
+    check("merge: serialize outline pdf", od && SaveAsString(od, base));
+    if (od) FPDF_CloseDocument(od);
+    if (!base.empty())
+    {
+      std::string merged(base.begin(), base.end());
+      std::vector<UserBookmark> bms;
+      bms.push_back({L"Added later", 1, false, 0, 0, 0});
+      std::wstring err;
+      const bool inj = AppendOutlines(merged, bms, 2, &err);
+      std::string why;
+      for (wchar_t c : err) why += (c < 128) ? (char)c : '?';
+      check("merge: inject ok" + (inj ? std::string() : " [" + why + "]"), inj);
+      FPDF_DOCUMENT m =
+          FPDF_LoadMemDocument(merged.data(), (int)merged.size(), nullptr);
+      check("merge: file reopens", m != nullptr);
+      if (m)
+      {
+        auto titleOf = [&](FPDF_BOOKMARK bm) -> std::wstring {
+          unsigned long n = FPDFBookmark_GetTitle(bm, nullptr, 0);
+          std::vector<unsigned char> raw(n + 2, 0);
+          FPDFBookmark_GetTitle(bm, raw.data(), (unsigned long)raw.size());
+          int c = (int)(n / 2) - 1;
+          if (c < 0) c = 0;
+          return std::wstring(reinterpret_cast<const wchar_t*>(raw.data()), (size_t)c);
+        };
+        FPDF_BOOKMARK t = FPDFBookmark_GetFirstChild(m, nullptr);
+        check("merge: first item kept", t && titleOf(t) == L"Cover");
+        FPDF_BOOKMARK t2 = t ? FPDFBookmark_GetNextSibling(m, t) : nullptr;
+        check("merge: second item kept", t2 && titleOf(t2) == L"Details");
+        FPDF_BOOKMARK t3 = t2 ? FPDFBookmark_GetNextSibling(m, t2) : nullptr;
+        check("merge: new item appended", t3 && titleOf(t3) == L"Added later");
+        check("merge: nothing after new item",
+              t3 && FPDFBookmark_GetNextSibling(m, t3) == nullptr);
+        FPDF_BOOKMARK nest = t2 ? FPDFBookmark_GetFirstChild(m, t2) : nullptr;
+        check("merge: nested child survived",
+              nest && titleOf(nest) == L"Details - Sub");
+        FPDF_DEST d3 = t3 ? FPDFBookmark_GetDest(m, t3) : nullptr;
+        checkEq("merge: new item dest page",
+                d3 ? FPDFDest_GetDestPageIndex(m, d3) : -1, 1);
+        checkEq("merge: page count kept", FPDF_GetPageCount(m), 2);
+        FPDF_CloseDocument(m);
+      }
+    }
   }
 
   {
@@ -6361,7 +8251,8 @@ static LRESULT CALLBACK TabBarProc(HWND hw, UINT msg, WPARAM wp, LPARAM lp)
                                   FALSE, FALSE, FALSE, DEFAULT_CHARSET,
                                   OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
                                   CLEARTYPE_QUALITY,
-                                  DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI");
+                       DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI");
+
       int x = 4;
       for (int i = 0; i < (int)g_tabs.size(); ++i)
       {
@@ -6457,12 +8348,46 @@ static LRESULT CALLBACK ToolbarProc(HWND hw, UINT msg, WPARAM wp, LPARAM lp)
       HBRUSH bg = CreateSolidBrush(th.ribbonBg);
       FillRect(dc, &rc, bg);
       DeleteObject(bg);
+      if (hw != g.toolbar) { EndPaint(hw, &ps); return 0; } // pane header etc.
 
       // brand accent strip across the very top
       HBRUSH strip = CreateSolidBrush(th.accent);
       RECT sr{0, 0, rc.right, 2};
       FillRect(dc, &sr, strip);
       DeleteObject(strip);
+
+      // Tab strip: one tab per tool group.
+      HFONT tabFont = CreateFontW(-MulDiv(10, g.dpi, 72), 0, 0, 0, FW_SEMIBOLD,
+                                  FALSE, FALSE, FALSE, DEFAULT_CHARSET,
+                                  OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+                                  CLEARTYPE_QUALITY,
+                                  DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI");
+      HFONT wasTab = (HFONT)SelectObject(dc, tabFont);
+      SetBkMode(dc, TRANSPARENT);
+      for (int i = 0; i < (int)g.ribbonTabRects.size(); ++i)
+      {
+        const RECT& tr = g.ribbonTabRects[i];
+        bool active = (i == g.ribbonTab);
+        if (active || i == g.ribbonTabHover)
+        {
+          HBRUSH tb = CreateSolidBrush(active ? th.card : th.btnHover);
+          HPEN tp = CreatePen(PS_SOLID, 1, active ? th.accent : th.cardBorder);
+          HBRUSH wb = (HBRUSH)SelectObject(dc, tb);
+          HPEN wp2 = (HPEN)SelectObject(dc, tp);
+          RoundRect(dc, tr.left, tr.top, tr.right, tr.bottom + (active ? 4 : 0),
+                    6, 6);
+          SelectObject(dc, wb);
+          SelectObject(dc, wp2);
+          DeleteObject(tb);
+          DeleteObject(tp);
+        }
+        SetTextColor(dc, active ? th.text : th.textDim);
+        RECT lr = tr;
+        DrawTextW(dc, RibbonTabName(i), -1, &lr,
+                  DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+      }
+      SelectObject(dc, wasTab);
+      DeleteObject(tabFont);
 
       for (const App::GroupBox& gb : g.groups)
       {
@@ -6477,30 +8402,20 @@ static LRESULT CALLBACK ToolbarProc(HWND hw, UINT msg, WPARAM wp, LPARAM lp)
         DeleteObject(fill);
         DeleteObject(pen);
 
-        RECT cap{card.left + 4, RIB_CAP_Y, card.right - 4, RIB_H - 2};
-        SetBkMode(dc, TRANSPARENT);
-        SetTextColor(dc, th.textDim);
-        HFONT capFont = CreateFontW(-MulDiv(8, g.dpi, 72), 0, 0, 0, FW_NORMAL,
+        // Group caption centred under the buttons, ribbon-style.
+        RECT cap{card.left, RIB_BTN_Y + RIB_BTN_H, card.right, RIB_H - 6};
+        HFONT capFont = CreateFontW(-MulDiv(9, g.dpi, 72), 0, 0, 0, FW_SEMIBOLD,
                                     FALSE, FALSE, FALSE, DEFAULT_CHARSET,
                                     OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
-                                    CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE,
-                                    L"Segoe UI");
-        HFONT was = (HFONT)SelectObject(dc, capFont);
-        DrawTextW(dc, gb.name.c_str(), -1, &cap,
-                  DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
-        SelectObject(dc, was);
-        DeleteObject(capFont);
-      }
-
-      if (GroupCount(g.ribbonTab) == 0)
-      {
+                                    CLEARTYPE_QUALITY,
+                                    DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI");
+        HFONT wasCap = (HFONT)SelectObject(dc, capFont);
         SetBkMode(dc, TRANSPARENT);
         SetTextColor(dc, th.textDim);
-        RECT trc{8, RIB_BTN_Y, rc.right - 8, RIB_CAP_Y};
-        DrawTextW(dc,
-                  L"Annotations, forms, security and advanced tools arrive in "
-                  L"later milestones.",
-                  -1, &trc, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+        DrawTextW(dc, gb.name.c_str(), -1, &cap,
+                  DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+        SelectObject(dc, wasCap);
+        DeleteObject(capFont);
       }
 
       HPEN pen = CreatePen(PS_SOLID, 1, th.cardBorder);
@@ -6509,6 +8424,37 @@ static LRESULT CALLBACK ToolbarProc(HWND hw, UINT msg, WPARAM wp, LPARAM lp)
       LineTo(dc, rc.right, rc.bottom - 1);
       DeleteObject(pen);
       EndPaint(hw, &ps);
+      return 0;
+    }
+    case WM_MOUSEMOVE:
+    {
+      if (hw != g.toolbar) return 0;
+      POINT pt{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
+      int hit = -1;
+      for (int i = 0; i < (int)g.ribbonTabRects.size(); ++i)
+        if (PtInRect(&g.ribbonTabRects[i], pt)) { hit = i; break; }
+      if (hit != g.ribbonTabHover)
+      {
+        g.ribbonTabHover = hit;
+        TRACKMOUSEEVENT tme{sizeof(tme), TME_LEAVE, hw, 0};
+        TrackMouseEvent(&tme);
+        InvalidateRect(hw, nullptr, FALSE);
+      }
+      return 0;
+    }
+    case WM_MOUSELEAVE:
+      if (g.ribbonTabHover != -1)
+      {
+        g.ribbonTabHover = -1;
+        InvalidateRect(hw, nullptr, FALSE);
+      }
+      return 0;
+    case WM_LBUTTONDOWN:
+    {
+      if (hw != g.toolbar) return 0;
+      POINT pt{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
+      for (int i = 0; i < (int)g.ribbonTabRects.size(); ++i)
+        if (PtInRect(&g.ribbonTabRects[i], pt)) { SwitchRibbonTab(i); break; }
       return 0;
     }
   }
@@ -6541,7 +8487,10 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int)
     openFile = args[1];
 
   SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
-  INITCOMMONCONTROLSEX iccex{sizeof(iccex), ICC_TREEVIEW_CLASSES};
+  PickCapPhrase();
+  INITCOMMONCONTROLSEX iccex{sizeof(iccex),
+                             ICC_TREEVIEW_CLASSES | ICC_TAB_CLASSES |
+                             ICC_BAR_CLASSES | ICC_STANDARD_CLASSES};
   InitCommonControlsEx(&iccex);
 
   ApplyInitialThemePref();
@@ -6560,10 +8509,12 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int)
   wc.lpfnWndProc = FrameProc;
   wc.hInstance = inst;
   wc.lpszClassName = L"SKFrame";
+  wc.style = CS_DBLCLKS;
   wc.hIcon = LoadIconW(inst, MAKEINTRESOURCEW(101));
   wc.hIconSm = LoadIconW(inst, MAKEINTRESOURCEW(101));
   RegisterClassExW(&wc);
 
+  wc.style = 0;  // only the frame wants double-click (caption maximise)
   wc.lpfnWndProc = ToolbarProc;
   wc.lpszClassName = L"SKToolbar";
   wc.hbrBackground = nullptr;
@@ -6602,9 +8553,30 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int)
                        CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
                        DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI");
 
+  // Ribbon icons. CreateFontW silently substitutes a face when the requested
+  // font is missing, so ask the DC which face it actually resolved.
+  g.iconFont = CreateFontW(-MulDiv(16, g.dpi, 72), 0, 0, 0, FW_NORMAL, FALSE, FALSE,
+                           FALSE, DEFAULT_CHARSET, OUT_TT_PRECIS,
+                           CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
+                           DEFAULT_PITCH | FF_DONTCARE, L"Segoe MDL2 Assets");
+  if (g.iconFont)
+  {
+    HDC probe = CreateCompatibleDC(nullptr);
+    if (probe)
+    {
+      HGDIOBJ old = SelectObject(probe, g.iconFont);
+      wchar_t face[LF_FACESIZE] = {};
+      GetTextFaceW(probe, LF_FACESIZE, face);
+      g.haveMdl2 = (lstrcmpiW(face, L"Segoe MDL2 Assets") == 0);
+      SelectObject(probe, old);
+      DeleteDC(probe);
+    }
+    if (!g.haveMdl2) { DeleteObject(g.iconFont); g.iconFont = nullptr; }
+  }
+
   FPDF_InitLibrary();
 
-  HWND frame = CreateWindowExW(0, L"SKFrame", L"Stitchup PDF Editor",
+  HWND frame = CreateWindowExW(0, L"SKFrame", kAppTitle,
                                WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN,
                                CW_USEDEFAULT, CW_USEDEFAULT,
                                1240, 820, nullptr, BuildMenu(), inst, nullptr);
@@ -6641,5 +8613,6 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int)
   g_tabs.clear();
   FPDF_DestroyLibrary();
   DeleteObject(g.font);
+  if (g.iconFont) DeleteObject(g.iconFont);
   return (int)msg.wParam;
 }

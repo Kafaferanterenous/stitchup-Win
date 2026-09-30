@@ -19,8 +19,19 @@ cmake --build build
 if errorlevel 1 exit /b 1
 
 if not exist dist mkdir dist
+rem A running instance locks dist\Stitchup.exe and copy fails silently, which
+rem leaves a stale exe in dist while the build reports success.
+taskkill /f /im Stitchup.exe >nul 2>&1
 copy /y "build\Stitchup.exe" "dist\Stitchup.exe" >nul
+if errorlevel 1 (
+  echo ERROR: could not update dist\Stitchup.exe - close any running Stitchup and retry.
+  exit /b 1
+)
 copy /y "third_party\pdfium\bin\pdfium.dll" "dist\pdfium.dll" >nul
+if errorlevel 1 (
+  echo ERROR: could not update dist\pdfium.dll
+  exit /b 1
+)
 echo.
 echo Built: dist\Stitchup.exe + dist\pdfium.dll  (portable PDF editor)
 start "" "dist\Stitchup.exe" --self-test
