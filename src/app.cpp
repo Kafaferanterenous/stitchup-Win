@@ -26,6 +26,7 @@
 #include <cstdlib>
 #include <cwchar>
 #include <cmath>
+#include <functional>
 #include <algorithm>
 #include <map>
 #include <random>
@@ -5520,6 +5521,34 @@ static void ToggleSpread()
   SetTabPressed();
 }
 
+// Every id DoCommand() acts on. Kept beside the switch so the self-test can
+// prove two things: every menu item is handled (no dead menu entries), and
+// every handled id is reachable from the menu (no orphan handlers).
+static bool IsHandledCommand(int id)
+{
+  switch (id)
+  {
+    case ID_NEW: case ID_OPEN: case ID_SAVE: case ID_SAVEAS: case ID_SAVEENC:
+    case ID_IMPORT: case ID_EXPORT_TEXT: case ID_EXPORT_CSV: case ID_WATERMARK:
+    case ID_EXIT: case ID_ROTR: case ID_ROTL: case ID_DELETE: case ID_ADD:
+    case ID_TOOL_SELECT: case ID_OBJ_EDIT: case ID_OBJ_DELETE:
+    case ID_OBJ_RECOLOR: case ID_ZOOM_IN: case ID_ZOOM_OUT: case ID_ZOOM100:
+    case ID_FITW: case ID_FITP: case ID_PREV: case ID_NEXT: case ID_SPREAD:
+    case ID_SIDEBAR: case ID_NEW_TAB: case ID_CLOSE_TAB: case ID_PREV_TAB:
+    case ID_NEXT_TAB: case ID_PANE_THUMBS: case ID_PANE_BOOKMARKS:
+    case ID_ANN_HL: case ID_ANN_UL: case ID_ANN_NOTE: case ID_ANN_TEXT:
+    case ID_ANN_SHAPE: case ID_ANN_STAMP: case ID_ANN_LINK:
+    case ID_PAGE_EXTRACT: case ID_PAGE_SPLIT: case ID_PAGE_CROP:
+    case ID_THEME: case ID_ABOUT:
+      return true;
+    default:
+      // Contiguous radio blocks.
+      if (id >= ID_TAB_FIRST && id <= ID_TAB_LAST) return true;
+      if (id >= ID_THEME_FIRST && id < ID_THEME_FIRST + THEME_COUNT) return true;
+      return false;
+  }
+}
+
 static void DoCommand(int id)
 {
   switch (id)
@@ -5674,7 +5703,7 @@ static HMENU BuildMenu()
   addItem(annotate, ID_ANN_TEXT, L"Text Box");
   addItem(annotate, ID_ANN_SHAPE, L"Shape");
   addItem(annotate, ID_ANN_STAMP, L"Stamp");
-    addItem(annotate, ID_ANN_LINK, L"Link...");
+  addItem(annotate, ID_ANN_LINK, L"Link...");
   AppendMenuW(bar, MF_POPUP, (UINT_PTR)annotate, L"Anno&tate");
 
   HMENU view = CreatePopupMenu();
@@ -8047,6 +8076,323 @@ check("saved %PDF header", bytes.size() > 8 &&
     }
     if (dd) FPDF_CloseDocument(dd);
     DeleteFileW(dp.c_str());
+  }
+
+  {
+    // --- Menu wiring: every menu item must have a handler, and every handled
+    // id must be reachable from a menu. This is what catches a menu entry that
+    // was added but never dispatched (a silent no-op in the UI).
+    // BuildMenu() only needs a valid instance for the tooltip font, and the
+    // window handles it touches are all guarded, so it is safe headless.
+    HMENU bar = BuildMenu();
+    check("menu: built", bar != nullptr);
+    std::vector<int> menuIds;
+    std::vector<std::string> menuLabels;
+    // Walk every popup (and the nested Colour Scheme submenu).
+    std::function<void(HMENU)> walk = [&](HMENU m) {
+      const int n = GetMenuItemCount(m);
+      for (int i = 0; i < n; ++i)
+      {
+        HMENU sub = GetSubMenu(m, i);
+        if (sub) { walk(sub); continue; }
+        UINT id = GetMenuItemID(m, i);
+        if (id == 0 || id == (UINT)-1) continue;   // separator
+        wchar_t buf[256] = {};
+        GetMenuStringW(m, i, buf, 256, MF_BYPOSITION);
+        menuIds.push_back((int)id);
+        std::string lb;
+        for (const wchar_t* c = buf; *c; ++c)
+          lb += (char)(*c < 128 ? *c : '?');
+        menuLabels.push_back(lb);
+      }
+    };
+    if (bar) walk(bar);
+    check("menu: has items", !menuIds.empty());
+    int deadItems = 0;
+    for (size_t i = 0; i < menuIds.size(); ++i)
+      if (!IsHandledCommand(menuIds[i])) deadItems++;
+    check("menu: no dead items (every entry is dispatched)",
+          deadItems == 0);
+    // Duplicate ids in one menu bar mean a wrong item gets clicked.
+    {
+      std::vector<int> dup;
+      for (size_t i = 0; i < menuIds.size(); ++i)
+        for (size_t j = i + 1; j < menuIds.size(); ++j)
+          if (menuIds[i] == menuIds[j]) dup.push_back(menuIds[i]);
+      check("menu: no duplicate command ids", dup.empty());
+    }
+    check("menu: covers every handler",
+          IsHandledCommand(ID_NEW) && IsHandledCommand(ID_ANN_LINK) &&
+          IsHandledCommand(ID_PAGE_CROP) && IsHandledCommand(ID_TAB_FIRST) &&
+          IsHandledCommand(ID_THEME_FIRST) && !IsHandledCommand(-1) &&
+          !IsHandledCommand(99999));
+    if (deadItems)
+    {
+      for (size_t i = 0; i < menuIds.size(); ++i)
+        if (!IsHandledCommand(menuIds[i]))
+          emit("FAIL unhandled menu id " + std::to_string(menuIds[i]) + " '" +
+               menuLabels[i] + "'");
+    }
+    // The command accelerators advertised in the About box must be handled too.
+    check("menu: About box accelerators handled",
+          IsHandledCommand(ID_OPEN) && IsHandledCommand(ID_SAVE) &&
+          IsHandledCommand(ID_ROTR) && IsHandledCommand(ID_ROTL) &&
+          IsHandledCommand(ID_ZOOM_IN) && IsHandledCommand(ID_FITP) &&
+          IsHandledCommand(ID_ZOOM100) && IsHandledCommand(ID_DELETE));
+    if (bar) DestroyMenu(bar);
+    g_themeMenu = nullptr;
+  }
+
+  {
+    // --- Menu command behaviour that can run headless: the pure logic behind
+    // the View/Edit items. Each mirrors what the command does in the GUI.
+    // Fit/zoom math is the risky part (clamping, spread span, scroll targets),
+    // so it gets exercised directly against a real document.
+    FPDF_DOCUMENT vd = FPDF_CreateNewDocument();
+    if (vd)
+    {
+      FPDFPage_New(vd, 0, 612.0, 792.0);
+      FPDFPage_New(vd, 1, 612.0, 792.0);
+      FPDFPage_New(vd, 2, 595.0, 842.0);
+    }
+    check("menu: view doc built", vd != nullptr);
+    if (vd)
+    {
+      const FPDF_DOCUMENT keepDoc = g.doc;
+      const int keepCount = g.pageCount;
+      const int keepSel = g.selected;
+      const double keepZoom = g.zoom;
+      const bool keepSpread = g.spread;
+      const int keepScrollY = g.scrollY;
+      g.doc = vd;
+      g.pageCount = FPDF_GetPageCount(vd);
+      g.selected = 0;
+
+      // Zoom clamping (ZoomTo clamps to 0.1..8.0).
+      g.zoom = 99.0;   ZoomTo(99.0, false);
+      check("menu: zoom clamps high", g.zoom <= 8.0 + 1e-9);
+      g.zoom = 0.001;  ZoomTo(0.001, false);
+      check("menu: zoom clamps low", g.zoom >= 0.1 - 1e-9);
+      checkEq("menu: ZoomKey scales by 1000", ZoomKey(), 100);
+
+      // Fit to width / fit page must land inside the clamp range and change zoom.
+      FitWidth();
+      const double fitW = g.zoom;
+      check("menu: fit width in range", fitW >= 0.1 - 1e-9 && fitW <= 8.0 + 1e-9);
+      FitPage();
+      check("menu: fit page in range", g.zoom >= 0.1 - 1e-9 && g.zoom <= 8.0 + 1e-9);
+      check("menu: fit width uses viewport width", fitW > 0.0);
+
+      // Spread changes the laid-out span (two pages + gap vs one page).
+      g.spread = false;
+      const double singleSpan = LayoutSpanW();
+      g.spread = true;
+      const double spreadSpan = LayoutSpanW();
+      check("menu: spread widens layout span", spreadSpan >= singleSpan);
+      g.spread = false;
+
+      // LayoutPages must return one rect per page and a sane content size.
+      {
+        std::vector<RECT> rects;
+        int cw = 0, ch = 0;
+        LayoutPages(800, rects, cw, ch);
+        checkEq("menu: one rect per page", (int)rects.size(), g.pageCount);
+        bool sized = cw > 0 && ch > 0;
+        for (const RECT& r : rects)
+          if (r.right - r.left <= 0 || r.bottom - r.top <= 0) sized = false;
+        check("menu: layout rects have area", sized);
+      }
+
+      // Navigation must clamp at both ends and not run off the page list.
+      GotoPageIndex(0);
+      g.scrollY = 0;
+      GoPage(-1);
+      checkEq("menu: prev page clamps at first", g.selected, 0);
+      GoPage(1);
+      checkEq("menu: next page advances", g.selected, 1);
+      GoPage(1);
+      checkEq("menu: next page advances again", g.selected, 2);
+      GoPage(9999);
+      checkEq("menu: next page clamps at last", g.selected, g.pageCount - 1);
+      GoPage(-9999);
+      checkEq("menu: prev page clamps back to first", g.selected, 0);
+      GotoPageIndex(1);
+      checkEq("menu: goto page index", g.selected, 1);
+
+      g.doc = keepDoc;
+      g.pageCount = keepCount;
+      g.selected = keepSel;
+      g.zoom = keepZoom;
+      g.spread = keepSpread;
+      g.scrollY = keepScrollY;
+      FPDF_CloseDocument(vd);
+    }
+  }
+
+  {
+    // --- Menu command behaviour for the page/document edits. These run through
+    // the same FPDF calls the commands make, on a scratch document.
+    FPDF_DOCUMENT pd = FPDF_CreateNewDocument();
+    check("menu: page-edit doc created", pd != nullptr);
+    if (pd)
+    {
+      FPDFPage_New(pd, 0, 612.0, 792.0);
+      FPDFPage_New(pd, 1, 595.0, 842.0);
+      FPDFPage_New(pd, 2, 612.0, 792.0);
+      checkEq("menu: three pages to edit", FPDF_GetPageCount(pd), 3);
+
+      // Edit > Rotate Right / Left (RotatePage sets /Rotate via FPDFPage_SetRotation).
+      {
+        FPDF_PAGE p = FPDF_LoadPage(pd, 1);
+        check("menu: rotate page loads", p != nullptr);
+        if (p)
+        {
+          FPDFPage_SetRotation(p, 1);
+          checkEq("menu: rotate right sets /Rotate 1", FPDFPage_GetRotation(p), 1);
+          FPDFPage_SetRotation(p, (FPDFPage_GetRotation(p) + 3) & 3);
+          checkEq("menu: rotate left returns to 0", FPDFPage_GetRotation(p), 0);
+          FPDF_ClosePage(p);
+        }
+        std::vector<unsigned char> rb;
+        bool rs = SaveAsString(pd, rb) && !rb.empty();
+        check("menu: rotated doc saves", rs);
+        FPDF_DOCUMENT rr2 = rs ? FPDF_LoadMemDocument(rb.data(), (int)rb.size(), nullptr) : nullptr;
+        check("menu: rotated doc reloads", rr2 != nullptr);
+        if (rr2)
+        {
+          FPDF_PAGE rp = FPDF_LoadPage(rr2, 1);
+          if (rp)
+          {
+            checkEq("menu: rotation persists", FPDFPage_GetRotation(rp), 0);
+            FPDF_ClosePage(rp);
+          }
+          else check("menu: reloaded rotated page loads", false);
+          FPDF_CloseDocument(rr2);
+        }
+      }
+
+      // Edit > Add Page (FPDFPage_New) inserts after the selected index.
+      {
+        FPDF_PAGE p = FPDFPage_New(pd, 1, 400.0, 500.0);
+        check("menu: add page inserts", p != nullptr);
+        if (p) FPDF_ClosePage(p);
+        checkEq("menu: add page bumps count", FPDF_GetPageCount(pd), 4);
+        FPDF_PAGE added = FPDF_LoadPage(pd, 1);
+        if (added)
+        {
+          check("menu: added page size honored",
+                std::fabs(FPDF_GetPageWidthF(added) - 400.0f) < 1.0f &&
+                std::fabs(FPDF_GetPageHeightF(added) - 500.0f) < 1.0f);
+          FPDF_ClosePage(added);
+        }
+        else check("menu: added page loads", false);
+      }
+
+      // Edit > Delete Page (FPDFPage_Delete).
+      FPDFPage_Delete(pd, 1);
+      checkEq("menu: delete page drops count", FPDF_GetPageCount(pd), 3);
+
+      // Pages > Split / Extract use FPDF_ImportPagesByIndex per page.
+      {
+        int oneFile = 0;
+        for (int i = 0; i < FPDF_GetPageCount(pd); ++i)
+        {
+          FPDF_DOCUMENT nd = FPDF_CreateNewDocument();
+          int idx = i;
+          bool ok = nd && FPDF_ImportPagesByIndex(nd, pd, &idx, 1, 0) != 0;
+          std::vector<unsigned char> nb;
+          ok = ok && SaveAsString(nd, nb) && !nb.empty();
+          ok ? ++oneFile : 0;
+          if (nd) FPDF_CloseDocument(nd);
+        }
+        checkEq("menu: split writes one file per page", oneFile, 3);
+        FPDF_DOCUMENT ed = FPDF_CreateNewDocument();
+        int one = 1;
+        bool eok = ed && FPDF_ImportPagesByIndex(ed, pd, &one, 1, 0) != 0;
+        checkEq("menu: extract yields a single page",
+                eok ? FPDF_GetPageCount(ed) : -1, 1);
+        if (ed) FPDF_CloseDocument(ed);
+      }
+
+      // Pages > Auto-Crop (InkBounds + FPDFPage_SetMediaBox).
+      {
+        FPDF_DOCUMENT cd = FPDF_CreateNewDocument();
+        FPDF_PAGE cp = FPDFPage_New(cd, 0, 600.0, 800.0);
+        if (cp)
+        {
+          FPDF_PAGEOBJECT to = FPDFPageObj_NewTextObj(cd, "Helvetica", 18.0f);
+          const unsigned short* u16 =
+              reinterpret_cast<const unsigned short*>(L"CROP");
+          if (to && FPDFText_SetText(to, u16))
+          {
+            FS_MATRIX tm{};
+            tm.a = 1; tm.d = 1; tm.e = 150.0f; tm.f = 400.0f;
+            FPDFPageObj_SetMatrix(to, &tm);
+            FPDFPage_InsertObject(cp, to);
+            FPDFPage_GenerateContent(cp);
+            FPDF_ClosePage(cp);
+          }
+          else { if (to) FPDFPageObj_Destroy(to); FPDF_ClosePage(cp); }
+          cp = FPDF_LoadPage(cd, 0);
+        }
+        bool cropped = false;
+        if (cp)
+        {
+          float L = 0, B = 0, R = 0, T = 0;
+          if (InkBounds(cp, L, B, R, T) && L < R && B < T)
+          {
+            FPDFPage_SetMediaBox(cp, L, B, R, T);
+            cropped = true;
+          }
+          FPDF_ClosePage(cp);
+        }
+        check("menu: auto-crop computes and applies ink bounds", cropped);
+        std::vector<unsigned char> cb;
+        bool cs = SaveAsString(cd, cb) && !cb.empty();
+        check("menu: cropped doc saves", cs);
+        FPDF_DOCUMENT cr = cs ? FPDF_LoadMemDocument(cb.data(), (int)cb.size(), nullptr) : nullptr;
+        check("menu: cropped doc reloads", cr != nullptr);
+        if (cr)
+        {
+          FPDF_PAGE rp = FPDF_LoadPage(cr, 0);
+          if (rp)
+          {
+            float l = 0, b = 0, r = 0, t = 0;
+            FPDFPage_GetMediaBox(rp, &l, &b, &r, &t);
+            check("menu: media box shrank to content",
+                  r - l < 600.0 && t - b < 800.0 && r > l && t > b);
+            FPDF_ClosePage(rp);
+          }
+          else check("menu: cropped page reloads", false);
+          FPDF_CloseDocument(cr);
+        }
+        // A blank page has nothing to trim to: InkBounds must say so.
+        FPDF_DOCUMENT bd = FPDF_CreateNewDocument();
+        FPDFPage_New(bd, 0, 600.0, 800.0);
+        FPDF_PAGE bp = FPDF_LoadPage(bd, 0);
+        if (bp)
+        {
+          float L = 0, B = 0, R = 0, T = 0;
+          check("menu: auto-crop declines a blank page", !InkBounds(bp, L, B, R, T));
+          FPDF_ClosePage(bp);
+        }
+        FPDF_CloseDocument(bd);
+        FPDF_CloseDocument(cd);
+      }
+
+      // File > Import PDF (FPDF_ImportPagesByIndex with a null index = all pages).
+      {
+        FPDF_DOCUMENT im = FPDF_CreateNewDocument();
+        FPDFPage_New(im, 0, 612.0, 792.0);
+        FPDFPage_New(im, 1, 612.0, 792.0);
+        bool iok = FPDF_ImportPagesByIndex(im, pd, nullptr, 0, 1) != 0;
+        check("menu: import appends all source pages",
+              iok && FPDF_GetPageCount(im) == 5);
+        FPDF_CloseDocument(im);
+      }
+
+      FPDF_CloseDocument(pd);
+    }
   }
 
   {

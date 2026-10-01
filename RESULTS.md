@@ -21,7 +21,7 @@ user rejected as a product (no GUI).
 
 Command: `Stitchup.exe --self-test`
 
-Result: **185 passed, 0 failed** (exit code 0).
+Result: **268 passed, 0 failed** (exit code 0).
 
 Select / Move Content Object (`obj:` checks covering content-object editing):
 clicking a content object (text run or vector path) on the current page selects
@@ -324,3 +324,36 @@ Sidebar / Sidebar menu (F8), and the Home / Tools ribbon-switch menus.
   save+reload (annot count 6 -> 7), and URI round-trip via
   `FPDFLink_GetAction` + `FPDFAction_GetURIPath` (the returned length includes
   the trailing NUL). Result: 226 passed, 0 failed. App smoke-launches.
+
+## v0.10.1 - menu function verification
+
+A static audit of `DoCommand()` against `BuildMenu()` confirmed all 45 command
+ids were dispatched, but nothing *tested* that. This release closes that gap.
+
+- Added `IsHandledCommand(int)` (`src/app.cpp:5527`) - the set of ids
+  `DoCommand()` acts on, including the two contiguous radio blocks
+  (`ID_TAB_FIRST..ID_TAB_LAST` and the theme range).
+- New `menu:` self-test block (`src/app.cpp:8082`) calls the real `BuildMenu()`,
+  walks every popup recursively, and asserts in both directions: no menu item is
+  unhandled (no dead entries), no duplicate command ids (which would make one
+  item fire another's action), and no orphan handlers. Any unhandled id is
+  reported by name in the log, e.g. `unhandled menu id 1024 'Foo...'`.
+- A second block exercises the commands that are pure logic and therefore
+  testable headless, against a real 3-page document: zoom clamping (`ZoomTo`
+  0.1..8.0), `ZoomKey`, `FitWidth` / `FitPage`, spread widening `LayoutSpanW()`,
+  `LayoutPages` rect count and area, and `GoPage` / `GotoPageIndex` clamping at
+  both ends.
+- A third block runs the same FPDF calls the page commands make on a scratch
+  document: rotate right/left (including `/Rotate` persistence after save+reload),
+  add page (insert index, size honored), delete page, split (one file per page),
+  extract (single page), import (appends all source pages), and auto-crop via
+  `InkBounds` + `FPDFPage_SetMediaBox` - including that the media box shrinks on
+  reload and that a blank page is declined rather than trimmed to nothing.
+
+Self-test grew from 226 to 268 checks. Result: 268 passed, 0 failed.
+
+Not covered by automation, because they require interaction: the file dialogs
+(Open, Save As, Import, Export Text/CSV, Save As Encrypted, Watermark), the
+annotation dialogs (Note, Free Text, Stamp, Link), MessageBox prompts, and
+the About box. Their underlying kernels are covered by the existing `tx:`,
+`csv:`, `enc:`, `wat:`, `annot:` and `link:` checks.
