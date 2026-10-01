@@ -124,7 +124,7 @@ enum
 
 // App identity shown in the title bar. The open file's name already lives on
 // the document tab below the title bar, so it is not repeated in the caption.
-const wchar_t* const kAppTitle = L"Stitchup PDF Editor  v0.12.0";
+const wchar_t* const kAppTitle = L"Stitchup PDF Editor  v0.12.1";
 
 // ---------------------------------------------------------------------------
 // Application state
@@ -1028,21 +1028,53 @@ static void RestoreTab(int i)
 static void CloseTab(int i)
 {
   if (i < 0 || i >= (int)g_tabs.size()) return;
+
+  // Keep the active tab's record current before we touch the vector.
   SnapshotCurrentTab();
-  TabDoc t = g_tabs[i];
+  const bool closingCurrent = (i == g_curTab);
+
+  // Take ownership of the document we are about to drop, then remove the entry
+  // so nothing else can reach it.
+  FPDF_DOCUMENT closed = g_tabs[i].doc;
   g_tabs.erase(g_tabs.begin() + i);
-  if (t.doc) FPDF_CloseDocument(t.doc);
+
   if (g_tabs.empty())
   {
-    CloseDoc();
+    // Detach the live pointer first: CloseDoc() closes g.doc, so leaving the
+    // just-closed handle in place would free it a second time.
+    g.doc = nullptr;
+    g.path.clear();
+    g.name.clear();
+    g.dirty = false;
     g_curTab = -1;
+    if (closed) FPDF_CloseDocument(closed);
+    CloseDoc();
     if (g.frame) SetWindowTextW(g.frame, kAppTitle);
     RefreshTabBar();
     return;
   }
-  int next = i;
-  if (next >= (int)g_tabs.size()) next = (int)g_tabs.size() - 1;
-  RestoreTab(next);
+
+  if (closed) FPDF_CloseDocument(closed);
+
+  if (closingCurrent)
+  {
+    // g.doc pointed at the tab we just closed; drop it and load a survivor.
+    // g_curTab = -1 stops RestoreTab's leading SnapshotCurrentTab from writing
+    // the dead handle into an unrelated slot.
+    g.doc = nullptr;
+    g_curTab = -1;
+    int next = i;
+    if (next >= (int)g_tabs.size()) next = (int)g_tabs.size() - 1;
+    RestoreTab(next);
+  }
+  else
+  {
+    // A background tab closed; the live document is untouched, only fix up the
+    // active index when the removed slot sat before it.
+    if (g_curTab > i) --g_curTab;
+    RefreshTabBar();
+    if (g.status) InvalidateRect(g.status, nullptr, TRUE);
+  }
 }
 
 static void SetActiveTab(int i)
@@ -7501,6 +7533,66 @@ static void SelfTest(const std::wstring& cwd)
 
   FPDF_InitLibrary();
   check("library init", true);
+
+  {
+    // --- Tab lifecycle. Closing the active tab used to free its document twice
+    // (CloseTab then CloseDoc) and leave g.doc dangling, which crashed when the
+    // tab-bar X was clicked. Exercise every close case: active with survivors,
+    // background, and the final tab.
+    std::vector<TabDoc> keepTabs = g_tabs;
+    const int keepCur = g_curTab;
+    const FPDF_DOCUMENT keepDocT = g.doc;
+    const std::wstring keepPathT = g.path, keepNameT = g.name;
+    const bool keepDirtyT = g.dirty;
+    const int keepPagesT = g.pageCount, keepSelT = g.selected;
+    const double keepZoomT = g.zoom;
+    const int keepSxT = g.scrollX, keepSyT = g.scrollY;
+
+    g_tabs.clear();
+    g_curTab = -1;
+    for (int k = 0; k < 3; ++k)
+    {
+      TabDoc td;
+      td.doc = FPDF_CreateNewDocument();
+      FPDFPage_New(td.doc, 0, 612.0, 792.0);
+      td.name = L"tab" + std::to_wstring(k) + L".pdf";
+      td.pageCount = 1;
+      g_tabs.push_back(td);
+    }
+    g.doc = g_tabs[0].doc;
+    g_curTab = 0;
+    g.pageCount = 1;
+    g.selected = 0;
+    const FPDF_DOCUMENT survivor = g_tabs[1].doc;
+
+    CloseTab(0);   // close the active tab, two survivors remain
+    check("tab: close active keeps others", g_tabs.size() == 2);
+    check("tab: active index stays valid", g_curTab >= 0 && g_curTab < 2);
+    check("tab: no dangling doc after close", g.doc == survivor);
+    check("tab: survivor document usable",
+          g.doc && FPDF_GetPageCount(g.doc) == 1);
+
+    CloseTab(1);   // close a background tab
+    check("tab: close background keeps active", g_tabs.size() == 1);
+    check("tab: active document intact", g.doc == survivor);
+
+    CloseTab(0);   // close the last tab
+    check("tab: last close empties tabs", g_tabs.empty());
+    check("tab: last close clears doc", g.doc == nullptr);
+    check("tab: last close resets index", g_curTab == -1);
+
+    g_tabs = keepTabs;
+    g_curTab = keepCur;
+    g.doc = keepDocT;
+    g.path = keepPathT;
+    g.name = keepNameT;
+    g.dirty = keepDirtyT;
+    g.pageCount = keepPagesT;
+    g.selected = keepSelT;
+    g.zoom = keepZoomT;
+    g.scrollX = keepSxT;
+    g.scrollY = keepSyT;
+  }
 
   {
     FPDF_DOCUMENT d = FPDF_CreateNewDocument();

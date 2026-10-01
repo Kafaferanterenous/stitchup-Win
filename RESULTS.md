@@ -21,7 +21,7 @@ user rejected as a product (no GUI).
 
 Command: `Stitchup.exe --self-test`
 
-Result: **292 passed, 0 failed** (exit code 0).
+Result: **301 passed, 0 failed** (exit code 0).
 
 Select / Move Content Object (`obj:` checks covering content-object editing):
 clicking a content object (text run or vector path) on the current page selects
@@ -419,3 +419,34 @@ highest-value unblocked addition.
   stale highlights.
 - Self-test grew from 281 to 292 checks (11 new `find:` checks, including the
   multi-page ordering merge). Result: 292 passed, 0 failed. App smoke-launches.
+
+## v0.12.1 - fix crash when closing a tab with its X (2026-10-01)
+
+Reported: open a PDF, then click the x next to the file name in the tab strip
+and the app crashed.
+
+Root cause - a double free plus a use-after-free in `CloseTab(i)`:
+
+- The tab's document was freed once (`FPDF_CloseDocument(t.doc)`) and then a
+  second time by `CloseDoc()`, which still saw the same handle in `g.doc`. With
+  one open tab that is a straight double free.
+- With more than one tab, the stale `g.doc` survived the erase and the following
+  `RestoreTab()` called `SnapshotCurrentTab()`, which wrote the just-freed handle
+  into the slot vacated by the removed tab. `RefreshState()` then ran
+  `FPDF_GetPageCount()` on the freed document.
+
+Fix: `CloseTab` now takes ownership of the document before erasing the slot,
+nulls `g.doc` whenever the closed tab was the active one, and sets `g_curTab`
+to -1 so `RestoreTab`'s leading snapshot cannot write to a shifted slot. The
+empty case frees the document exactly once with `g.doc` already null. Closing a
+background tab now just drops its document, decrements `g_curTab` when needed,
+and leaves the live document untouched.
+
+- Nine new `tab:` self-test checks drive all three close paths headlessly
+  (active-with-survivors, background, final tab) and assert the survivor is the
+  expected document and still usable (`FPDF_GetPageCount` = 1), that the final
+  close clears `g.doc` and `g_curTab`, and that nothing dangles. These would have
+  caught the crash.
+
+Self-test grew from 292 to 301 checks. Result: 301 passed, 0 failed. App
+smoke-launches.
