@@ -55,6 +55,11 @@ Produces `dist\Stitchup.exe` + `dist\pdfium.dll`.
   parchment scroll with an inked quill), and a light/dark color theme
 - Bookmarks pane lists the PDF outline (nested); clicking a bookmark jumps to
   its page
+- Find (Edit > Find... / Find Next / Find Previous, `Ctrl+F` / `F3` /
+  `Shift+F3`): case-insensitive text search across the document using PDFium's
+  text API; every match is collected in page order, the active match is shown
+  as a filled amber box and the other matches on the same page are outlined, and
+  F3 / Shift+F3 step through the matches with wraparound
 - Annotate (Home > Annotate group or Edit > Annotate menu): pick highlight,
   underline, sticky note, text box, shape, stamp or link, then **drag on the
   page to draw its rectangle** (a plain click uses the kind's default
@@ -96,9 +101,10 @@ Produces `dist\Stitchup.exe` + `dist\pdfium.dll`.
   document is left unchanged
 - Drag & drop a PDF onto the window to open it; open via command-line argument
 - Shortcuts: Ctrl+N/O/S, Ctrl+Shift+S, Ctrl+R (rotate), Ctrl+[/Ctrl+], Delete,
-  Ctrl+0/1/2 (100%/fit width/fit page), Ctrl+D (dark mode), PgUp/PgDn,
-  Ctrl+wheel to zoom, F5 (two-page spread), F8 (toggle sidebar), Ctrl+T
-  (new tab), Ctrl+Tab/Ctrl+Shift+Tab (next/previous tab)
+  Ctrl+0/1/2 (100%/fit width/fit page), Ctrl+F (find), F3 / Shift+F3 (find
+  next / previous), Ctrl+D (dark mode), PgUp/PgDn, Ctrl+wheel to zoom, F5
+  (two-page spread), F8 (toggle sidebar), Ctrl+T (new tab),
+  Ctrl+Tab/Ctrl+Shift+Tab (next/previous tab)
 
 ## Third-party components
 

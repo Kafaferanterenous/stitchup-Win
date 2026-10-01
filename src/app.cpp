@@ -92,6 +92,9 @@ ID_ANN_LINK,
   ID_CLOSE_TAB,
   ID_NEXT_TAB,
   ID_PREV_TAB,
+  ID_FIND,
+  ID_FIND_NEXT,
+  ID_FIND_PREV,
   // Colour-scheme pickers follow in one contiguous block (radio group).
   ID_THEME_FIRST,
   ID_THEME_LIGHT = ID_THEME_FIRST,
@@ -121,7 +124,7 @@ enum
 
 // App identity shown in the title bar. The open file's name already lives on
 // the document tab below the title bar, so it is not repeated in the caption.
-const wchar_t* const kAppTitle = L"Stitchup PDF Editor  v0.11.0";
+const wchar_t* const kAppTitle = L"Stitchup PDF Editor  v0.12.0";
 
 // ---------------------------------------------------------------------------
 // Application state
@@ -227,6 +230,14 @@ struct App
     int type = 0;
     float l = 0, b = 0, r = 0, t = 0;
   } sel;
+  // Text search (Ctrl+F). findHits holds every match in page order; findCur
+  // indexes it (-1 = no active search). findQuery is kept so F3 / Shift+F3 can
+  // repeat without re-prompting.
+  struct FindHit { int page; int start; int count; };
+  std::wstring findQuery;
+  std::vector<FindHit> findHits;
+  int findCur = -1;
+
   FPDF_PAGE editPage = nullptr;   // page kept open during a live object drag
   FPDF_PAGEOBJECT editObj = nullptr;
   bool selDrag = false;
@@ -958,6 +969,9 @@ static void CloseDoc()
   if (g.annDrag) { ReleaseCapture(); g.annDrag = false; }
   g.annTool = 0;
   g.annPage = -1;
+  g.findQuery.clear();
+  g.findHits.clear();
+  g.findCur = -1;
 }
 
 static void SnapshotCurrentTab()
@@ -983,6 +997,8 @@ static void SyncThumbScroll();
 static void FitWidth();
 static void RelayoutPanes(int w, int h);
 static void GotoPageIndex(int idx);
+static void FindHighlightRects(int pageIdx, int start, int count,
+                               std::vector<FS_RECTF>& out);
 
 static void RestoreTab(int i)
 {
@@ -3200,6 +3216,10 @@ DeleteObject(bg);
                                          : g.name + (g.dirty ? L"  *" : L"");
       if (g.annTool)
         left += L"      Draw the annotation on the page \x2013 Esc to cancel";
+      if (!g.findHits.empty() && g.findCur >= 0)
+        left += L"      Match " + std::to_wstring(g.findCur + 1) + L" of " +
+                std::to_wstring((int)g.findHits.size()) + L" for \"" +
+                g.findQuery + L"\"";
       RECT lrc = rc;
       lrc.left += 10;
       DrawTextW(dc, left.c_str(), -1, &lrc, DT_SINGLELINE | DT_VCENTER);
@@ -4149,6 +4169,49 @@ static void CanvasPaint(HDC dc, int cw, int ch)
                                                    : th.pageFrame);
       FrameRect(dc, &r, fb);
       DeleteObject(fb);
+
+      // Search-match highlights. The active match is a filled amber box; the
+      // other matches on the page get an outline so the text stays readable.
+      if (!g.findHits.empty())
+      {
+        for (int hi = 0; hi < (int)g.findHits.size(); ++hi)
+        {
+          const App::FindHit& fh = g.findHits[hi];
+          if (fh.page != i) continue;
+          std::vector<FS_RECTF> fr;
+          FindHighlightRects(i, fh.start, fh.count, fr);
+          const bool active = (hi == g.findCur);
+          const COLORREF amber = RGB(255, 168, 0);
+          HBRUSH hb2 = CreateSolidBrush(amber);
+          HPEN pn2 = CreatePen(PS_SOLID, 2, RGB(208, 96, 0));
+          for (const FS_RECTF& q : fr)
+          {
+            int ax = x + (int)std::lround(q.left * s);
+            int ay = y + (int)std::lround((PageH(i) - q.top) * s);
+            int aw = (int)std::lround((q.right - q.left) * s);
+            int ah = (int)std::lround((q.top - q.bottom) * s);
+            if (aw < 1 || ah < 1) continue;
+            if (active)
+            {
+              HBRUSH ob = (HBRUSH)SelectObject(dc, hb2);
+              HPEN op = (HPEN)SelectObject(dc, pn2);
+              Rectangle(dc, ax, ay - 1, ax + aw, ay + ah + 1);
+              SelectObject(dc, op);
+              SelectObject(dc, ob);
+            }
+            else
+            {
+              HPEN op = (HPEN)SelectObject(dc, pn2);
+              HBRUSH ob = (HBRUSH)SelectObject(dc, GetStockObject(NULL_BRUSH));
+              Rectangle(dc, ax, ay - 1, ax + aw, ay + ah + 1);
+              SelectObject(dc, ob);
+              SelectObject(dc, op);
+            }
+          }
+          DeleteObject(pn2);
+          DeleteObject(hb2);
+        }
+      }
 
       // Content-object selection overlay (Select tool)
       if (g.sel.active && g.sel.page == i && g.sel.type > 0)
@@ -5595,6 +5658,127 @@ static bool DragToPageRect(int page, POINT a, POINT b, FS_RECTF& out)
   return true;
 }
 
+// --- Text search (Ctrl+F / F3 / Shift+F3) ----------------------------------
+
+// Collects every case-insensitive match of `query` in document order.
+static int CountFindHits(FPDF_DOCUMENT doc, const std::wstring& query,
+                         std::vector<App::FindHit>* hits)
+{
+  if (hits) hits->clear();
+  if (!doc || query.empty()) return 0;
+  int total = 0;
+  const int pages = FPDF_GetPageCount(doc);
+  for (int i = 0; i < pages; ++i)
+  {
+    FPDF_PAGE page = FPDF_LoadPage(doc, i);
+    if (!page) continue;
+    FPDF_TEXTPAGE tp = FPDFText_LoadPage(page);
+    if (tp)
+    {
+      FPDF_SCHHANDLE sch = FPDFText_FindStart(
+          tp, reinterpret_cast<FPDF_WIDESTRING>(query.c_str()), 0, 0);
+      if (sch)
+      {
+        while (FPDFText_FindNext(sch))
+        {
+          int start = FPDFText_GetSchResultIndex(sch);
+          int count = FPDFText_GetSchCount(sch);
+          if (count > 0)
+          {
+            ++total;
+            if (hits) hits->push_back(App::FindHit{i, start, count});
+          }
+        }
+        FPDFText_FindClose(sch);
+      }
+      FPDFText_ClosePage(tp);
+    }
+    FPDF_ClosePage(page);
+  }
+  return total;
+}
+
+// Fills `out` with the PDF-space highlight rectangles of one match.
+static void FindHighlightRects(int pageIdx, int start, int count,
+                               std::vector<FS_RECTF>& out)
+{
+  out.clear();
+  if (!g.doc || pageIdx < 0 || pageIdx >= g.pageCount) return;
+  FPDF_PAGE page = FPDF_LoadPage(g.doc, pageIdx);
+  if (!page) return;
+  FPDF_TEXTPAGE tp = FPDFText_LoadPage(page);
+  if (tp)
+  {
+    int n = FPDFText_CountRects(tp, start, count);
+    for (int i = 0; i < n && i < 64; ++i)
+    {
+      double l = 0, t = 0, r = 0, b = 0;
+      if (FPDFText_GetRect(tp, i, &l, &t, &r, &b))
+        out.push_back(FS_RECTF{(float)l, (float)t, (float)r, (float)b});
+    }
+    FPDFText_ClosePage(tp);
+  }
+  FPDF_ClosePage(page);
+}
+
+// Jumps to the active match and repaints. False when there is no active match.
+static bool FindShowCurrent()
+{
+  if (g.findHits.empty() || g.findCur < 0 ||
+      g.findCur >= (int)g.findHits.size())
+    return false;
+  int page = g.findHits[g.findCur].page;
+  if (page != g.selected) GotoPageIndex(page);
+  InvalidateRect(g.canvas, nullptr, TRUE);
+  if (g.status) InvalidateRect(g.status, nullptr, TRUE);
+  return true;
+}
+
+// Ctrl+F: prompt for a term, gather every match, jump to the first at or after
+// the page currently shown.
+static void FindOpen()
+{
+  if (!g.doc || g.pageCount == 0) return;
+  std::wstring q;
+  if (!PromptText(q, g.findQuery, L"Find", L"Search text:", false)) return;
+  g.findQuery = q;
+  if (q.empty())
+  {
+    g.findHits.clear();
+    g.findCur = -1;
+    if (g.status) InvalidateRect(g.status, nullptr, TRUE);
+    return;
+  }
+  CountFindHits(g.doc, g.findQuery, &g.findHits);
+  g.findCur = -1;
+  if (g.findHits.empty())
+  {
+    MessageBoxW(g.frame, (L"No matches for \"" + q + L"\".").c_str(), L"Find",
+                MB_OK | MB_ICONINFORMATION);
+    if (g.status) InvalidateRect(g.status, nullptr, TRUE);
+    return;
+  }
+  int cur = 0;
+  for (int i = 0; i < (int)g.findHits.size(); ++i)
+    if (g.findHits[i].page >= g.selected) { cur = i; break; }
+  g.findCur = cur;
+  FindShowCurrent();
+}
+
+// F3 / Shift+F3: step through the collected matches, wrapping around.
+static void FindStep(int dir)
+{
+  if (!g.doc || g.pageCount == 0) return;
+  if (g.findHits.empty() || g.findQuery.empty())
+  {
+    FindOpen();
+    return;
+  }
+  int n = (int)g.findHits.size();
+  g.findCur = ((g.findCur + dir) % n + n) % n;
+  FindShowCurrent();
+}
+
 static BOOL CALLBACK PaneTabEnum(HWND h, LPARAM)
 {
   Btn* b = reinterpret_cast<Btn*>(GetWindowLongPtrW(h, GWLP_USERDATA));
@@ -5695,7 +5879,8 @@ static bool IsHandledCommand(int id)
     case ID_OBJ_RECOLOR: case ID_ZOOM_IN: case ID_ZOOM_OUT: case ID_ZOOM100:
     case ID_FITW: case ID_FITP: case ID_PREV: case ID_NEXT: case ID_SPREAD:
     case ID_SIDEBAR: case ID_NEW_TAB: case ID_CLOSE_TAB: case ID_PREV_TAB:
-    case ID_NEXT_TAB: case ID_PANE_THUMBS: case ID_PANE_BOOKMARKS:
+    case ID_NEXT_TAB: case ID_FIND: case ID_FIND_NEXT: case ID_FIND_PREV:
+    case ID_PANE_THUMBS: case ID_PANE_BOOKMARKS:
     case ID_ANN_HL: case ID_ANN_UL: case ID_ANN_NOTE: case ID_ANN_TEXT:
     case ID_ANN_SHAPE: case ID_ANN_STAMP: case ID_ANN_LINK:
     case ID_PAGE_EXTRACT: case ID_PAGE_SPLIT: case ID_PAGE_CROP:
@@ -5752,6 +5937,9 @@ static void DoCommand(int id)
     case ID_CLOSE_TAB: CloseTab(g_curTab); break;
     case ID_PREV_TAB: NextTab(-1); break;
     case ID_NEXT_TAB: NextTab(1); break;
+    case ID_FIND:      FindOpen(); break;
+    case ID_FIND_NEXT: FindStep(1); break;
+    case ID_FIND_PREV: FindStep(-1); break;
     case ID_TAB_DOCUMENT: SwitchRibbonTab(0); break;
     case ID_TAB_PAGES:    SwitchRibbonTab(1); break;
     case ID_TAB_ANNOTATE: SwitchRibbonTab(2); break;
@@ -5804,6 +5992,7 @@ static void DoCommand(int id)
         L"  Ctrl+O open   Ctrl+S save   Ctrl+Shift+S save as\n"
         L"  Ctrl+R rotate CW   Ctrl+Shift+R rotate CCW\n"
         L"  Ctrl+= / Ctrl+- zoom   Ctrl+0 fit page   Ctrl+1 100%\n"
+        L"  Ctrl+F find   F3 next   Shift+F3 previous\n"
         L"  Del delete page   Ctrl+W fit width   Ctrl+PgUp/PgDn page",
         L"About Stitchup", MB_OK | MB_ICONINFORMATION);
       break;
@@ -5840,6 +6029,10 @@ static HMENU BuildMenu()
   AppendMenuW(bar, MF_POPUP, (UINT_PTR)file, L"&File");
 
   HMENU edit = CreatePopupMenu();
+  addItem(edit, ID_FIND, L"Find...\tCtrl+F");
+  addItem(edit, ID_FIND_NEXT, L"Find Next\tF3");
+  addItem(edit, ID_FIND_PREV, L"Find Previous\tShift+F3");
+  AppendMenuW(edit, MF_SEPARATOR, 0, nullptr);
   addItem(edit, ID_ROTR, L"Rotate Right\tCtrl+R");
   addItem(edit, ID_ROTL, L"Rotate Left\tCtrl+Shift+R");
   addItem(edit, ID_DELETE, L"Delete Page\tDel");
@@ -6479,6 +6672,7 @@ static LRESULT CALLBACK FrameProc(HWND hw, UINT msg, WPARAM wp, LPARAM lp)
         switch (vk)
         {
           case 'N': DoCommand(ID_NEW); return 0;
+          case 'F': DoCommand(ID_FIND); return 0;
           case 'O': DoCommand(ID_OPEN); return 0;
           case 'T': DoCommand(ID_NEW_TAB); return 0;
           case VK_TAB: DoCommand(shift ? ID_PREV_TAB : ID_NEXT_TAB); return 0;
@@ -6499,6 +6693,7 @@ static LRESULT CALLBACK FrameProc(HWND hw, UINT msg, WPARAM wp, LPARAM lp)
       {
         switch (vk)
         {
+          case VK_F3: DoCommand(shift ? ID_FIND_PREV : ID_FIND_NEXT); return 0;
           case VK_F5: DoCommand(ID_SPREAD); return 0;
           case VK_F8: DoCommand(ID_SIDEBAR); return 0;
           case VK_DELETE: DoCommand(g.toolSelect ? ID_OBJ_DELETE : ID_DELETE); return 0;
@@ -7804,6 +7999,70 @@ check("saved %PDF header", bytes.size() > 8 &&
     g.scrollX = keepScrollX;
     g.scrollY = keepScrollY;
     FPDF_CloseDocument(dd);
+  }
+
+  {
+    // --- Text search (Ctrl+F / F3). CountFindHits + FindHighlightRects are the
+    // kernels behind the find UI; exercise them on a known-text fixture and on
+    // a two-page merge so match ordering across pages is covered too.
+    std::string tpdf = MakeTextPdf();
+    FPDF_DOCUMENT fd = FPDF_LoadMemDocument(tpdf.data(), (int)tpdf.size(), nullptr);
+    check("find: load text pdf", fd != nullptr);
+
+    std::vector<App::FindHit> hits;
+    int n = CountFindHits(fd, L"World", &hits);
+    check("find: one match found", n == 1 && hits.size() == 1);
+    check("find: match on page 0", !hits.empty() && hits[0].page == 0);
+    check("find: match length is 5", !hits.empty() && hits[0].count == 5);
+
+    std::wstring matched;
+    std::vector<FS_RECTF> fr;
+    if (!hits.empty())
+    {
+      FPDF_PAGE fp = FPDF_LoadPage(fd, hits[0].page);
+      if (fp)
+      {
+        FPDF_TEXTPAGE ftp = FPDFText_LoadPage(fp);
+        if (ftp)
+        {
+          std::vector<unsigned short> buf((size_t)hits[0].count + 1, 0);
+          int got = FPDFText_GetText(ftp, hits[0].start, hits[0].count, buf.data());
+          if (got > 1) matched.assign((const wchar_t*)buf.data(), (size_t)got - 1);
+          FPDFText_ClosePage(ftp);
+        }
+        FPDF_ClosePage(fp);
+      }
+      const FPDF_DOCUMENT keepDoc2 = g.doc;
+      const int keepCount2 = g.pageCount;
+      g.doc = fd;
+      g.pageCount = 1;
+      FindHighlightRects(hits[0].page, hits[0].start, hits[0].count, fr);
+      g.doc = keepDoc2;
+      g.pageCount = keepCount2;
+    }
+    check("find: matched text is 'World'", matched == L"World");
+    check("find: highlight rect produced", !fr.empty() && fr[0].left < fr[0].right &&
+          fr[0].bottom < fr[0].top);
+    check("find: case-insensitive", CountFindHits(fd, L"hello", nullptr) == 1);
+    check("find: miss returns 0", CountFindHits(fd, L"zzznotfound", nullptr) == 0);
+    check("find: empty query returns 0", CountFindHits(fd, L"", nullptr) == 0);
+
+    // Merge two copies so the same word appears on pages 0 and 1 in order.
+    FPDF_DOCUMENT fm = FPDF_CreateNewDocument();
+    if (fm)
+    {
+      FPDF_ImportPagesByIndex(fm, fd, nullptr, 0, 0);
+      FPDF_ImportPagesByIndex(fm, fd, nullptr, 0, 0);
+      std::vector<App::FindHit> mh;
+      int mn = CountFindHits(fm, L"World", &mh);
+      check("find: multi-page hit count", mn == 2 && mh.size() == 2);
+      check("find: multi-page ordering", mh.size() == 2 && mh[0].page == 0 &&
+            mh[1].page == 1);
+      FPDF_CloseDocument(fm);
+    }
+    else check("find: multi-page doc built", false);
+
+    if (fd) FPDF_CloseDocument(fd);
   }
 
   {

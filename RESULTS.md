@@ -21,7 +21,7 @@ user rejected as a product (no GUI).
 
 Command: `Stitchup.exe --self-test`
 
-Result: **281 passed, 0 failed** (exit code 0).
+Result: **292 passed, 0 failed** (exit code 0).
 
 Select / Move Content Object (`obj:` checks covering content-object editing):
 clicking a content object (text run or vector path) on the current page selects
@@ -70,9 +70,13 @@ export: a text-bearing fixture produces the expected per-page row
 `1,612.0,792.0,25,0` (pdfium appends the trailing line break to the 24-character
 run), the file carries a UTF-8 BOM byte-for-byte with the header line
 `Page,Width (pt),Height (pt),Text chars,Annotations`, a 2-page doc yields one
-row per page, an empty doc makes `ExportCsvToFile` return false and writes no
-file, and a doc with a highlight annotation reports `0,1` in the annotation
-column.
+  row per page, an empty doc makes `ExportCsvToFile` return false and writes no
+  file, and a doc with a highlight annotation reports `0,1` in the annotation
+  column. Text search: the `find:` checks run `CountFindHits` / `FindHighlightRects`
+  on a known-text fixture (one match, correct page, 5-character span whose text
+  reads back as `World`, case-insensitive hit, miss and empty query both 0, a
+  highlight rectangle produced) and on a two-copy merge to confirm matches on
+  pages 0 and 1 are collected in document order.
 - Watermark (`ApplyWatermarkDoc`): empty text rejected; center/top/tiled modes
   each apply and are extractable; every page of a 2-page doc gains the
   watermark; a watermarked doc saves and round-trips with the watermark
@@ -389,3 +393,29 @@ smoke-launches.
 Known limits unchanged: internal page-destination links still cannot be created
 (PDFium exposes no destination-writing API), and the visual feel of the
 rubber-band drag itself is verified by hand, not headless.
+
+## v0.12.0 - find / search (2026-10-01)
+
+A Find feature, since the two remaining roadmap items are hard blockers: static
+single-exe still needs PDFium built from source with the static CRT, and internal
+page-destination links still need a destination-writing API PDFium does not
+export. Text search is fully supported by the bundled runtime, so it is the
+highest-value unblocked addition.
+
+- New commands `ID_FIND` / `ID_FIND_NEXT` / `ID_FIND_PREV` (Edit menu;
+  `Ctrl+F`, `F3`, `Shift+F3`). `FindOpen` reuses `PromptText` to ask for the
+  term, `FindStep` walks the collected matches with wraparound.
+- `CountFindHits(doc, query, hits)` walks every page's text layer via
+  `FPDFText_LoadPage` / `FPDFText_FindStart` (case-insensitive, flags 0) /
+  `FPDFText_FindNext` / `FPDFText_GetSchResultIndex` / `FPDFText_GetSchCount` and
+  records each match (page, char index, length) in document order.
+  `FindHighlightRects` turns one match back into PDF-space rectangles with
+  `FPDFText_CountRects` / `FPDFText_GetRect`.
+- Canvas paint draws the match highlights: the active match is a filled amber box
+  with a darker border, the other matches on the same page are outlined only so
+  the underlying text stays legible. The status bar shows
+  `Match i of N for "term"`.
+- `CloseDoc` clears the query, hits and active index so tab switches never leave
+  stale highlights.
+- Self-test grew from 281 to 292 checks (11 new `find:` checks, including the
+  multi-page ordering merge). Result: 292 passed, 0 failed. App smoke-launches.
