@@ -56,10 +56,18 @@ Produces `dist\Stitchup.exe` + `dist\pdfium.dll`.
 - Bookmarks pane lists the PDF outline (nested); clicking a bookmark jumps to
   its page
 - Annotate (Home > Annotate group or Edit > Annotate menu): insert highlight,
-  underline, sticky note, text box, shape and stamp annotations on the current
-  page; annotations persist through Save and keep their rendered appearance
+  underline, sticky note, text box, shape, stamp and link annotations on the
+  current page; annotations persist through Save and keep their rendered
+  appearance
 - Links: clicking an internal link jumps to its destination page; clicking a
   URI link opens the URL in the default browser (hand cursor over link areas)
+- Link creation (Home > Annotate group "Link..." or Edit > Annotate > Link...):
+  the dialog asks for a web address, then places a clickable /Link annotation on
+  the current page. A link is created with the annotation API
+  (`FPDFPage_CreateAnnot` + `FPDFAnnot_SetURI`), which the bundled PDFium already
+  supports, so no newer runtime is required. Only web (URI) targets are
+  supported — PDFium can read page destinations but offers no API to write one,
+  so internal page jumps must come from the source document
 - Content object editing (Edit > Select / Move Content Object, or the Home >
   Edit group Select tool): click any content object — text run, vector path or
   image — on the current page to select it (accent bounding box + handles), then
@@ -109,9 +117,14 @@ project (github.com/bblanchon/pdfium-binaries). Non-GPL build.
   auto-crop) + text export + CSV export + password-unlock + watermarks +
   encrypt-on-save are done. Rendering, page model,
   editing operations, ribbon navigation, the bookmarks pane, annotation
-  creation/persistence, link navigation and page extract/split/crop are
-  functional.
-  Note: link *creation* (drawing new links) requires a newer PDFium runtime
-  than the bundled `pdfium.dll`, which exposes only link reading.
+  creation/persistence, link navigation, link *creation* and page
+  extract/split/crop are functional.
+- Link *creation* works on the bundled PDFium: a hyperlink is a /Link
+  annotation, and PDFium exposes `FPDFPage_CreateAnnot` plus
+  `FPDFAnnot_SetURI` for writing the target. A newer `pdfium.dll` is therefore
+  not required; the checked `chromium/8076` build exports the same set.
+- The link dialog currently places the link at a default position (190x20 pt at
+  12% / 62% of the page); drag-to-draw the link rectangle is not implemented
+  yet.
 - Tools menu/ribbon tab hosts the Security (Save As Encrypted) and Export
   (Export Text / Export CSV) groups.

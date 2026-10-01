@@ -71,7 +71,8 @@ enum
   ID_ANN_NOTE,
   ID_ANN_TEXT,
   ID_ANN_SHAPE,
-  ID_ANN_STAMP,
+ID_ANN_STAMP,
+ID_ANN_LINK,
   ID_PAGE_EXTRACT,
   ID_PAGE_SPLIT,
   ID_PAGE_CROP,
@@ -119,7 +120,7 @@ enum
 
 // App identity shown in the title bar. The open file's name already lives on
 // the document tab below the title bar, so it is not repeated in the caption.
-const wchar_t* const kAppTitle = L"Stitchup PDF Editor  v0.9.0";
+const wchar_t* const kAppTitle = L"Stitchup PDF Editor  v0.10.0";
 
 // ---------------------------------------------------------------------------
 // Application state
@@ -1517,7 +1518,14 @@ struct BmCtx
   HWND label = nullptr;
   bool ok = false;
   std::wstring text;
+  // Dialog wording, so the same shell serves bookmarks and link targets.
+  const wchar_t* caption = L"Add Bookmark";
+  const wchar_t* prompt = L"Bookmark name:";
+  bool allowEmpty = false;
 };
+
+// Target for the next InsertAnnot(ID_ANN_LINK) call.
+static std::wstring g_linkUri;
 
 static LRESULT CALLBACK BmProc(HWND h, UINT m, WPARAM w, LPARAM l)
 {
@@ -1528,7 +1536,7 @@ static LRESULT CALLBACK BmProc(HWND h, UINT m, WPARAM w, LPARAM l)
       BmCtx* ctx = reinterpret_cast<BmCtx*>(
         reinterpret_cast<CREATESTRUCTW*>(l)->lpCreateParams);
       SetWindowLongPtrW(h, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(ctx));
-      ctx->label = CreateWindowExW(0, L"STATIC", L"Bookmark name:",
+      ctx->label = CreateWindowExW(0, L"STATIC", ctx->prompt,
         WS_CHILD | WS_VISIBLE, 16, 14, 300, 16, h, nullptr, g.inst, nullptr);
       ctx->edit = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
         WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL,
@@ -1572,7 +1580,9 @@ static LRESULT CALLBACK BmProc(HWND h, UINT m, WPARAM w, LPARAM l)
   return DefWindowProcW(h, m, w, l);
 }
 
-static bool PromptBookmarkName(std::wstring& out, const std::wstring& deflt)
+static bool PromptText(std::wstring& out, const std::wstring& deflt,
+                       const wchar_t* caption, const wchar_t* prompt,
+                       bool allowEmpty)
 {
   const wchar_t cls[] = L"SKBmWnd";
   static bool reg = false;
@@ -1590,7 +1600,10 @@ static bool PromptBookmarkName(std::wstring& out, const std::wstring& deflt)
   }
   BmCtx ctx;
   ctx.text = deflt;
-  HWND hw = CreateWindowExW(WS_EX_DLGMODALFRAME, cls, L"Add Bookmark",
+  ctx.caption = caption;
+  ctx.prompt = prompt;
+  ctx.allowEmpty = allowEmpty;
+  HWND hw = CreateWindowExW(WS_EX_DLGMODALFRAME, cls, caption,
                             WS_POPUP | WS_CAPTION | WS_SYSMENU,
                             CW_USEDEFAULT, CW_USEDEFAULT, 332, 138,
                             g.frame, nullptr, g.inst, &ctx);
@@ -1625,7 +1638,20 @@ static bool PromptBookmarkName(std::wstring& out, const std::wstring& deflt)
   const size_t a = t.find_first_not_of(L" \t");
   const size_t b = t.find_last_not_of(L" \t");
   out = (a == std::wstring::npos) ? L"" : t.substr(a, b - a + 1);
-  return !out.empty();
+  return allowEmpty || !out.empty();
+}
+
+static bool PromptBookmarkName(std::wstring& out, const std::wstring& deflt)
+{
+  return PromptText(out, deflt, L"Add Bookmark", L"Bookmark name:", false);
+}
+
+// A link is a /Link annotation; the target lives in its URI action.
+// PDFium can also read page destinations, but exposes no API to write one, so
+// an empty target would create a dead link - refuse instead of writing junk.
+static bool PromptLinkUri(std::wstring& out, const std::wstring& deflt)
+{
+  return PromptText(out, deflt, L"Add Link", L"Web address:", false);
 }
 
 struct WmCtx
@@ -4934,6 +4960,8 @@ static void BuildToolbar(HWND)
      L"Draw a rectangle or oval shape"},
     {ID_ANN_STAMP,    L"Stamp",      62, 2, 0xE735, false,
      L"Stamp the page number or a custom mark"},
+    {ID_ANN_LINK,     L"Link",       62, 2, 0xE71B, false,
+     L"Place a clickable web link on the page"},
     {ID_TOOL_SELECT,  L"Select",     62, 3, 0xE8B0, false,
      L"Click a content object to select it, then drag to move it"},
     {ID_OBJ_EDIT,     L"Edit Text",  78, 3, 0xE70F, false,
@@ -5351,6 +5379,40 @@ static bool InsertAnnot(FPDF_DOCUMENT doc, int pageIdx, int kind)
       SetAnnotText(a, "Contents", L"DRAFT");
     }
   }
+  else if (kind == ID_ANN_LINK)
+  {
+    // A hyperlink is a /Link annotation; the target lives in its URI action.
+    std::wstring uri = g_linkUri;
+    while (!uri.empty() && (uri.back() == L' ' || uri.back() == L'\t')) uri.pop_back();
+    size_t first = uri.find_first_not_of(L" \t");
+    uri = (first == std::wstring::npos) ? std::wstring() : uri.substr(first);
+
+    a = FPDFPage_CreateAnnot(page, FPDF_ANNOT_LINK);
+    if (a)
+    {
+      float x = pw * 0.12f;
+      float y = ph * 0.62f;
+      float w = 190.0f;
+      float h = 20.0f;
+      FS_RECTF rc{x, y + h, x + w, y};
+      ok = FPDFAnnot_SetRect(a, &rc) != 0;
+      if (!uri.empty())
+      {
+        int n = WideCharToMultiByte(CP_UTF8, 0, uri.c_str(), -1, nullptr, 0,
+                                    nullptr, nullptr);
+        if (n > 1)
+        {
+          std::string utf8(static_cast<size_t>(n), '\0');
+          WideCharToMultiByte(CP_UTF8, 0, uri.c_str(), -1, &utf8[0], n,
+                              nullptr, nullptr);
+          ok = ok && (FPDFAnnot_SetURI(a, utf8.c_str()) != 0);
+        }
+      }
+      // Links draw no border of their own; the Rect is the click area.
+      ok = ok && (FPDFAnnot_SetFlags(a, FPDF_ANNOT_FLAG_PRINT) != 0);
+      SetAnnotText(a, "Contents", uri.c_str());
+    }
+  }
 
   if (a)
   {
@@ -5516,6 +5578,16 @@ static void DoCommand(int id)
     case ID_ANN_TEXT:  InsertAnnotCurrent(ID_ANN_TEXT); break;
     case ID_ANN_SHAPE: InsertAnnotCurrent(ID_ANN_SHAPE); break;
     case ID_ANN_STAMP: InsertAnnotCurrent(ID_ANN_STAMP); break;
+    case ID_ANN_LINK:
+    {
+      std::wstring uri;
+      if (PromptLinkUri(uri, g_linkUri))
+      {
+        g_linkUri = uri;
+        InsertAnnotCurrent(ID_ANN_LINK);
+      }
+      break;
+    }
     case ID_PAGE_EXTRACT: ExtractCurrentPage(); break;
     case ID_PAGE_SPLIT:   SplitAllPages(); break;
     case ID_PAGE_CROP:    CropCurrentPageToContent(); break;
@@ -5602,6 +5674,7 @@ static HMENU BuildMenu()
   addItem(annotate, ID_ANN_TEXT, L"Text Box");
   addItem(annotate, ID_ANN_SHAPE, L"Shape");
   addItem(annotate, ID_ANN_STAMP, L"Stamp");
+    addItem(annotate, ID_ANN_LINK, L"Link...");
   AppendMenuW(bar, MF_POPUP, (UINT_PTR)annotate, L"Anno&tate");
 
   HMENU view = CreatePopupMenu();
@@ -7322,6 +7395,9 @@ check("saved %PDF header", bytes.size() > 8 &&
     check("annot: textbox created", InsertAnnot(an, 0, ID_ANN_TEXT));
     check("annot: shape created", InsertAnnot(an, 0, ID_ANN_SHAPE));
     check("annot: stamp created", InsertAnnot(an, 0, ID_ANN_STAMP));
+    const char* kTestLinkUri = "https://example.com/stitchup";
+    g_linkUri = L"https://example.com/stitchup";
+    check("annot: link created", InsertAnnot(an, 0, ID_ANN_LINK));
 
     FPDF_PAGE ap9 = FPDF_LoadPage(an, 0);
     check("annot: page with annots loads", ap9 != nullptr);
@@ -7339,9 +7415,10 @@ check("saved %PDF header", bytes.size() > 8 &&
       if (ap)
       {
         int n = FPDFPage_GetAnnotCount(ap);
-        checkEq("annot: persistent count", n, 6);
+        checkEq("annot: persistent count", n, 7);
         bool foundHL = false, foundUL = false, foundNote = false, foundFree = false,
-             foundSq = false, foundSt = false;
+             foundSq = false, foundSt = false, foundLink = false;
+        bool linkUriOk = false;
         FS_RECTF noteR{};
         for (int i = 0; i < n && i < 16; ++i)
         {
@@ -7354,9 +7431,27 @@ check("saved %PDF header", bytes.size() > 8 &&
           foundFree |= (st == FPDF_ANNOT_FREETEXT);
           foundSq |= (st == FPDF_ANNOT_SQUARE);
           foundSt |= (st == FPDF_ANNOT_STAMP);
+          if (st == FPDF_ANNOT_LINK)
+          {
+            foundLink = true;
+            FPDF_LINK lnk = FPDFAnnot_GetLink(aa);
+            FPDF_ACTION act = lnk ? FPDFLink_GetAction(lnk) : nullptr;
+            unsigned long need = act ? FPDFAction_GetURIPath(an2, act, nullptr, 0) : 0;
+            if (need > 1)
+            {
+              std::string uri(need, '\0');
+              unsigned long got =
+                  FPDFAction_GetURIPath(an2, act, &uri[0], need);
+              // Returned length counts the trailing NUL.
+              if (got && uri[got - 1] == '\0') --got;
+              linkUriOk = (got > 0 && uri.substr(0, got) == kTestLinkUri);
+            }
+          }
           if (st == FPDF_ANNOT_TEXT) FPDFAnnot_GetRect(aa, &noteR);
           FPDFPage_CloseAnnot(aa);
         }
+        check("annot: link persists", foundLink);
+        check("link: URI round-trips", linkUriOk);
         check("annot: highlight persists", foundHL);
         check("annot: underline persists", foundUL);
         check("annot: note persists", foundNote);

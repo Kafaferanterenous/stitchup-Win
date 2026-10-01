@@ -264,8 +264,12 @@ No CRT DLLs (static `/MT` linked). Portable package = `Stitchup.exe` +
 
 Nitro-style UI shell (Phase B) COMPLETE and verified. Phase C in progress:
 annotation engine done (highlight, underline, sticky note, free text, shape,
-stamp) with persistence and rendered appearances; link activation done (click
-navigates or opens a URI, hand cursor); page management done (extract current
+stamp, link) with persistence and rendered appearances; link activation done
+(click navigates or opens a URI, hand cursor); link creation done
+(Home > Annotate "Link..." prompts for a web address, blank = same-document
+jump, and writes a /Link annotation via FPDFPage_CreateAnnot +
+FPDFAnnot_SetURI, so the bundled PDFium runtime suffices - no upgrade needed);
+page management done (extract current
 page to its own PDF, split a document into one file per page, auto-crop the
 current page to its ink bounding box via the InkBounds render pass); text
 export added (File > Export Text writes a BOM'd UTF-8 .txt of every page's
@@ -295,3 +299,28 @@ Auto-Crop), File > Export Text / Export CSV / Watermark / Save As Encrypted,
 open a password-protected PDF, and the new view extras: File > New Tab (Ctrl+T),
 File > Close / Next / Previous Tab, View > Two-Page Spread (F5), View >
 Sidebar / Sidebar menu (F8), and the Home / Tools ribbon-switch menus.
+
+## Latest — v0.10.0: link creation (2026-10-01)
+
+- The earlier roadmap note ("link *creation* needs a newer PDFium") was wrong:
+  a hyperlink is a `/Link` annotation, and the bundled `chromium/8057` DLL
+  already exports both `FPDFPage_CreateAnnot` and `FPDFAnnot_SetURI`. The newer
+  `chromium/8076` build exports exactly the same set, so no runtime upgrade was
+  needed or made.
+- New command `ID_ANN_LINK` (`src/app.cpp`): Home > Annotate "Link..." /
+  Edit > Annotate > Link... opens a `PromptLinkUri` dialog asking for a web
+  address, then places a /Link annotation on the current page with the URI as
+  its action. Page-destination targets are not offered: PDFium has no
+  destination-writing API (no `FPDFLink_SetDest*` is declared or exported), so a
+  blank target would be a dead link and the dialog rejects empty input.
+- `PromptBookmarkName` was generalized into `PromptText(caption, prompt,
+  allowEmpty)` so bookmarks and link targets share one dialog implementation.
+- Link rectangle is a default 190x20 pt box at 12%/62% of the page; drag-to-draw
+  is not implemented yet. Two limits found while implementing: only
+  `FPDFANNOT_COLORTYPE_Color` / `_InteriorColor` exist (there is no Border
+  colour type), and `FPDFAction_GetURIPath` returns a length *including* the
+  trailing NUL.
+- Self-test grew from 223 to 226 checks: link creation, link persistence after
+  save+reload (annot count 6 -> 7), and URI round-trip via
+  `FPDFLink_GetAction` + `FPDFAction_GetURIPath` (the returned length includes
+  the trailing NUL). Result: 226 passed, 0 failed. App smoke-launches.
