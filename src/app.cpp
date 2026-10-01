@@ -121,7 +121,7 @@ enum
 
 // App identity shown in the title bar. The open file's name already lives on
 // the document tab below the title bar, so it is not repeated in the caption.
-const wchar_t* const kAppTitle = L"Stitchup PDF Editor  v0.10.0";
+const wchar_t* const kAppTitle = L"Stitchup PDF Editor  v0.11.0";
 
 // ---------------------------------------------------------------------------
 // Application state
@@ -232,6 +232,15 @@ struct App
   bool selDrag = false;
   bool selDragMoved = false;
   double dragLastX = 0, dragLastY = 0;
+
+  // Drag-to-draw annotation placement. When annTool is set the next left-drag
+  // on a page defines the annotation rectangle; annDrag is true between the
+  // button-down and button-up. Coordinates are canvas-client pixels.
+  int annTool = 0;           // pending annotation kind, 0 = none
+  bool annDrag = false;
+  int annPage = -1;          // page under the drag start
+  POINT annStart{};
+  POINT annCur{};
 };
 
 // A document open in its own tab. The live App fields above always mirror the
@@ -946,6 +955,9 @@ static void CloseDoc()
   g.name.clear();
   g.dirty = false;
   g.bmDirty = true;
+  if (g.annDrag) { ReleaseCapture(); g.annDrag = false; }
+  g.annTool = 0;
+  g.annPage = -1;
 }
 
 static void SnapshotCurrentTab()
@@ -3186,6 +3198,8 @@ DeleteObject(bg);
       SetTextColor(dc, th.statusTxt);
       std::wstring left = g.name.empty() ? L"Stitchup PDF Editor"
                                          : g.name + (g.dirty ? L"  *" : L"");
+      if (g.annTool)
+        left += L"      Draw the annotation on the page \x2013 Esc to cancel";
       RECT lrc = rc;
       lrc.left += 10;
       DrawTextW(dc, left.c_str(), -1, &lrc, DT_SINGLELINE | DT_VCENTER);
@@ -4173,6 +4187,20 @@ static void CanvasPaint(HDC dc, int cw, int ch)
       }
     }
   }
+
+  // Drag-to-draw rubber band for the armed annotation tool.
+  if (g.annDrag && g.annTool)
+  {
+    RECT br{std::min(g.annStart.x, g.annCur.x), std::min(g.annStart.y, g.annCur.y),
+            std::max(g.annStart.x, g.annCur.x), std::max(g.annStart.y, g.annCur.y)};
+    HPEN pen = CreatePen(PS_DOT, 1, th.accent);
+    HGDIOBJ oldPen = SelectObject(dc, pen);
+    HGDIOBJ oldBr = SelectObject(dc, GetStockObject(NULL_BRUSH));
+    Rectangle(dc, br.left, br.top, br.right, br.bottom);
+    SelectObject(dc, oldBr);
+    SelectObject(dc, oldPen);
+    DeleteObject(pen);
+  }
 }
 
 struct HitInfo
@@ -4182,6 +4210,9 @@ struct HitInfo
 static bool HitPage(POINT pt, HitInfo& out);
 static bool GetLinkAtDevice(FPDF_PAGE page, POINT pt, FPDF_LINK& link);
 static bool FollowLink(FPDF_PAGE page, POINT pt);
+static void InsertAnnotCurrent(int kind, const FS_RECTF* rect);
+static bool DragToPageRect(int page, POINT a, POINT b, FS_RECTF& out);
+static void CancelAnnotTool();
 
 // Maps the canvas viewport onto a destination for a "bookmark this view" entry.
 // |pageLeftClient|/|pageTopClient| place the page's top-left in canvas client
@@ -4337,6 +4368,11 @@ static LRESULT CALLBACK CanvasProc(HWND hw, UINT msg, WPARAM wp, LPARAM lp)
       POINT cur;
       GetCursorPos(&cur);
       ScreenToClient(hw, &cur);
+      if (g.annTool)
+      {
+        SetCursor(LoadCursorW(nullptr, IDC_CROSS));
+        return TRUE;
+      }
       if (g.doc && g.pageCount > 0)
       {
         HitInfo hi;
@@ -4408,6 +4444,16 @@ static LRESULT CALLBACK CanvasProc(HWND hw, UINT msg, WPARAM wp, LPARAM lp)
       HitInfo hi;
       if (HitPage(pt, hi))
       {
+        if (g.annTool)
+        {
+          // Begin a drag-to-draw annotation on the page under the pointer.
+          g.annDrag = true;
+          g.annPage = hi.page;
+          g.annStart = pt;
+          g.annCur = pt;
+          SetCapture(hw);
+          return 0;
+        }
         if (g.toolSelect)
         {
           const double s = g.zoom;
@@ -4493,6 +4539,12 @@ static LRESULT CALLBACK CanvasProc(HWND hw, UINT msg, WPARAM wp, LPARAM lp)
     }
     case WM_MOUSEMOVE:
     {
+      if (g.annDrag && GetCapture() == hw)
+      {
+        g.annCur = POINT{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
+        InvalidateRect(hw, nullptr, FALSE);
+        return 0;
+      }
       if (!(g.toolSelect && g.selDrag && GetCapture() == hw)) break;
       POINT pt{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
       HitInfo hi;
@@ -4521,6 +4573,29 @@ static LRESULT CALLBACK CanvasProc(HWND hw, UINT msg, WPARAM wp, LPARAM lp)
     }
     case WM_LBUTTONUP:
     {
+      if (g.annDrag)
+      {
+        ReleaseCapture();
+        g.annCur = POINT{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
+        const int kind = g.annTool;
+        const int page = g.annPage;
+        const POINT a = g.annStart, b = g.annCur;
+        g.annTool = 0;
+        g.annDrag = false;
+        g.annPage = -1;
+        // Arm the page that was drawn on, then place the annotation. A drag of
+        // a few pixels or less falls back to the kind's default rectangle.
+        if (page >= 0 && page < g.pageCount) g.selected = page;
+        const int dx = std::abs(b.x - a.x), dy = std::abs(b.y - a.y);
+        FS_RECTF rc{};
+        const bool drawn = (dx >= 4 || dy >= 4) &&
+                           DragToPageRect(page, a, b, rc);
+        InsertAnnotCurrent(kind, drawn ? &rc : nullptr);
+        SetCursor(LoadCursorW(nullptr, IDC_ARROW));
+        InvalidateRect(hw, nullptr, TRUE);
+        InvalidateRect(g.status, nullptr, TRUE);
+        return 0;
+      }
       if (!(g.toolSelect && g.selDrag)) break;
       ReleaseCapture();
       const bool moved = g.selDragMoved;
@@ -5299,7 +5374,11 @@ static void SetAnnotText(FPDF_ANNOTATION a, const char* key, const wchar_t* valu
 // Creates a fresh annotation of the requested kind on |pageIdx| of |doc|.
 // Parametrised on the document so the same code runs in the GUI and in the
 // headless self-test.
-static bool InsertAnnot(FPDF_DOCUMENT doc, int pageIdx, int kind)
+// Creates one annotation on page pageIdx. When `rect` is non-null the caller
+// (drag-to-draw) supplies the rectangle in PDF coordinates; otherwise each kind
+// falls back to its conventional default placement. Pure FPDF work.
+static bool InsertAnnot(FPDF_DOCUMENT doc, int pageIdx, int kind,
+                        const FS_RECTF* rect = nullptr)
 {
   if (!doc) return false;
   FPDF_PAGE page = FPDF_LoadPage(doc, pageIdx);
@@ -5315,6 +5394,13 @@ static bool InsertAnnot(FPDF_DOCUMENT doc, int pageIdx, int kind)
     float x = pw * 0.10f, w = pw * 0.55f;
     float y = (kind == ID_ANN_HL) ? ph * 0.85f : ph * 0.80f;
     float h = (kind == ID_ANN_HL) ? 18.0f : 6.0f;
+    if (rect)
+    {
+      x = rect->left;
+      y = rect->bottom;
+      w = rect->right - rect->left;
+      h = rect->top - rect->bottom;
+    }
     a = FPDFPage_CreateAnnot(page, sub);
     if (a)
     {
@@ -5337,7 +5423,8 @@ static bool InsertAnnot(FPDF_DOCUMENT doc, int pageIdx, int kind)
     a = FPDFPage_CreateAnnot(page, FPDF_ANNOT_TEXT);
     if (a)
     {
-      FS_RECTF rc{pw - 90.0f, ph - 36.0f, pw - 30.0f, ph - 90.0f};
+      FS_RECTF rc = rect ? *rect
+                         : FS_RECTF{pw - 90.0f, ph - 36.0f, pw - 30.0f, ph - 90.0f};
       ok = FPDFAnnot_SetRect(a, &rc) != 0;
       ok = ok && (FPDFAnnot_SetColor(a, FPDFANNOT_COLORTYPE_Color, 255, 230, 0, 255) != 0);
       SetAnnotText(a, "Contents", L"Sticky note added by Stitchup.");
@@ -5348,7 +5435,8 @@ static bool InsertAnnot(FPDF_DOCUMENT doc, int pageIdx, int kind)
     a = FPDFPage_CreateAnnot(page, FPDF_ANNOT_FREETEXT);
     if (a)
     {
-      FS_RECTF rc{pw * 0.12f, ph * 0.55f, pw * 0.52f, ph * 0.42f};
+      FS_RECTF rc = rect ? *rect
+                         : FS_RECTF{pw * 0.12f, ph * 0.55f, pw * 0.52f, ph * 0.42f};
       ok = FPDFAnnot_SetRect(a, &rc) != 0;
       ok = ok && (FPDFAnnot_SetColor(a, FPDFANNOT_COLORTYPE_Color, 0, 0, 0, 255) != 0);
       ok = ok && (FPDFAnnot_SetColor(a, FPDFANNOT_COLORTYPE_InteriorColor,
@@ -5362,7 +5450,8 @@ static bool InsertAnnot(FPDF_DOCUMENT doc, int pageIdx, int kind)
     if (a)
     {
       float s = 70.0f;
-      FS_RECTF rc{pw * 0.12f, ph * 0.35f, pw * 0.12f + s, ph * 0.35f - s};
+      FS_RECTF rc = rect ? *rect
+                         : FS_RECTF{pw * 0.12f, ph * 0.35f, pw * 0.12f + s, ph * 0.35f - s};
       ok = FPDFAnnot_SetRect(a, &rc) != 0;
       ok = ok && (FPDFAnnot_SetColor(a, FPDFANNOT_COLORTYPE_Color, 0x1F, 0x6F, 0xEB, 255) != 0);
       ok = ok && (FPDFAnnot_SetColor(a, FPDFANNOT_COLORTYPE_InteriorColor,
@@ -5374,7 +5463,8 @@ static bool InsertAnnot(FPDF_DOCUMENT doc, int pageIdx, int kind)
     a = FPDFPage_CreateAnnot(page, FPDF_ANNOT_STAMP);
     if (a)
     {
-      FS_RECTF rc{pw * 0.55f, ph * 0.18f, pw * 0.55f + 150.0f, ph * 0.18f - 52.0f};
+      FS_RECTF rc = rect ? *rect
+                         : FS_RECTF{pw * 0.55f, ph * 0.18f, pw * 0.55f + 150.0f, ph * 0.18f - 52.0f};
       ok = FPDFAnnot_SetRect(a, &rc) != 0;
       SetAnnotText(a, "Name", L"Draft");
       SetAnnotText(a, "Contents", L"DRAFT");
@@ -5395,7 +5485,7 @@ static bool InsertAnnot(FPDF_DOCUMENT doc, int pageIdx, int kind)
       float y = ph * 0.62f;
       float w = 190.0f;
       float h = 20.0f;
-      FS_RECTF rc{x, y + h, x + w, y};
+      FS_RECTF rc = rect ? *rect : FS_RECTF{x, y + h, x + w, y};
       ok = FPDFAnnot_SetRect(a, &rc) != 0;
       if (!uri.empty())
       {
@@ -5424,15 +5514,85 @@ static bool InsertAnnot(FPDF_DOCUMENT doc, int pageIdx, int kind)
   return ok;
 }
 
-static void InsertAnnotCurrent(int kind)
+static void InsertAnnotCurrent(int kind, const FS_RECTF* rect = nullptr)
 {
   if (!g.doc || g.pageCount == 0) return;
-  if (InsertAnnot(g.doc, g.selected, kind))
+  if (InsertAnnot(g.doc, g.selected, kind, rect))
   {
+    g.dirty = true;
     InvalidateRect(g.canvas, nullptr, TRUE);
     InvalidateRect(g.thumbs, nullptr, TRUE);
     InvalidateRect(g.status, nullptr, TRUE);
   }
+}
+
+// Arms drag-to-draw for an annotation kind. The next left-drag on a page sets
+// the annotation rectangle; a plain click falls back to the default placement.
+static void SetAnnotTool(int kind)
+{
+  g.annTool = kind;
+  g.annDrag = false;
+  if (g.canvas)
+  {
+    SetCursor(LoadCursorW(nullptr, IDC_CROSS));
+    InvalidateRect(g.canvas, nullptr, FALSE);
+  }
+  if (g.status) InvalidateRect(g.status, nullptr, TRUE);
+}
+
+static void CancelAnnotTool()
+{
+  if (!g.annTool && !g.annDrag) return;
+  if (g.annDrag) ReleaseCapture();
+  g.annTool = 0;
+  g.annDrag = false;
+  g.annPage = -1;
+  if (g.canvas)
+  {
+    SetCursor(LoadCursorW(nullptr, IDC_ARROW));
+    InvalidateRect(g.canvas, nullptr, TRUE);
+  }
+  if (g.status) InvalidateRect(g.status, nullptr, TRUE);
+}
+
+// Maps a canvas-client drag on `page` to a PDF-space FS_RECTF (left, top,
+// right, bottom with top > bottom), clamped to the page. Pure geometry so the
+// self-test can exercise it without a window.
+static bool DragToPageRect(int page, POINT a, POINT b, FS_RECTF& out)
+{
+  if (!g.doc || page < 0 || page >= g.pageCount) return false;
+  int cw = 120;
+  if (g.canvas)
+  {
+    RECT cr{};
+    GetClientRect(g.canvas, &cr);
+    cw = cr.right - cr.left;
+  }
+  std::vector<RECT> rects;
+  int cwDummy = 0, chDummy = 0;
+  LayoutPages(cw, rects, cwDummy, chDummy);
+  if (page >= (int)rects.size()) return false;
+  const RECT& pr = rects[page];
+  if (pr.right - pr.left < 1 || pr.bottom - pr.top < 1) return false;
+  const POINT org = PageOrigin((int)std::lround(g.scrollX),
+                               (int)std::lround(g.scrollY));
+  const double s = g.zoom > 0 ? g.zoom : 1.0;
+  const double pw = PageW(page), ph = PageH(page);
+  auto toPdf = [&](POINT p, double& x, double& y) {
+    double lx = (p.x - (pr.left + org.x)) / s;
+    double ly = ph - (p.y - (pr.top + org.y)) / s;
+    lx = lx < 0 ? 0 : (lx > pw ? pw : lx);
+    ly = ly < 0 ? 0 : (ly > ph ? ph : ly);
+    x = lx;
+    y = ly;
+  };
+  double x1 = 0, y1 = 0, x2 = 0, y2 = 0;
+  toPdf(a, x1, y1);
+  toPdf(b, x2, y2);
+  const double l = std::min(x1, x2), r = std::max(x1, x2);
+  const double bo = std::min(y1, y2), to = std::max(y1, y2);
+  out = FS_RECTF{(float)l, (float)to, (float)r, (float)bo};
+  return true;
 }
 
 static BOOL CALLBACK PaneTabEnum(HWND h, LPARAM)
@@ -5601,19 +5761,20 @@ static void DoCommand(int id)
     case ID_TAB_SECURITY: SwitchRibbonTab(6); break;
     case ID_PANE_THUMBS: SetPane(0); break;
     case ID_PANE_BOOKMARKS: SetPane(1); break;
-    case ID_ANN_HL:    InsertAnnotCurrent(ID_ANN_HL); break;
-    case ID_ANN_UL:    InsertAnnotCurrent(ID_ANN_UL); break;
-    case ID_ANN_NOTE:  InsertAnnotCurrent(ID_ANN_NOTE); break;
-    case ID_ANN_TEXT:  InsertAnnotCurrent(ID_ANN_TEXT); break;
-    case ID_ANN_SHAPE: InsertAnnotCurrent(ID_ANN_SHAPE); break;
-    case ID_ANN_STAMP: InsertAnnotCurrent(ID_ANN_STAMP); break;
+    case ID_ANN_HL:    SetAnnotTool(ID_ANN_HL); break;
+    case ID_ANN_UL:    SetAnnotTool(ID_ANN_UL); break;
+    case ID_ANN_NOTE:  SetAnnotTool(ID_ANN_NOTE); break;
+    case ID_ANN_TEXT:  SetAnnotTool(ID_ANN_TEXT); break;
+    case ID_ANN_SHAPE: SetAnnotTool(ID_ANN_SHAPE); break;
+    case ID_ANN_STAMP: SetAnnotTool(ID_ANN_STAMP); break;
     case ID_ANN_LINK:
     {
+      // Ask for the target first, then let the user drag its rectangle.
       std::wstring uri;
       if (PromptLinkUri(uri, g_linkUri))
       {
         g_linkUri = uri;
-        InsertAnnotCurrent(ID_ANN_LINK);
+        SetAnnotTool(ID_ANN_LINK);
       }
       break;
     }
@@ -6341,6 +6502,7 @@ static LRESULT CALLBACK FrameProc(HWND hw, UINT msg, WPARAM wp, LPARAM lp)
           case VK_F5: DoCommand(ID_SPREAD); return 0;
           case VK_F8: DoCommand(ID_SIDEBAR); return 0;
           case VK_DELETE: DoCommand(g.toolSelect ? ID_OBJ_DELETE : ID_DELETE); return 0;
+          case VK_ESCAPE: CancelAnnotTool(); return 0;
         }
       }
       return 0;
@@ -7519,6 +7681,129 @@ check("saved %PDF header", bytes.size() > 8 &&
       FPDF_CloseDocument(an2);
     }
     FPDF_CloseDocument(an);
+  }
+
+  {
+    // --- Drag-to-draw annotation placement. The GUI rubber-band is not
+    // reachable headless, but the two pieces that decide where the annotation
+    // lands - canvas drag -> PDF rectangle, and InsertAnnot at that rectangle -
+    // are. This is what makes "drag-to-draw links" more than a fixed box.
+    FPDF_DOCUMENT dd = FPDF_CreateNewDocument();
+    FPDFPage_New(dd, 0, 612.0, 792.0);
+    check("drag: doc built", dd != nullptr);
+
+    const FPDF_DOCUMENT keepDoc = g.doc;
+    const int keepCount = g.pageCount;
+    const double keepZoom = g.zoom;
+    const int keepScrollX = g.scrollX, keepScrollY = g.scrollY;
+    const int keepSel = g.selected;
+    g.doc = dd;
+    g.pageCount = 1;
+    g.selected = 0;
+
+    // With no canvas the layout falls back to cw=120; find the page's device
+    // rect so the simulated drags land on real points.
+    std::vector<RECT> rects;
+    int lw = 0, lh = 0;
+    LayoutPages(120, rects, lw, lh);
+    check("drag: page rect available", !rects.empty() &&
+          rects[0].right - rects[0].left > 1 && rects[0].bottom - rects[0].top > 1);
+    if (!rects.empty())
+    {
+      const POINT org = PageOrigin((int)std::lround(g.scrollX),
+                                   (int)std::lround(g.scrollY));
+      const int px = rects[0].left + org.x;
+      const int py = rects[0].top + org.y;
+      const int w = rects[0].right - rects[0].left;
+      const int h = rects[0].bottom - rects[0].top;
+
+      // Top-left to bottom-right drag.
+      FS_RECTF r1{};
+      bool ok1 = DragToPageRect(0, POINT{px + w / 4, py + h / 4},
+                                POINT{px + w / 2, py + h / 2}, r1);
+      check("drag: rect computed", ok1);
+      check("drag: rect ordered", r1.left < r1.right && r1.bottom < r1.top);
+      check("drag: rect within page", r1.left >= 0 && r1.top <= 792.0f &&
+            r1.right <= 612.0f && r1.bottom >= 0);
+
+      // Reverse drag (bottom-right to top-left) must produce the same rect.
+      FS_RECTF r2{};
+      bool ok2 = DragToPageRect(0, POINT{px + w / 2, py + h / 2},
+                                POINT{px + w / 4, py + h / 4}, r2);
+      check("drag: reverse drag ordered", ok2 &&
+            std::fabs(r1.left - r2.left) < 1.0f &&
+            std::fabs(r1.top - r2.top) < 1.0f &&
+            std::fabs(r1.right - r2.right) < 1.0f &&
+            std::fabs(r1.bottom - r2.bottom) < 1.0f);
+
+      // A drag that leaves the page is clamped, not dropped.
+      FS_RECTF r3{};
+      bool ok3 = DragToPageRect(0, POINT{px + w / 4, py + h / 4},
+                                POINT{px + w + 500, py + h + 500}, r3);
+      check("drag: off-page drag clamped", ok3 && r3.right <= 612.0f + 0.01f &&
+            r3.bottom >= -0.01f);
+
+      // Geometry must survive a zoom change (scales to the same PDF rect).
+      g.zoom = 2.0;
+      std::vector<RECT> zr;
+      int zw = 0, zh = 0;
+      LayoutPages(120, zr, zw, zh);
+      if (!zr.empty())
+      {
+        const int zx = zr[0].left + org.x, zy = zr[0].top + org.y;
+        const int zww = zr[0].right - zr[0].left, zhh = zr[0].bottom - zr[0].top;
+        FS_RECTF rz{};
+        bool okz = DragToPageRect(0, POINT{zx + zww / 4, zy + zhh / 4},
+                                  POINT{zx + zww / 2, zy + zhh / 2}, rz);
+        check("drag: zoom-independent placement",
+              okz && std::fabs(rz.left - r1.left) < 2.0f &&
+              std::fabs(rz.right - r1.right) < 2.0f &&
+              std::fabs(rz.top - r1.top) < 2.0f &&
+              std::fabs(rz.bottom - r1.bottom) < 2.0f);
+      }
+      g.zoom = 1.0;
+
+      // InsertAnnot at an explicit rectangle must honor it exactly.
+      FS_RECTF want{100.0f, 500.0f, 300.0f, 480.0f};
+      check("drag: link inserted at drawn rect",
+            InsertAnnot(dd, 0, ID_ANN_LINK, &want));
+      FPDF_PAGE dp = FPDF_LoadPage(dd, 0);
+      if (dp)
+      {
+        FPDF_ANNOTATION da = FPDFPage_GetAnnot(dp, 0);
+        FS_RECTF gotR{};
+        bool gr = da && FPDFAnnot_GetRect(da, &gotR);
+        check("drag: drawn rect persisted",
+              gr && std::fabs(gotR.left - want.left) < 0.5f &&
+              std::fabs(gotR.top - want.top) < 0.5f &&
+              std::fabs(gotR.right - want.right) < 0.5f &&
+              std::fabs(gotR.bottom - want.bottom) < 0.5f);
+        if (da) FPDFPage_CloseAnnot(da);
+        FPDF_ClosePage(dp);
+      }
+      else check("drag: page with drawn annot loads", false);
+    }
+    else check("drag: page rect available", false);
+
+    // Arming and cancelling the tool must be reflected in state (the cursor and
+    // status hints are drawn from these fields).
+    SetAnnotTool(ID_ANN_LINK);
+    check("drag: arming sets tool", g.annTool == ID_ANN_LINK && !g.annDrag);
+    SetAnnotTool(ID_ANN_SHAPE);
+    check("drag: re-arming switches kind", g.annTool == ID_ANN_SHAPE);
+    g.annDrag = true;
+    g.annPage = 0;
+    CancelAnnotTool();
+    check("drag: cancel clears tool", g.annTool == 0 && !g.annDrag &&
+          g.annPage == -1);
+
+    g.doc = keepDoc;
+    g.pageCount = keepCount;
+    g.selected = keepSel;
+    g.zoom = keepZoom;
+    g.scrollX = keepScrollX;
+    g.scrollY = keepScrollY;
+    FPDF_CloseDocument(dd);
   }
 
   {

@@ -55,15 +55,16 @@ Produces `dist\Stitchup.exe` + `dist\pdfium.dll`.
   parchment scroll with an inked quill), and a light/dark color theme
 - Bookmarks pane lists the PDF outline (nested); clicking a bookmark jumps to
   its page
-- Annotate (Home > Annotate group or Edit > Annotate menu): insert highlight,
-  underline, sticky note, text box, shape, stamp and link annotations on the
-  current page; annotations persist through Save and keep their rendered
-  appearance
+- Annotate (Home > Annotate group or Edit > Annotate menu): pick highlight,
+  underline, sticky note, text box, shape, stamp or link, then **drag on the
+  page to draw its rectangle** (a plain click uses the kind's default
+  placement; Esc cancels); annotations persist through Save and keep their
+  rendered appearance
 - Links: clicking an internal link jumps to its destination page; clicking a
   URI link opens the URL in the default browser (hand cursor over link areas)
 - Link creation (Home > Annotate group "Link..." or Edit > Annotate > Link...):
-  the dialog asks for a web address, then places a clickable /Link annotation on
-  the current page. A link is created with the annotation API
+  the dialog asks for a web address, then a drag on the page draws the clickable
+  /Link rectangle. A link is created with the annotation API
   (`FPDFPage_CreateAnnot` + `FPDFAnnot_SetURI`), which the bundled PDFium already
   supports, so no newer runtime is required. Only web (URI) targets are
   supported — PDFium can read page destinations but offers no API to write one,
@@ -123,8 +124,8 @@ project (github.com/bblanchon/pdfium-binaries). Non-GPL build.
   annotation, and PDFium exposes `FPDFPage_CreateAnnot` plus
   `FPDFAnnot_SetURI` for writing the target. A newer `pdfium.dll` is therefore
   not required; the checked `chromium/8076` build exports the same set.
-- The link dialog currently places the link at a default position (190x20 pt at
-  12% / 62% of the page); drag-to-draw the link rectangle is not implemented
-  yet.
+- Annotation placement is drag-to-draw: pick a tool, drag the rectangle on the
+  page. A plain click still uses a sensible default rectangle, and Esc cancels
+  the armed tool. (The earlier build placed every annotation at a fixed spot.)
 - Tools menu/ribbon tab hosts the Security (Save As Encrypted) and Export
   (Export Text / Export CSV) groups.

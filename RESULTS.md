@@ -21,7 +21,7 @@ user rejected as a product (no GUI).
 
 Command: `Stitchup.exe --self-test`
 
-Result: **268 passed, 0 failed** (exit code 0).
+Result: **281 passed, 0 failed** (exit code 0).
 
 Select / Move Content Object (`obj:` checks covering content-object editing):
 clicking a content object (text run or vector path) on the current page selects
@@ -357,3 +357,35 @@ Not covered by automation, because they require interaction: the file dialogs
 annotation dialogs (Note, Free Text, Stamp, Link), MessageBox prompts, and
 the About box. Their underlying kernels are covered by the existing `tx:`,
 `csv:`, `enc:`, `wat:`, `annot:` and `link:` checks.
+
+## v0.11.0 - drag-to-draw annotation placement
+
+Previously every annotation was created at a fixed spot. Now picking an
+annotate command arms a drawing tool: the next left-drag on a page defines the
+annotation rectangle, with a live dotted rubber band. A plain click (a drag of
+four pixels or less) still falls back to the kind's conventional default
+rectangle, so the old one-click flow is preserved. `Esc` cancels an armed tool,
+and the status bar shows a hint while one is armed.
+
+- `InsertAnnot()` gained an optional `const FS_RECTF* rect`; each kind uses the
+  supplied rectangle instead of its default (highlight/underline derive their
+  quad points from it). Existing calls keep the default placement, so the
+  `annot:` checks are unchanged.
+- `DragToPageRect(page, a, b, FS_RECTF&)` converts a canvas-client drag into a
+  PDF-space rectangle: it flips y, orders the two corners, and clamps to the
+  page. Kept pure (falls back to cw=120 with no canvas) so it is self-testable.
+- `SetAnnotTool` / `CancelAnnotTool` manage the armed-tool state and crosshair
+  cursor; `CloseDoc` clears it. The drag is captured on mouse-down and released
+  on mouse-up.
+- The link flow still prompts for the URI first (only URI targets are writable),
+  then arms the drag.
+
+Self-test grew from 268 to 281 checks: rectangle ordering, reverse-drag
+equivalence, off-page clamping, zoom-independent placement, that `InsertAnnot`
+at an explicit rectangle persists that exact rectangle after save+reload, and
+the arm/re-arm/cancel state transitions. Result: 281 passed, 0 failed. App
+smoke-launches.
+
+Known limits unchanged: internal page-destination links still cannot be created
+(PDFium exposes no destination-writing API), and the visual feel of the
+rubber-band drag itself is verified by hand, not headless.
