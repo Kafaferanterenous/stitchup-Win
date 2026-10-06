@@ -1,4 +1,4 @@
-﻿# RESULTS - Project 027: Stitchup PDF Editor
+# RESULTS - Project 027: Stitchup PDF Editor
 
 ## Goal
 
@@ -589,3 +589,53 @@ every page had been rotated:
 
 Not verified headlessly: the thumbnail multi-select painting and the
 status-bar count, since the test desktop does not composite a visible window.
+
+## v0.12.6
+
+Drag-to-reorder rebuilt the document from imported pages, and anything that does
+not live inside a page object was thrown away in the process. Two of those were
+silent losses, one was the feature deferred in v0.12.5.
+
+- Drag-to-reorder now moves the whole selected block when it is contiguous,
+  which is always true for a Shift-click range. A scattered Ctrl-picked
+  selection stays click-only rather than being moved with its gaps shuffled,
+  since there is no single correct answer for where the pages in between go.
+- The file path and name survive the rebuild. CloseDoc() clears both, and the
+  old code did not put them back, so Ctrl+S after a drag opened Save As instead
+  of saving in place and the tab strip showed "Untitled".
+- The PDF outline is carried across and re-pointed at the new page indices. The
+  rebuild imports pages only, and imported pages carry no document-level
+  /Outlines, so a single drag used to delete every bookmark in the file. The
+  bundled PDFium predates the outline writing API (FPDFBookmark_Create and
+  FPDFDest_CreateDest are absent), so the outline is read out of the outgoing
+  document and re-registered through the flat bookmark list that the save path
+  already appends as an incremental update. The cost is that nesting is
+  flattened: a PDF outline is a tree and the bookmark list is flat.
+- Bookmarks added in the same session are remapped through the reorder as well,
+  and page rotation keeps following its page rather than staying on the index.
+- The selection follows the pages it covered to their new indices.
+- Ctrl-clicking the only selected page no longer empties the selection. It used
+  to leave selected pointing at a page that was no longer selected, so
+  "rotate the selection" skipped the page the user was looking at.
+
+The block-move arithmetic is the kind of thing that looks right and is not:
+order[k] is the old index of the page that lands at new index k, so anything
+referring to a page by its old index has to be mapped through the inverse
+permutation. The first version applied order forwards and two tests caught it
+(ookmark remapped to the new page got 2 want 0, earlier bookmark keeps its
+page got 3 want 1). The selection capture had the same class of problem for a
+different reason: it was read after CloseDoc() had already cleared it, so it
+has to be captured with the rotation, before the rebuild.
+
+25 new eorder: / sel: checks: block move with the resulting order and the
+selection that followed it, path and name preservation, rotation travelling with
+its page, an outline fixture built through the real save-time writer and then
+reordered with its bookmarks asserted to survive, be remapped, and still be
+present in the file after a further save. Self-test grew from 331 to 356 checks:
+356 passed, 0 failed, exit code 0.
+
+Not verified: the drag gesture itself and the thumbnail painting, by mouse or
+otherwise. On this test desktop the Pages pane reports a zero-width rect, so the
+window never lays out and there is nothing to drive; the reorder is covered
+headlessly through ReorderPagesTo() and SelectedBlock() instead, which is
+the same code the gesture calls.

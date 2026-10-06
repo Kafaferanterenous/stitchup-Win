@@ -58,7 +58,18 @@ Produces `dist\Stitchup.exe` + `dist\pdfium.dll`.
   then act on the whole selection, and Edit > Rotate All Pages Right does the
   document in one step. A single-page selection behaves exactly as before, and
   the status bar shows how many pages are selected. A document always keeps at
-  least one page.
+  least one page. Ctrl-clicking the only selected page again will not empty the
+  selection, so the page you are looking at is always part of it.
+- Drag-to-reorder moves the whole selected block when it is contiguous (which a
+  Shift-click range always is); a scattered Ctrl-picked selection stays
+  click-only, because moving it as one piece would change what sits in the gaps.
+  Reordering no longer loses anything that lives outside the pages: page
+  rotation follows its page, the selection follows the pages it covered, and the
+  PDF outline is carried over and re-pointed at the new page indices instead of
+  being dropped by the rebuild. The file path is preserved too, so Ctrl+S still
+  saves in place. One tradeoff: the outline's nesting is flattened, because the
+  bundled PDFium cannot write outlines and they are re-registered through the
+  flat bookmark list that the save path already appends.
 - View: zoom in/out, 100%, fit width, fit page, previous/next page, and a
   Dark Mode toggle (View > Dark Mode, `Ctrl+D`, remembered between runs)
 - Modern flat UI: flat ribbon (hover/pressed states, accent brand strip,

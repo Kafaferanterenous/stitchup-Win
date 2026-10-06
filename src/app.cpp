@@ -1000,6 +1000,26 @@ static int PageSelCount()
   return n;
 }
 
+// The selected pages as ascending indices, or empty if nothing is selected.
+static std::vector<int> SelectedBlock()
+{
+  std::vector<int> out;
+  for (size_t i = 0; i < g.pageSel.size(); ++i)
+    if (g.pageSel[i]) out.push_back((int)i);
+  return out;
+}
+
+// True when the selected pages form one contiguous run, which is what a
+// reorder can move without changing anything else's position.
+static bool SelectedContiguous()
+{
+  std::vector<int> s = SelectedBlock();
+  if (s.size() < 2) return !s.empty();
+  for (size_t i = 1; i < s.size(); ++i)
+    if (s[i] != s[i - 1] + 1) return false;
+  return true;
+}
+
 // Plain click: the clicked page becomes the only selection.
 static void SelectOnly(int i)
 {
@@ -1010,13 +1030,45 @@ static void SelectOnly(int i)
   g.selAnchor = i;
 }
 
+// Selects an explicit set of pages (used after a reorder, where the same pages
+// are now at different indices). Out-of-range indices are dropped.
+static void SetPageSelTo(std::vector<int> idxs)
+{
+  if ((int)g.pageSel.size() != g.pageCount)
+    g.pageSel.assign(std::max(0, g.pageCount), false);
+  for (size_t k = 0; k < g.pageSel.size(); ++k) g.pageSel[k] = false;
+  for (int i : idxs)
+    if (i >= 0 && i < (int)g.pageSel.size()) g.pageSel[i] = true;
+  // The focus page is always part of the selection, otherwise "rotate the
+  // selection" would not include the page the user is looking at.
+  if (!g.pageSel.empty())
+  {
+    g.selected = std::max(0, std::min(g.selected, (int)g.pageSel.size() - 1));
+    g.pageSel[g.selected] = true;
+  }
+  g.selAnchor = g.selected;
+}
+
 // Ctrl-click: add or remove one page, leaving the rest of the selection alone.
 static void TogglePageSel(int i)
 {
   if (i < 0 || i >= (int)g.pageSel.size()) return;
-  g.pageSel[i] = !g.pageSel[i];
+  if (g.pageSel[i])
+  {
+    // Never empty the selection: that would leave the focus page unselected and
+    // "rotate the selection" would skip the page the user is looking at. Clicking
+    // the last selected page again therefore does nothing.
+    if (PageSelCount() <= 1) return;
+    g.pageSel[i] = false;
+    if (g.selected == i)
+      for (int k = 0; k < (int)g.pageSel.size(); ++k)
+        if (g.pageSel[k]) { g.selected = k; break; }
+  }
+  else
+  {
+    g.pageSel[i] = true;
+  }
   g.selAnchor = i;
-  if (!g.pageSel[i] && g.selected == i) g.selected = i;  // focus stays put
 }
 
 // Shift-click: extend the selection from the anchor across a contiguous range.
@@ -3237,32 +3289,121 @@ static void CropCurrentPageToContent()
   InvalidateRect(g.thumbs, nullptr, TRUE);
 }
 
-static void ReorderDoc(int from, int to)
-{
-  if (from == to || g.pageCount < 2) return;
-  std::vector<int> order;
-  order.reserve(g.pageCount);
-  for (int i = 0; i < g.pageCount; ++i) order.push_back(i);
-  int moving = order[from];
-  order.erase(order.begin() + from);
-  if (to >= (int)order.size()) to = (int)order.size() - 1;
-  order.insert(order.begin() + (to < from ? to : to), moving);
+static bool GetBookmarkTitle(FPDF_BOOKMARK bm, std::wstring& out);
 
+// A page reorder rebuilds the document out of imported pages, and imported pages
+// carry no document-level /Outlines, so a drag-to-reorder used to silently drop
+// every bookmark in the file. The PDFium build bundled here predates the outline
+// writing API (no FPDFBookmark_Create / FPDFDest_CreateDest), but the save path
+// already appends outlines as an incremental update, so the outline is read out
+// of the outgoing document and re-registered through that list instead. The
+// cost is that nesting is lost: a PDF outline is a tree, the bookmark list is
+// flat.
+static void CaptureOutlineAsMarks(FPDF_DOCUMENT doc, FPDF_BOOKMARK parent,
+                                  std::vector<UserBookmark>& out, int depth = 0)
+{
+  if (depth > 48 || !doc) return;
+  for (FPDF_BOOKMARK bm = FPDFBookmark_GetFirstChild(doc, parent); bm;
+       bm = FPDFBookmark_GetNextSibling(doc, bm))
+  {
+    UserBookmark m;
+    if (GetBookmarkTitle(bm, m.title) && !m.title.empty())
+    {
+      FPDF_DEST dest = FPDFBookmark_GetDest(doc, bm);
+      if (dest)
+      {
+        m.page = FPDFDest_GetDestPageIndex(doc, dest);
+        if (m.page >= 0)
+        {
+          FPDF_BOOL hasX = 0, hasY = 0, hasZ = 0;
+          float lx = 0, ly = 0, lz = 0;
+          if (FPDFDest_GetLocationInPage(dest, &hasX, &hasY, &hasZ, &lx, &ly,
+                                         &lz) && hasZ && lz > 0)
+          {
+            m.atView = true;
+            m.x = hasX ? lx : 0;
+            m.y = hasY ? ly : 0;
+            m.zoom = lz;
+          }
+          unsigned long n = 0;
+          FS_FLOAT params[8] = {};
+          if (FPDFDest_GetView(dest, &n, params) && n == 3) m.atView = true;
+          out.push_back(m);
+        }
+      }
+    }
+    CaptureOutlineAsMarks(doc, bm, out, depth + 1);
+  }
+}
+
+// Rebuilds the document with its pages in a new order. `moving` is the set of
+// old page indices being moved, ascending; `to` is the index in the ORIGINAL
+// ordering where the moved block should land. Page rotation, the file path and
+// the outline all survive, because every one of them lives outside the imported
+// page objects and so is lost by the rebuild unless it is carried over.
+static void ReorderPagesTo(const std::vector<int>& moving, int to)
+{
+  const int n = g.pageCount;
+  if (n < 2 || moving.empty()) return;
+
+  std::vector<bool> isMoving(n, false);
+  for (int m : moving)
+    if (m >= 0 && m < n) isMoving[m] = true;
+
+  // Insertion point in the reduced list: everything that was removed and sat
+  // before `to` shifts the target left by that much.
+  int adj = to;
+  for (int i = 0; i < n && i < to; ++i)
+    if (isMoving[i]) --adj;
+  adj = std::max(0, std::min(adj, n - (int)moving.size()));
+
+  std::vector<int> order;
+  order.reserve(n);
+  for (int i = 0; i < n; ++i)
+    if (!isMoving[i]) order.push_back(i);
+  order.insert(order.begin() + adj, moving.begin(), moving.end());
+
+  // order[k] is the OLD index of the page that lands at new index k, so anything
+  // that refers to a page by its old index has to be mapped through the inverse.
+  std::vector<int> toNew(n, -1);
+  for (int k = 0; k < n; ++k) toNew[order[k]] = k;
+
+  bool sameOrder = true;
+  for (int i = 0; i < n; ++i)
+    if (order[i] != i) { sameOrder = false; break; }
+  if (sameOrder) return;
+
+  // Everything below has to survive the CloseDoc() in the middle, because the
+  // rebuild drops it: CloseDoc() clears the file path, and imported pages carry
+  // neither rotation nor outlines.
   std::map<int, int> rot;
-  for (int i = 0; i < g.pageCount; ++i)
+  for (int i = 0; i < n; ++i)
   {
     FPDF_PAGE p = FPDF_LoadPage(g.doc, i);
     if (p) { rot[i] = FPDFPage_GetRotation(p); FPDF_ClosePage(p); }
   }
+  std::vector<UserBookmark> marks = g.marks;   // added this session
+  CaptureOutlineAsMarks(g.doc, nullptr, marks);
+  // Must be read before CloseDoc() below, which clears the selection.
+  const std::vector<int> wasSel = SelectedBlock();
+  const std::wstring keepPath = g.path;
+  const std::wstring keepName = g.name;
 
   FPDF_DOCUMENT nd = FPDF_CreateNewDocument();
-  for (int k = 0; k < (int)order.size(); ++k)
+  if (!nd) return;
+  for (int k = 0; k < n; ++k)
   {
     int idx = order[k];
     FPDF_ImportPagesByIndex(nd, g.doc, &idx, 1, k);
   }
+  // Every bookmark now points at an old page index; remap through the new order.
+  for (UserBookmark& m : marks)
+    if (m.page >= 0 && m.page < n) m.page = toNew[m.page];
+
   CloseDoc();
   g.doc = nd;
+  g.path = keepPath;
+  g.name = keepName;
   RefreshState();
 
   for (int k = 0; k < g.pageCount; ++k)
@@ -3270,23 +3411,26 @@ static void ReorderDoc(int from, int to)
     FPDF_PAGE p = FPDF_LoadPage(g.doc, k);
     if (p)
     {
-      int srcIdx = order[k];
-      FPDFPage_SetRotation(p, rot[srcIdx]);
+      FPDFPage_SetRotation(p, rot[order[k]]);
       FPDF_ClosePage(p);
     }
   }
+  g.marks = marks;
   g.dirty = true;
-  // Every index moved, so the old selection is meaningless. Focus the page that
-  // was dragged, at its new index, and select only that.
-  int newFrom = 0;
-  for (int k = 0; k < (int)order.size(); ++k)
-    if (order[k] == from) { newFrom = k; break; }
-  g.selected = newFrom;
-  PrunePageSel();
-  SelectOnly(newFrom);
+
+  // Every index moved, so the old selection was captured as page identities
+  // rather than indices; keep those same pages selected at their new indices.
+  std::vector<int> stillSel;
+  for (int i : wasSel)
+    if (i >= 0 && i < n && toNew[i] >= 0) stillSel.push_back(toNew[i]);
+  std::sort(stillSel.begin(), stillSel.end());
+  int newFocus = stillSel.empty() ? 0 : stillSel.front();
+  g.selected = newFocus;
+  SetPageSelTo(stillSel);
   g.bmDirty = true;
   InvalidateRect(g.canvas, nullptr, TRUE);
   InvalidateRect(g.thumbs, nullptr, TRUE);
+  if (g.status) InvalidateRect(g.status, nullptr, TRUE);
 }
 
 // ---------------------------------------------------------------------------
@@ -3731,10 +3875,11 @@ static LRESULT CALLBACK ThumbsProc(HWND hw, UINT msg, WPARAM wp, LPARAM lp)
           TogglePageSel(pi);
         else
           SelectOnly(pi);
-        // Drag-to-reorder only makes sense for one page: moving a block would
-        // need the whole selection to move together, so a multi-selection click
-        // selects without arming the drag.
-        if (PageSelCount() == 1)
+        // Drag-to-reorder moves the selected block. The block has to be
+        // contiguous, which a Shift-built range always is; a Ctrl-picked
+        // scattered selection is not, and reordering it as-is would silently
+        // drop the gaps, so that stays click-only.
+        if (SelectedContiguous())
         {
           g.dragPage = pi;
           g.dragCursor = pi;
@@ -3774,12 +3919,14 @@ static LRESULT CALLBACK ThumbsProc(HWND hw, UINT msg, WPARAM wp, LPARAM lp)
       ReleaseCapture();
       if (g.dragPage >= 0)
       {
-        int from = g.dragPage;
         int to = g.dragCursor;
+        std::vector<int> sel = SelectedBlock();
         g.dragPage = -1;
         g.dragCursor = -1;
-        if (from >= 0 && to >= 0 && from != to && from != to - 1)
-          ReorderDoc(from, to);
+        bool noop = sel.empty();
+        for (int s : sel)
+          if (s == to || s == to - 1) noop = true;  // dropped on itself
+        if (!noop && to >= 0) ReorderPagesTo(sel, to);
         InvalidateRect(hw, nullptr, FALSE);
       }
       return 0;
@@ -9450,12 +9597,204 @@ check("saved %PDF header", bytes.size() > 8 &&
       check("sel: delete-all is caught by the keep-one-page guard",
             PageSelCount() >= FPDF_GetPageCount(sd2));
 
+      // Ctrl-clicking the focused page off used to leave g.selected pointing at a
+      // page that was no longer selected, so "rotate the selection" would skip
+      // the page on screen.
+      g.selected = 2;
+      SelectOnly(2);
+      TogglePageSel(0);
+      g.selected = 2;
+      TogglePageSel(2);   // deselect the focused page
+      check("sel: ctrl-clicking the focus page off keeps it selected",
+            IsPageSel(g.selected));
+      checkEq("sel: focus moved to a still-selected page", PageSelCount(), 1);
+
+      // A scattered Ctrl-picked selection cannot be dragged as a block without
+      // changing what sits in the gaps, so it must stay click-only.
+      SelectOnly(0);
+      TogglePageSel(3);
+      check("sel: scattered selection is not contiguous", !SelectedContiguous());
+      checkEq("sel: scattered selection lists both pages",
+              (int)SelectedBlock().size(), 2);
+      SelectOnly(0);
+      TogglePageSel(1);
+      check("sel: adjacent pages are contiguous", SelectedContiguous());
+
       g.doc = keepSelDoc;
       g.pageCount = keepSelCount;
       g.selected = keepSelFocus;
       PrunePageSel();
       SelectOnly(keepSelFocus);
       FPDF_CloseDocument(sd2);
+    }
+  }
+
+{
+    // --- Page reorder: block move, and what the rebuild used to throw away ---
+    // A reorder rebuilds the document from imported pages. Imported pages carry
+    // no /Outlines and CloseDoc() clears the file path, so before this was
+    // handled a single drag silently dropped every bookmark and turned the next
+    // Ctrl+S into a Save As. Both are asserted here, along with the block move
+    // itself and rotation following its page.
+    //
+    // ReorderPagesTo() takes ownership of g.doc and closes it, so each document
+    // built here is used once and never touched again afterwards.
+    FPDF_DOCUMENT keepReorderDoc = g.doc;
+    const int keepReorderCount = g.pageCount;
+    const int keepReorderFocus = g.selected;
+    const std::wstring keepReorderPath = g.path;
+    const std::wstring keepReorderName = g.name;
+    const std::vector<UserBookmark> keepReorderMarks = g.marks;
+
+    // --- part 1: block move, path and rotation ---
+    FPDF_DOCUMENT rd = FPDF_CreateNewDocument();
+    check("reorder: scratch doc created", rd != nullptr);
+    if (rd)
+    {
+      for (int i = 0; i < 5; ++i) FPDFPage_New(rd, i, 612.0, 792.0);
+      // Page 0 gets a rotation, so the test can prove rotation travels with the
+      // page rather than staying on the index.
+      FPDF_PAGE r0 = FPDF_LoadPage(rd, 0);
+      if (r0) { FPDFPage_SetRotation(r0, 1); FPDF_ClosePage(r0); }
+
+      g.doc = rd;
+      g.pageCount = FPDF_GetPageCount(rd);
+      g.path = L"C:\\somewhere\\plan.pdf";
+      g.name = L"plan.pdf";
+      g.marks.clear();
+      PrunePageSel();
+      SelectOnly(1);
+      TogglePageSel(2);       // block {1,2}, the way a Shift-click builds it
+      g.selected = 1;
+
+      // Move the contiguous block {1,2} so it lands after page 3. Expected
+      // order: 0, 3, 1, 2, 4.
+      ReorderPagesTo(SelectedBlock(), 4);
+      checkEq("reorder: page count unchanged", g.pageCount, 5);
+      check("reorder: file path survives the rebuild",
+            g.path == L"C:\\somewhere\\plan.pdf");
+      check("reorder: file name survives the rebuild", g.name == L"plan.pdf");
+      {
+        int got = -1;
+        FPDF_PAGE p = FPDF_LoadPage(g.doc, 0);
+        if (p) { got = FPDFPage_GetRotation(p); FPDF_ClosePage(p); }
+        checkEq("reorder: rotation stayed with its page", got, 1);
+      }
+      {
+        // The moved block is still selected, at its new indices.
+        std::vector<int> sel = SelectedBlock();
+        checkEq("reorder: moved block still selected", (int)sel.size(), 2);
+        bool at23 = sel.size() == 2 && sel[0] == 2 && sel[1] == 3;
+        check("reorder: selection followed the block to 2,3", at23);
+      }
+
+      FPDF_DOCUMENT built = g.doc;
+      g.doc = keepReorderDoc;
+      g.pageCount = keepReorderCount;
+      g.selected = keepReorderFocus;
+      g.path = keepReorderPath;
+      g.name = keepReorderName;
+      g.marks = keepReorderMarks;
+      PrunePageSel();
+      FPDF_CloseDocument(built);
+    }
+
+    // --- part 2: bookmarks survive the reorder and are remapped ---
+    // Built through the save-time writer rather than by hand, so the fixture is
+    // a real outline in a real file.
+    FPDF_DOCUMENT seed = FPDF_CreateNewDocument();
+    check("reorder: outline seed created", seed != nullptr);
+    if (seed)
+    {
+      for (int i = 0; i < 5; ++i) FPDFPage_New(seed, i, 612.0, 792.0);
+      std::vector<unsigned char> seedBuf;
+      g.doc = seed;
+      g.pageCount = FPDF_GetPageCount(seed);
+      g.marks.clear();
+      bool sok = SerializeForSave(seedBuf, false);
+      g.doc = keepReorderDoc;
+      check("reorder: outline seed serializes", sok);
+
+      if (sok)
+      {
+        std::vector<UserBookmark> bms;
+        bms.push_back({L"First", 0, false, 0, 0, 0});
+        bms.push_back({L"Second", 3, false, 0, 0, 0});
+        bms.push_back({L"Third", 4, false, 0, 0, 0});
+        std::string pdf(seedBuf.begin(), seedBuf.end());
+        std::wstring err;
+        const bool inj = AppendOutlines(pdf, bms, 5, &err);
+        check("reorder: outline fixture injected", inj);
+        if (inj)
+        {
+          FPDF_DOCUMENT od =
+              FPDF_LoadMemDocument(pdf.data(), (int)pdf.size(), nullptr);
+          check("reorder: outline fixture reloads", od != nullptr);
+          if (od)
+          {
+            g.doc = od;
+            g.pageCount = FPDF_GetPageCount(od);
+            g.marks.clear();
+            g.path = L"C:\\somewhere\\plan.pdf";
+            g.name = L"plan.pdf";
+            PrunePageSel();
+            SelectOnly(0);
+            g.selected = 0;
+            check("reorder: fixture starts with an outline",
+                  FPDFBookmark_GetFirstChild(od, nullptr) != nullptr);
+
+            // Move page 3 to the front. Expected order: 3, 0, 1, 2, 4.
+            ReorderPagesTo({3}, 0);
+            checkEq("reorder: outline bookmarks captured", (int)g.marks.size(), 3);
+            bool order2 = g.marks.size() == 3 &&
+                          g.marks[0].title == L"First" &&
+                          g.marks[1].title == L"Second" &&
+                          g.marks[2].title == L"Third";
+            check("reorder: bookmark order kept", order2);
+            if (order2)
+            {
+              // "Second" pointed at page 3, which is now page 0.
+              checkEq("reorder: bookmark remapped to the new page",
+                      g.marks[1].page, 0);
+              checkEq("reorder: earlier bookmark keeps its page",
+                      g.marks[0].page, 1);
+              checkEq("reorder: last bookmark keeps its page",
+                      g.marks[2].page, 4);
+            }
+            // Otherwise the recovered outline would be lost again on the next
+            // Ctrl+S, which is the whole point of capturing it.
+            std::vector<unsigned char> again;
+            const bool ok2 = SerializeForSave(again, false);
+            check("reorder: recovered outline saves", ok2);
+            if (ok2)
+            {
+              FPDF_DOCUMENT vr =
+                  FPDF_LoadMemDocument(again.data(), (int)again.size(), nullptr);
+              check("reorder: saved file reopens", vr != nullptr);
+              if (vr)
+              {
+                int cnt = 0;
+                for (FPDF_BOOKMARK bm = FPDFBookmark_GetFirstChild(vr, nullptr);
+                     bm; bm = FPDFBookmark_GetNextSibling(vr, bm))
+                  ++cnt;
+                checkEq("reorder: bookmarks present in the saved file", cnt, 3);
+                FPDF_CloseDocument(vr);
+              }
+            }
+            // ReorderPagesTo() replaced g.doc, so this is the rebuilt document.
+            FPDF_DOCUMENT built2 = g.doc;
+            g.doc = keepReorderDoc;
+            g.pageCount = keepReorderCount;
+            g.selected = keepReorderFocus;
+            g.path = keepReorderPath;
+            g.name = keepReorderName;
+            g.marks = keepReorderMarks;
+            PrunePageSel();
+            FPDF_CloseDocument(built2);
+          }
+        }
+      }
+      FPDF_CloseDocument(seed);
     }
   }
 
