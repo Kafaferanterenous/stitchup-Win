@@ -1,0 +1,40 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  windows:
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build
+        shell: cmd
+        run: |
+          call "%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -property installationPath > vspath.txt
+          set /p MSVCROOT=<vspath.txt
+          call "%MSVCROOT%\VC\Auxiliary\Build\vcvars64.bat"
+          cmake -S . -B build -G "NMake Makefiles" -DCMAKE_BUILD_TYPE=Release
+          cmake --build build
+          if not exist dist mkdir dist
+          copy /y "build\Stitchup.exe" "dist\Stitchup.exe" >nul
+          copy /y "third_party\pdfium\bin\pdfium.dll" "dist\pdfium.dll" >nul
+
+      # --self-test exits non-zero when any check fails.
+      - name: Self-test
+        shell: cmd
+        run: |
+          dist\Stitchup.exe --self-test
+          type test_result.txt
+
+      - name: Upload build
+        uses: actions/upload-artifact@v4
+        with:
+          name: Stitchup-windows
+          path: |
+            dist/Stitchup.exe
+            dist/pdfium.dll

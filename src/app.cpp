@@ -7535,7 +7535,9 @@ static bool SaveAsString(FPDF_DOCUMENT d, std::vector<unsigned char>& out)
   return ok;
 }
 
-static void SelfTest(const std::wstring& cwd)
+// Runs the headless checks, writing test_result.txt next to the exe. Returns
+// the number of failed checks so callers (including CI) can use the exit code.
+static int SelfTest(const std::wstring& cwd)
 {
   std::vector<std::string> lines;
   int pass = 0, fail = 0;
@@ -9317,6 +9319,7 @@ check("saved %PDF header", bytes.size() > 8 &&
   emit(std::string("SUMMARY ") + std::to_string(pass) +
        " passed, " + std::to_string(fail) + " failed");
   if (of) fclose(of);
+  return fail;
 }
 
 static bool DemoMode(const std::wstring& outPath, int pages)
@@ -9630,8 +9633,8 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int)
     std::wstring cwd(MAX_PATH, L'\0');
     DWORD n = GetCurrentDirectoryW((DWORD)cwd.size(), &cwd[0]);
     cwd.resize(n);
-    SelfTest(cwd);
-    return 0;
+    // Non-zero exit on failure so CI fails without parsing the log.
+    return SelfTest(cwd) == 0 ? 0 : 1;
   }
 
   std::wstring openFile;

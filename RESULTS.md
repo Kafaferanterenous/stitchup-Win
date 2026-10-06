@@ -497,3 +497,22 @@ smoke-launches.
 Not verifiable headlessly: the double-click dialog, the canvas pixel output, and
 the file picker were confirmed by driving the real window; no automated pixel
 test exists because the test session does not composite a visible desktop.
+
+## v0.12.3 - file version metadata + CI (2026-10-06)
+
+Two packaging/tooling gaps closed.
+
+- The exe carried no VERSIONINFO, so Windows showed blank Properties and tools
+  saw file version 0.0.0.0. `resources/app.rc` now carries a version resource
+  (`0.12.2.0`, description/product/company names, translation block). Verified
+  by reading `VersionInfo` off the built binary: FileVersion and ProductVersion
+  both report `0.12.2.0`.
+- There was no CI, so every build was verified by hand. Added
+  `.github/workflows/build.yml`: builds with MSVC on `windows-2022` using the
+  same CMake/NMake steps as `Build.cmd`, runs the self-test, and uploads the two
+  binaries as an artifact. For the workflow to fail on a regression,
+  `SelfTest` now returns its failure count and `--self-test` exits non-zero
+  instead of always 0 (previously a failing run still reported success to any
+  caller that checked the exit code).
+
+Self-test unchanged at 302 checks: 302 passed, 0 failed, exit code 0.

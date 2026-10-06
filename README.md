@@ -112,6 +112,17 @@ Produces `dist\Stitchup.exe` + `dist\pdfium.dll`.
   (two-page spread), F8 (toggle sidebar), Ctrl+T (new tab),
   Ctrl+Tab/Ctrl+Shift+Tab (next/previous tab)
 
+## Building / continuous integration
+
+`Build.cmd` configures with CMake + NMake, builds into `build\`, copies
+`Stitchup.exe` and `pdfium.dll` into `dist\`, and runs the self-test.
+
+`.github/workflows/build.yml` runs the same steps on every push to `main` and on
+pull requests: it builds with MSVC on `windows-2022`, runs
+`Stitchup.exe --self-test` (which exits non-zero if any check fails), and uploads
+`Stitchup.exe` + `pdfium.dll` as a build artifact. Releases are cut manually
+with `gh release create` so the tag always matches a verified local build.
+
 ## Third-party components
 
 | Component | Version | License        |
