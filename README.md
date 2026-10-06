@@ -161,3 +161,31 @@ project (github.com/bblanchon/pdfium-binaries). Non-GPL build.
   the armed tool. (The earlier build placed every annotation at a fixed spot.)
 - Tools menu/ribbon tab hosts the Security (Save As Encrypted) and Export
   (Export Text / Export CSV) groups.
+
+### Remaining goals
+
+Not yet implemented, roughly by how much a user notices them missing:
+
+- Print / Print Preview — no print command exists yet
+- Undo / Redo — every edit is immediate and cannot be reversed from the UI
+- Merge / Combine PDFs — only Import (append) is available
+- File compression / reduce file size
+- Digital signatures (needs a crypto library beyond what is linked)
+- Redaction (needs real content removal, not an overlay)
+- Internal page-destination link creation — blocked: PDFium reads destinations
+  but exposes no API to write one
+- Static single-exe build — blocked: requires rebuilding PDFium from source with
+  the static CRT, since the prebuilt import lib is not static
+
+### Nice to have
+
+- OCR, so scanned pages become searchable
+- Freehand / pen annotation
+- Metadata editor (title, author, subject, keywords)
+- View embedded file attachments
+- Drag a page into another open document
+- Remember per-page rotation across save
+- Autosave / crash recovery
+- Print-to-PDF as an explicit target
+- Select All and multi-select for content objects
+- AcroForm field filling

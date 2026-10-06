@@ -540,3 +540,7 @@ the tamper test also had to remove the stale `app.rc.res`.
 
 Self-test grew from 302 to 310 checks: 310 passed, 0 failed, exit code 0. Built
 exe reports FileVersion and ProductVersion `0.12.3.0`. App smoke-launches.
+
+A follow-up commit bumped `VERSION` to `0.12.4` and rebuilt so the shipped tag
+matches the stamped binary; local and CI runs both report 310 passed, 0 failed
+with FileVersion `0.12.4.0`.
