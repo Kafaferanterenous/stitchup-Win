@@ -50,6 +50,15 @@ Produces `dist\Stitchup.exe` + `dist\pdfium.dll`.
   first imported page)
 - Edit: rotate page CW/CCW, delete page, add blank page (Letter/A4), drag pages
   in the thumbnails panel to reorder
+- Multi-page selection in the Pages panel: Ctrl-click adds or removes a page,
+  Shift-click extends a contiguous range from the last click, Ctrl+Shift-click
+  adds a range, and Ctrl+A (Edit > Select All Pages) takes the whole document.
+  The focused page keeps the accent frame and the rest of the selection uses the
+  deeper accent. Rotate Right/Left (`Ctrl+R` / `Ctrl+Shift+R`) and Delete Page
+  then act on the whole selection, and Edit > Rotate All Pages Right does the
+  document in one step. A single-page selection behaves exactly as before, and
+  the status bar shows how many pages are selected. A document always keeps at
+  least one page.
 - View: zoom in/out, 100%, fit width, fit page, previous/next page, and a
   Dark Mode toggle (View > Dark Mode, `Ctrl+D`, remembered between runs)
 - Modern flat UI: flat ribbon (hover/pressed states, accent brand strip,
@@ -107,9 +116,9 @@ Produces `dist\Stitchup.exe` + `dist\pdfium.dll`.
   document is left unchanged
 - Drag & drop a PDF onto the window to open it; open via command-line argument
 - Shortcuts: Ctrl+N/O/S, Ctrl+Shift+S, Ctrl+R (rotate), Ctrl+[/Ctrl+], Delete,
-  Ctrl+0/1/2 (100%/fit width/fit page), Ctrl+F (find), F3 / Shift+F3 (find
-  next / previous), Ctrl+D (dark mode), PgUp/PgDn, Ctrl+wheel to zoom, F5
-  (two-page spread), F8 (toggle sidebar), Ctrl+T (new tab),
+  Ctrl+0/1/2 (100%/fit width/fit page), Ctrl+A (select all pages), Ctrl+F (find),
+  F3 / Shift+F3 (find next / previous), Ctrl+D (dark mode), PgUp/PgDn,
+  Ctrl+wheel to zoom, F5 (two-page spread), F8 (toggle sidebar), Ctrl+T (new tab),
   Ctrl+Tab/Ctrl+Shift+Tab (next/previous tab)
 
 ## Building / continuous integration
@@ -172,6 +181,8 @@ Not yet implemented, roughly by how much a user notices them missing:
 - File compression / reduce file size
 - Digital signatures (needs a crypto library beyond what is linked)
 - Redaction (needs real content removal, not an overlay)
+- Multi-page rotate/delete now works from a Pages-pane selection; Extract,
+  Split and Auto-Crop still act on the focused page only
 - Internal page-destination link creation — blocked: PDFium reads destinations
   but exposes no API to write one
 - Static single-exe build — blocked: requires rebuilding PDFium from source with
@@ -184,8 +195,7 @@ Not yet implemented, roughly by how much a user notices them missing:
 - Metadata editor (title, author, subject, keywords)
 - View embedded file attachments
 - Drag a page into another open document
-- Remember per-page rotation across save
 - Autosave / crash recovery
 - Print-to-PDF as an explicit target
-- Select All and multi-select for content objects
+- Select All and multi-select for content objects (pages now support it)
 - AcroForm field filling

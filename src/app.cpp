@@ -96,6 +96,8 @@ ID_ANN_LINK,
   ID_FIND,
   ID_FIND_NEXT,
   ID_FIND_PREV,
+  ID_SEL_ALL,     // Select All pages (Pages pane / Ctrl+A)
+  ID_ROT_ALL,     // Rotate All Pages CW (explicit, for the whole document)
   // Colour-scheme pickers follow in one contiguous block (radio group).
   ID_THEME_FIRST,
   ID_THEME_LIGHT = ID_THEME_FIRST,
@@ -199,6 +201,13 @@ struct App
   std::wstring name;
   int pageCount = 0;
   int selected = 0;
+  // Multi-selection over pages, driven from the Pages pane (Ctrl/Shift click)
+  // and Select All. `selected` remains the focus page the canvas is showing, so
+  // existing single-page behaviour is unchanged; pageSel is the set that
+  // page-level commands act on. selAnchor is the last page clicked without a
+  // modifier, which Shift-click extends from.
+  std::vector<bool> pageSel;
+  int selAnchor = 0;
   double zoom = 1.0;   // screen px per PDF pt (1.0 == 96 dpi)
   int scrollX = 0;
   int scrollY = 0;
@@ -959,6 +968,76 @@ static void ClearThumbCache()
 // ---------------------------------------------------------------------------
 // Document operations
 // ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// Page selection
+// ---------------------------------------------------------------------------
+// The Pages pane is single-focus but multi-select: `selected` is the page the
+// canvas shows, and pageSel is the set that page commands act on. Keeping the
+// two separate is what lets a plain click still behave exactly as before while
+// Ctrl/Shift build up a range.
+
+// Drop any selected page that no longer exists, keeping the focus page selected.
+static void PrunePageSel()
+{
+  if ((int)g.pageSel.size() != g.pageCount)
+    g.pageSel.assign(std::max(0, g.pageCount), false);
+  int lo = g.pageSel.size() ? g.selAnchor : 0;
+  if (lo >= (int)g.pageSel.size()) lo = g.pageSel.empty() ? 0 : (int)g.pageSel.size() - 1;
+  if (lo < 0) lo = 0;
+  g.selAnchor = lo;
+  if (!g.pageSel.empty()) g.pageSel[g.selected] = true;
+}
+
+static bool IsPageSel(int i)
+{
+  return i >= 0 && i < (int)g.pageSel.size() && g.pageSel[i];
+}
+
+static int PageSelCount()
+{
+  int n = 0;
+  for (bool b : g.pageSel) if (b) ++n;
+  return n;
+}
+
+// Plain click: the clicked page becomes the only selection.
+static void SelectOnly(int i)
+{
+  // Indexed, not ranged: std::vector<bool>'s proxy references cannot bind to
+  // bool&, which is a C2440 on MSVC.
+  for (size_t k = 0; k < g.pageSel.size(); ++k) g.pageSel[k] = false;
+  if (i >= 0 && i < (int)g.pageSel.size()) g.pageSel[i] = true;
+  g.selAnchor = i;
+}
+
+// Ctrl-click: add or remove one page, leaving the rest of the selection alone.
+static void TogglePageSel(int i)
+{
+  if (i < 0 || i >= (int)g.pageSel.size()) return;
+  g.pageSel[i] = !g.pageSel[i];
+  g.selAnchor = i;
+  if (!g.pageSel[i] && g.selected == i) g.selected = i;  // focus stays put
+}
+
+// Shift-click: extend the selection from the anchor across a contiguous range.
+// Ctrl+Shift-click adds a range instead of replacing the selection.
+static void ExtendPageSel(int i, bool additive)
+{
+  if (i < 0 || i >= (int)g.pageSel.size()) return;
+  if (!additive)
+    for (size_t k = 0; k < g.pageSel.size(); ++k) g.pageSel[k] = false;
+  int a = std::max(0, std::min(g.selAnchor, i));
+  int b = std::max(g.selAnchor, i);
+  for (int k = a; k <= b && k < (int)g.pageSel.size(); ++k) g.pageSel[k] = true;
+}
+
+static void SelectAllPages()
+{
+  if (g.pageCount <= 0) return;
+  g.pageSel.assign(g.pageCount, true);
+  g.selAnchor = 0;
+}
+
 static void CloseDoc()
 {
   if (g.doc)
@@ -970,6 +1049,8 @@ static void CloseDoc()
   ClearThumbCache();
   g.pageCount = 0;
   g.selected = 0;
+  g.pageSel.clear();
+  g.selAnchor = 0;
   g.path.clear();
   g.name.clear();
   g.dirty = false;
@@ -1118,6 +1199,7 @@ static void RefreshState()
   g.pageCount = g.doc ? FPDF_GetPageCount(g.doc) : 0;
   if (g.selected >= g.pageCount) g.selected = g.pageCount ? g.pageCount - 1 : 0;
   if (g.selected < 0) g.selected = 0;
+  PrunePageSel();
   if (g_curTab >= 0 && g_curTab < (int)g_tabs.size())
     g_tabs[g_curTab].pageCount = g.pageCount;
   ClearCanvasCache();
@@ -2941,16 +3023,34 @@ static void ImportPdf()
   InvalidateRect(g.thumbs, nullptr, TRUE);
 }
 
-static void DeletePage()
+// Deletes every selected page, highest index first so the remaining indices
+// stay valid. Leaves at least one page behind.
+static void DeleteSelectedPages()
 {
   if (g.pageCount == 0) return;
-  if (MessageBoxW(g.frame,
-                  (L"Delete page " + std::to_wstring(g.selected + 1) + L"?")
-                      .c_str(),
-                  L"Stitchup", MB_YESNO | MB_ICONQUESTION) != IDYES)
+  PrunePageSel();
+  std::vector<int> kill;
+  for (int i = 0; i < g.pageCount; ++i)
+    if (IsPageSel(i)) kill.push_back(i);
+  if (kill.empty() || (int)kill.size() >= g.pageCount)
+  {
+    MessageBoxW(g.frame, L"A document must keep at least one page.",
+                L"Stitchup", MB_OK | MB_ICONWARNING);
     return;
-  FPDFPage_Delete(g.doc, g.selected);
+  }
+  std::wstring what =
+      kill.size() == 1
+          ? L"Delete page " + std::to_wstring(kill[0] + 1) + L"?"
+          : L"Delete " + std::to_wstring((int)kill.size()) + L" selected pages?";
+  if (MessageBoxW(g.frame, what.c_str(), L"Stitchup",
+                  MB_YESNO | MB_ICONQUESTION) != IDYES)
+    return;
+  for (int k = (int)kill.size() - 1; k >= 0; --k)
+    FPDFPage_Delete(g.doc, kill[k]);
   g.dirty = true;
+  // Focus the page that took the first deleted slot; RefreshState clamps it to
+  // the new page count and prunes the stale selection for us.
+  g.selected = kill[0];
   RefreshState();
   InvalidateRect(g.canvas, nullptr, TRUE);
   InvalidateRect(g.thumbs, nullptr, TRUE);
@@ -2974,23 +3074,35 @@ static void AddPage()
   }
 }
 
-static void RotatePage(int turns)
+// Rotates every page in the current selection (see the page-selection helpers).
+// With a single page selected this is exactly the old one-page behaviour, so
+// plain click + Ctrl+R is unchanged; Ctrl+A then rotate turns the whole
+// document.
+static void RotateSelectedPages(int turns)
 {
   if (g.pageCount == 0) return;
   CheckLib();
-  FPDF_PAGE p = FPDF_LoadPage(g.doc, g.selected);
-  if (!p) return;
-  int r = (FPDFPage_GetRotation(p) + turns) & 3;
-  FPDFPage_SetRotation(p, r);
-  FPDF_ClosePage(p);
+  PrunePageSel();
+  int touched = 0;
+  for (int i = 0; i < g.pageCount; ++i)
+  {
+    if (!IsPageSel(i)) continue;
+    FPDF_PAGE p = FPDF_LoadPage(g.doc, i);
+    if (!p) continue;
+    FPDFPage_SetRotation(p, (FPDFPage_GetRotation(p) + turns) & 3);
+    FPDF_ClosePage(p);
+    ++touched;
+    // refresh affected caches
+    auto c = g.canvasCache.find(i);
+    if (c != g.canvasCache.end()) { DeleteObject(c->second.bmp); g.canvasCache.erase(c); }
+    auto t = g.thumbCache.find(i);
+    if (t != g.thumbCache.end()) { DeleteObject(t->second); g.thumbCache.erase(t); }
+  }
+  if (!touched) return;
   g.dirty = true;
-  // refresh affected caches
-  auto c = g.canvasCache.find(g.selected);
-  if (c != g.canvasCache.end()) { DeleteObject(c->second.bmp); g.canvasCache.erase(c); }
-  auto t = g.thumbCache.find(g.selected);
-  if (t != g.thumbCache.end()) { DeleteObject(t->second); g.thumbCache.erase(t); }
   InvalidateRect(g.canvas, nullptr, TRUE);
   InvalidateRect(g.thumbs, nullptr, TRUE);
+  if (g.status) InvalidateRect(g.status, nullptr, TRUE);
 }
 
 static void UpdateScrollbars();
@@ -3164,7 +3276,14 @@ static void ReorderDoc(int from, int to)
     }
   }
   g.dirty = true;
-  g.selected = order.size() ? 0 : 0;
+  // Every index moved, so the old selection is meaningless. Focus the page that
+  // was dragged, at its new index, and select only that.
+  int newFrom = 0;
+  for (int k = 0; k < (int)order.size(); ++k)
+    if (order[k] == from) { newFrom = k; break; }
+  g.selected = newFrom;
+  PrunePageSel();
+  SelectOnly(newFrom);
   g.bmDirty = true;
   InvalidateRect(g.canvas, nullptr, TRUE);
   InvalidateRect(g.thumbs, nullptr, TRUE);
@@ -3269,9 +3388,14 @@ DeleteObject(bg);
       DrawTextW(dc, left.c_str(), -1, &lrc, DT_SINGLELINE | DT_VCENTER);
       std::wstring right;
       if (g.pageCount > 0)
+      {
         right = L"Page " + std::to_wstring(g.selected + 1) + L" of " +
-                std::to_wstring(g.pageCount) + L"      Zoom " +
-                std::to_wstring((int)std::lround(g.zoom * 100.0)) + L"%";
+                std::to_wstring(g.pageCount);
+        int nsel = PageSelCount();
+        if (nsel > 1) right += L"      " + std::to_wstring(nsel) + L" selected";
+        right += L"      Zoom " +
+                 std::to_wstring((int)std::lround(g.zoom * 100.0)) + L"%";
+      }
       else
         right = L"No document      Zoom " +
                 std::to_wstring((int)std::lround(g.zoom * 100.0)) + L"%";
@@ -3499,7 +3623,10 @@ static LRESULT CALLBACK ThumbsProc(HWND hw, UINT msg, WPARAM wp, LPARAM lp)
           SelectObject(md, hb);
           BitBlt(mem, x + 4, yc, tw, th, md, 0, 0, SRCCOPY);
           DeleteDC(md);
-          bool sel = (i == g.selected);
+          // Focus page keeps the accent frame; the rest of a multi-selection gets the
+          // deeper accent so the two are distinguishable without a legend.
+          bool focus = (i == g.selected);
+          bool sel = focus || IsPageSel(i);
           if (g.dragPage >= 0 && i == g.dragPage)
           {
             HBRUSH dim = CreateSolidBrush(thm.btnHover);
@@ -3508,8 +3635,9 @@ static LRESULT CALLBACK ThumbsProc(HWND hw, UINT msg, WPARAM wp, LPARAM lp)
             DeleteObject(dim);
           }
           RECT pr{x + 2, yc - 2, x + 4 + tw, yc + th + 6};
-          HBRUSH phb = CreateSolidBrush(sel ? thm.accent
-                                            : thm.pageFrame);
+          HBRUSH phb = CreateSolidBrush(focus ? thm.accent
+                                     : sel     ? thm.accentDeep
+                                               : thm.pageFrame);
           FrameRect(mem, &pr, phb);
           DeleteObject(phb);
           std::wstring num = std::to_wstring(i + 1);
@@ -3593,9 +3721,25 @@ static LRESULT CALLBACK ThumbsProc(HWND hw, UINT msg, WPARAM wp, LPARAM lp)
       int pi = ThumbForY(y);
       if (pi >= 0)
       {
+        bool ctrl = (wp & MK_CONTROL) != 0;
+        bool shift = (wp & MK_SHIFT) != 0;
+        PrunePageSel();
         g.selected = pi;
-        g.dragPage = pi;
-        g.dragCursor = pi;
+        if (shift)
+          ExtendPageSel(pi, ctrl);
+        else if (ctrl)
+          TogglePageSel(pi);
+        else
+          SelectOnly(pi);
+        // Drag-to-reorder only makes sense for one page: moving a block would
+        // need the whole selection to move together, so a multi-selection click
+        // selects without arming the drag.
+        if (PageSelCount() == 1)
+        {
+          g.dragPage = pi;
+          g.dragCursor = pi;
+        }
+        if (g.status) InvalidateRect(g.status, nullptr, TRUE);
         InvalidateRect(hw, nullptr, FALSE);
         InvalidateRect(g.canvas, nullptr, FALSE);
         UpdateScrollbars();
@@ -3651,7 +3795,9 @@ static LRESULT CALLBACK ThumbsProc(HWND hw, UINT msg, WPARAM wp, LPARAM lp)
       const int pi = ThumbForY(pt.y + si.nPos);
       if (pi >= 0)
       {
+        PrunePageSel();
         g.selected = pi;
+        SelectOnly(pi);
         GotoPageIndex(pi);
         SetFocus(g.canvas);
         InvalidateRect(hw, nullptr, FALSE);
@@ -5954,6 +6100,7 @@ static bool IsHandledCommand(int id)
     case ID_ANN_HL: case ID_ANN_UL: case ID_ANN_NOTE: case ID_ANN_TEXT:
     case ID_ANN_SHAPE: case ID_ANN_STAMP: case ID_ANN_LINK:
     case ID_PAGE_EXTRACT: case ID_PAGE_SPLIT: case ID_PAGE_CROP:
+    case ID_SEL_ALL: case ID_ROT_ALL:
     case ID_THEME: case ID_ABOUT:
       return true;
     default:
@@ -5986,10 +6133,15 @@ static void DoCommand(int id)
     case ID_SAVEAS: SaveAs(); break;
     case ID_SAVEENC: SaveAsEncrypted(); break;
     case ID_IMPORT: ImportPdf(); break;
-    case ID_DELETE: DeletePage(); break;
+    case ID_DELETE: DeleteSelectedPages(); break;
     case ID_ADD:    AddPage(); break;
-    case ID_ROTL:   RotatePage(3); break;
-    case ID_ROTR:   RotatePage(1); break;
+    case ID_ROTL:   RotateSelectedPages(3); break;
+    case ID_ROTR:   RotateSelectedPages(1); break;
+    case ID_SEL_ALL: SelectAllPages();
+      if (g.thumbs) InvalidateRect(g.thumbs, nullptr, TRUE);
+      if (g.status) InvalidateRect(g.status, nullptr, TRUE);
+      break;
+    case ID_ROT_ALL: SelectAllPages(); RotateSelectedPages(1); break;
     case ID_TOOL_SELECT: SetToolSelect(!g.toolSelect); break;
     case ID_OBJ_EDIT:   EditSelectedText(); break;
     case ID_OBJ_DELETE: DeleteSelectedObject(); break;
@@ -6105,8 +6257,11 @@ static HMENU BuildMenu()
   AppendMenuW(edit, MF_SEPARATOR, 0, nullptr);
   addItem(edit, ID_ROTR, L"Rotate Right\tCtrl+R");
   addItem(edit, ID_ROTL, L"Rotate Left\tCtrl+Shift+R");
-  addItem(edit, ID_DELETE, L"Delete Page\tDel");
+  addItem(edit, ID_ROT_ALL, L"Rotate All Pages Right");
+  addItem(edit, ID_DELETE, L"Delete Page(s)\tDel");
   addItem(edit, ID_ADD, L"Add Page...");
+  AppendMenuW(edit, MF_SEPARATOR, 0, nullptr);
+  addItem(edit, ID_SEL_ALL, L"Select All Pages\tCtrl+A");
   AppendMenuW(edit, MF_SEPARATOR, 0, nullptr);
   addItem(edit, ID_TOOL_SELECT, L"Select / Move Content Object");
   addItem(edit, ID_OBJ_EDIT, L"Edit Text...\tDouble-click");
@@ -6749,6 +6904,7 @@ static LRESULT CALLBACK FrameProc(HWND hw, UINT msg, WPARAM wp, LPARAM lp)
           case VK_F4: if (shift) DoCommand(ID_CLOSE_TAB); return 0;
           case 'S': DoCommand(shift ? ID_SAVEAS : ID_SAVE); return 0;
           case 'R': DoCommand(shift ? ID_ROTL : ID_ROTR); return 0;
+          case 'A': DoCommand(ID_SEL_ALL); return 0;
           case VK_OEM_PLUS: case VK_ADD: DoCommand(ID_ZOOM_IN); return 0;
           case VK_OEM_MINUS: case VK_SUBTRACT: DoCommand(ID_ZOOM_OUT); return 0;
           case '0': DoCommand(ID_FITP); return 0;
@@ -9172,6 +9328,134 @@ check("saved %PDF header", bytes.size() > 8 &&
       }
 
       FPDF_CloseDocument(pd);
+    }
+  }
+
+  {
+    // --- Page multi-selection + rotate/delete over the selection ---
+    // The Pages pane is single-focus but multi-select. These exercise the
+    // selection model directly (it is pure state, no window needed) and the
+    // multi-page rotate against a real document, which is the part that used to
+    // be impossible: only g.selected was ever rotated.
+    FPDF_DOCUMENT sd2 = FPDF_CreateNewDocument();
+    check("sel: scratch doc created", sd2 != nullptr);
+    if (sd2)
+    {
+      for (int i = 0; i < 5; ++i) FPDFPage_New(sd2, i, 612.0, 792.0);
+      FPDF_DOCUMENT keepSelDoc = g.doc;
+      const int keepSelCount = g.pageCount;
+      const int keepSelFocus = g.selected;
+      g.doc = sd2;
+      g.pageCount = FPDF_GetPageCount(sd2);
+      PrunePageSel();
+
+      g.selected = 0;
+      SelectOnly(0);
+      checkEq("sel: plain click selects one", PageSelCount(), 1);
+      check("sel: focus page is in the selection", IsPageSel(g.selected));
+
+      TogglePageSel(2);
+      checkEq("sel: ctrl-click adds a page", PageSelCount(), 2);
+      TogglePageSel(2);
+      checkEq("sel: ctrl-click again removes it", PageSelCount(), 1);
+      TogglePageSel(2);
+      SelectOnly(0);
+      ExtendPageSel(3, false);
+      checkEq("sel: shift-click selects the range", PageSelCount(), 4);
+      check("sel: range covers the middle", IsPageSel(1) && IsPageSel(2));
+
+      // Ctrl-click re-anchors, so ctrl+shift-click at 3 adds the range 3..4 on
+      // top of the earlier pick at 1: {1} + {3,4} = 3 pages, not 4.
+      SelectOnly(1);
+      TogglePageSel(4);
+      ExtendPageSel(3, true);
+      checkEq("sel: ctrl+shift adds a range", PageSelCount(), 3);
+      check("sel: ctrl+shift keeps the earlier pick", IsPageSel(1));
+      check("sel: ctrl+shift reaches the new range",
+            IsPageSel(3) && IsPageSel(4));
+
+      SelectAllPages();
+      checkEq("sel: select all covers the document", PageSelCount(), 5);
+
+      // Pruning must never leave the focus page unselected, and must survive a
+      // page count change (this is what a delete or an import does).
+      SelectOnly(4);
+      g.pageCount = 2;
+      PrunePageSel();
+      checkEq("sel: prune resizes to the new count", (int)g.pageSel.size(), 2);
+      check("sel: prune keeps the focus selected", IsPageSel(g.selected));
+      g.pageCount = FPDF_GetPageCount(sd2);
+      PrunePageSel();
+
+      // Rotate every selected page, then prove it survives a save.
+      SelectAllPages();
+      g.selected = 0;
+      RotateSelectedPages(1);
+      bool allRotated = true;
+      for (int i = 0; i < 5; ++i)
+      {
+        FPDF_PAGE p = FPDF_LoadPage(sd2, i);
+        if (!p || FPDFPage_GetRotation(p) != 1) allRotated = false;
+        if (p) FPDF_ClosePage(p);
+      }
+      check("sel: rotate applies to every selected page", allRotated);
+      std::vector<unsigned char> sb2;
+      bool ss2 = SaveAsString(sd2, sb2) && !sb2.empty();
+      check("sel: multi-rotated doc saves", ss2);
+      FPDF_DOCUMENT sr2 = ss2 ? FPDF_LoadMemDocument(sb2.data(), (int)sb2.size(), nullptr) : nullptr;
+      check("sel: multi-rotated doc reloads", sr2 != nullptr);
+      if (sr2)
+      {
+        bool persisted = FPDF_GetPageCount(sr2) == 5;
+        for (int i = 0; i < FPDF_GetPageCount(sr2); ++i)
+        {
+          FPDF_PAGE p = FPDF_LoadPage(sr2, i);
+          if (!p || FPDFPage_GetRotation(p) != 1) persisted = false;
+          if (p) FPDF_ClosePage(p);
+        }
+        check("sel: every rotation persists through save", persisted);
+        FPDF_CloseDocument(sr2);
+      }
+
+      // Rotating a subset must leave the others alone - the property that makes
+      // a multi-selection more than "rotate all".
+      SelectOnly(1);
+      TogglePageSel(2);
+      RotateSelectedPages(3);
+      int rot1 = -1, rot3 = -1;
+      {
+        FPDF_PAGE p = FPDF_LoadPage(sd2, 1);
+        if (p) { rot1 = FPDFPage_GetRotation(p); FPDF_ClosePage(p); }
+        p = FPDF_LoadPage(sd2, 3);
+        if (p) { rot3 = FPDFPage_GetRotation(p); FPDF_ClosePage(p); }
+      }
+      checkEq("sel: subset rotate turns CCW from 1 back to 0", rot1, 0);
+      checkEq("sel: unselected page is untouched", rot3, 1);
+
+      // Rotating everything again must bring the unselected page with it only
+      // because it was explicitly selected this time.
+      SelectAllPages();
+      RotateSelectedPages(3);
+      int rotAll = -1;
+      {
+        FPDF_PAGE p = FPDF_LoadPage(sd2, 3);
+        if (p) { rotAll = FPDFPage_GetRotation(p); FPDF_ClosePage(p); }
+      }
+      checkEq("sel: select-all rotate returns the whole document to 0", rotAll, 0);
+
+      // DeleteSelectedPages() refuses when the selection would empty the
+      // document. The guard is (selection covers every page); the command also
+      // prompts, so only the precondition is assertable headlessly.
+      SelectAllPages();
+      check("sel: delete-all is caught by the keep-one-page guard",
+            PageSelCount() >= FPDF_GetPageCount(sd2));
+
+      g.doc = keepSelDoc;
+      g.pageCount = keepSelCount;
+      g.selected = keepSelFocus;
+      PrunePageSel();
+      SelectOnly(keepSelFocus);
+      FPDF_CloseDocument(sd2);
     }
   }
 

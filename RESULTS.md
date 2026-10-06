@@ -544,3 +544,48 @@ exe reports FileVersion and ProductVersion `0.12.3.0`. App smoke-launches.
 A follow-up commit bumped `VERSION` to `0.12.4` and rebuilt so the shipped tag
 matches the stamped binary; local and CI runs both report 310 passed, 0 failed
 with FileVersion `0.12.4.0`.
+
+## v0.12.5 - page multi-selection, rotate/delete over the selection (2026-10-06)
+
+Reported gap: per-page rotation worked, but there was no way to select several
+pages and rotate them - `RotatePage` only ever touched `g.selected`, and the
+Pages pane had no multi-selection to select with.
+
+- The Pages pane is now single-focus but multi-select. `selected` stays the
+  focus page the canvas shows, and a new `pageSel` set is what page commands act
+  on. Ctrl-click toggles one page, Shift-click extends a contiguous range from
+  the anchor, Ctrl+Shift-click adds a range, and `Ctrl+A` / Edit > Select All
+  Pages takes the document.
+- `Rotate Right` / `Rotate Left` now rotate every selected page, plus an
+  explicit Edit > Rotate All Pages Right for the whole document in one step.
+  Delete Page acts on the selection too (highest index first, and a document
+  always keeps at least one page). Single-page behaviour is unchanged.
+- The focus page keeps the accent frame and the rest of the selection uses the
+  deeper accent, so the two are distinguishable; the status bar reports how many
+  pages are selected.
+- Drag-to-reorder is deliberately not armed for a multi-selection: moving a
+  block would need the whole selection to move together, so that is left for a
+  follow-up rather than half-done.
+
+21 new `sel:` checks: the selection model (plain/Ctrl/Shift/Ctrl+Shift/Select
+All, prune after a page-count change) and the multi-page rotate, including that a
+subset rotate leaves unselected pages alone - the property that makes this more
+than "rotate all" - and that every rotation survives save/reload. One draft check
+asserted the wrong count for Ctrl+Shift-click (a Ctrl-click re-anchors, so
+`{1} + range 3..4` is 3 pages, not 4) and failed on the first run.
+
+Self-test grew from 310 to 331 checks: 331 passed, 0 failed, exit code 0.
+
+Verified by driving the real window on the 5-page `example.pdf` and comparing
+the `/Rotate` values in the saved file rather than counting tokens - the fixture
+already carries `/Rotate` on all five pages, which made a token count look like
+every page had been rotated:
+
+| keys sent | `/Rotate` for pages 1-5 |
+|-----------|--------------------------|
+| none (baseline) | 0, 90, 180, 270, 0 |
+| Ctrl+R | 90, 90, 180, 270, 0 |
+| Ctrl+A then Ctrl+R | 90, 180, 270, 0, 90 |
+
+Not verified headlessly: the thumbnail multi-select painting and the
+status-bar count, since the test desktop does not composite a visible window.
