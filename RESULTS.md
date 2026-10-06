@@ -503,10 +503,17 @@ test exists because the test session does not composite a visible desktop.
 Two packaging/tooling gaps closed.
 
 - The exe carried no VERSIONINFO, so Windows showed blank Properties and tools
-  saw file version 0.0.0.0. `resources/app.rc` now carries a version resource
-  (`0.12.2.0`, description/product/company names, translation block). Verified
-  by reading `VersionInfo` off the built binary: FileVersion and ProductVersion
-  both report `0.12.2.0`.
+  saw file version 0.0.0.0. A version resource now carries description, product,
+  company and translation values. Verified by reading `VersionInfo` off the built
+  binary.
+- The version lived in two hand-edited places (`kAppTitle` in `src/app.cpp` and
+  the literal in the `.rc`), which is how the v0.12.3 tag shipped with `0.12.2`
+  stamped in the file properties. `VERSION` at the repo root is now the only
+  place to edit: CMake parses it, generates the `.rc` into the build tree from
+  `resources/app.rc.in` (the source `.rc` is generated and gitignored), and
+  passes `STITCHUP_VERSION` to the compiler. A malformed value aborts the
+  configure step - confirmed by temporarily writing `0.12.x` and getting
+  `CMake Error ... VERSION must look like MAJOR.MINOR.PATCH`.
 - There was no CI, so every build was verified by hand. Added
   `.github/workflows/build.yml`: builds with MSVC on `windows-2022` using the
   same CMake/NMake steps as `Build.cmd`, runs the self-test, and uploads the two
@@ -515,4 +522,21 @@ Two packaging/tooling gaps closed.
   instead of always 0 (previously a failing run still reported success to any
   caller that checked the exit code).
 
-Self-test unchanged at 302 checks: 302 passed, 0 failed, exit code 0.
+- Trusting the generator is not enough, so 8 new `version:` checks read the built
+  binary's own resource back (GetModuleFileName + GetFileVersionInfo +
+  VerQueryValue, linked against `version.lib`) and compare it to the
+  compile-time `STITCHUP_VERSION`: the numeric `FILEVERSION` block, that
+  `FILEVERSION` equals `PRODUCTVERSION`, and the string table's `FileVersion`,
+  `ProductVersion` and `FileDescription`. The numeric and string halves are
+  separate resource blocks and a check on only one of them is not a check at all:
+  an earlier draft passed while a tampered string table was stamped into the
+  binary, so both are now asserted.
+
+Verified by tampering: rebuilding with the generated string table changed to
+`9.9.9.0` produces 2 failures and exit code 1 (308 passed, 2 failed); the
+restored build returns 310 passed, 0 failed, exit code 0. Note that MSVC does not
+recompile the `.rc` from an unchanged generated file on an incremental build, so
+the tamper test also had to remove the stale `app.rc.res`.
+
+Self-test grew from 302 to 310 checks: 310 passed, 0 failed, exit code 0. Built
+exe reports FileVersion and ProductVersion `0.12.3.0`. App smoke-launches.

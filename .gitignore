@@ -1,5 +1,6 @@
 build/
 dist/
+resources/app.rc
 build.log
 test_result.txt
 *.user

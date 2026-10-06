@@ -117,6 +117,15 @@ Produces `dist\Stitchup.exe` + `dist\pdfium.dll`.
 `Build.cmd` configures with CMake + NMake, builds into `build\`, copies
 `Stitchup.exe` and `pdfium.dll` into `dist\`, and runs the self-test.
 
+`VERSION` at the repo root holds the single `MAJOR.MINOR.PATCH` value. CMake reads
+it, generates `resources/app.rc` into the build tree (from `resources/app.rc.in`,
+so the source tree has no hand-editable copy) and passes it to the compiler as
+`STITCHUP_VERSION`. That one file therefore feeds the title bar, the exe's
+VERSIONINFO and, in practice, the release tag; a malformed value fails the
+configure step. A self-test check reads the built binary's version resource back
+and compares both the numeric block and the string table against `VERSION`, so a
+release that drifts is caught by the test run rather than by a user.
+
 `.github/workflows/build.yml` runs the same steps on every push to `main` and on
 pull requests: it builds with MSVC on `windows-2022`, runs
 `Stitchup.exe --self-test` (which exits non-zero if any check fails), and uploads

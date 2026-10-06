@@ -1,12 +1,14 @@
 #include <winver.h>
 
-// App icon resource
-101 ICON "app.ico"
+// App icon resource. The generated .rc lives in the build tree, so the icon
+// needs an absolute path rather than one relative to the source file.
+101 ICON "@STITCHUP_RC_ICON@"
 
-// Version info. Keep these in step with kAppTitle in src/app.cpp.
+// Version info. The numbers are generated from the VERSION file at the repo
+// root by CMakeLists.txt (see resources/app.rc.in); edit that file, not this.
 VS_VERSION_INFO VERSIONINFO
-  FILEVERSION     0,12,2,0
-  PRODUCTVERSION  0,12,2,0
+  FILEVERSION     @STITCHUP_VER_MAJOR@,@STITCHUP_VER_MINOR@,@STITCHUP_VER_PATCH@,0
+  PRODUCTVERSION  @STITCHUP_VER_MAJOR@,@STITCHUP_VER_MINOR@,@STITCHUP_VER_PATCH@,0
 #ifdef _DEBUG
   FILEFLAGS       VS_FF_DEBUG
 #else
@@ -22,11 +24,11 @@ BEGIN
     BEGIN
       VALUE "CompanyName",      "Stitchup"
       VALUE "FileDescription",  "Stitchup PDF Editor"
-      VALUE "FileVersion",      "0.12.2.0"
+      VALUE "FileVersion",      "@STITCHUP_VERSION@.0"
       VALUE "InternalName",     "Stitchup"
       VALUE "OriginalFilename", "Stitchup.exe"
       VALUE "ProductName",      "Stitchup PDF Editor"
-      VALUE "ProductVersion",   "0.12.2.0"
+      VALUE "ProductVersion",   "@STITCHUP_VERSION@.0"
     END
   END
   BLOCK "VarFileInfo"

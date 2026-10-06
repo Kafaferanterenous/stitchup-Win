@@ -10,6 +10,7 @@
 #include <windowsx.h>
 #include <uxtheme.h>
 #include <dwmapi.h>
+#include <winver.h>
 
 #pragma warning(push, 0)
 #include <fpdfview.h>
@@ -124,7 +125,14 @@ enum
 
 // App identity shown in the title bar. The open file's name already lives on
 // the document tab below the title bar, so it is not repeated in the caption.
-const wchar_t* const kAppTitle = L"Stitchup PDF Editor  v0.12.2";
+// Version comes from the VERSION file at the repo root (CMakeLists.txt turns it
+// into the STITCHUP_VERSION define and the VERSIONINFO resource), so the title
+// bar, the file properties and the release tag cannot drift apart.
+#ifndef STITCHUP_VERSION
+#define STITCHUP_VERSION L"0.0.0"
+#endif
+
+const wchar_t* const kAppTitle = L"Stitchup PDF Editor  v" STITCHUP_VERSION;
 
 // ---------------------------------------------------------------------------
 // Application state
@@ -7565,6 +7573,65 @@ static int SelfTest(const std::wstring& cwd)
 
   FPDF_InitLibrary();
   check("library init", true);
+
+  {
+    // The VERSIONINFO resource and the compile-time STITCHUP_VERSION both come
+    // from the VERSION file, but that is only a claim until the built binary is
+    // read back, so verify it here: it is the check that would have caught the
+    // release that shipped as v0.12.3 with 0.12.2 stamped in its properties.
+    std::wstring exePath(MAX_PATH, L'\0');
+    DWORD en = GetModuleFileNameW(nullptr, &exePath[0], (DWORD)exePath.size());
+    exePath.resize(en);
+    DWORD handle = 0;
+    DWORD want = GetFileVersionInfoSizeW(exePath.c_str(), &handle);
+    bool sized = want > 0;
+    check("version: resource present", sized);
+    if (sized)
+    {
+      std::vector<unsigned char> vbuf(want);
+      bool got = GetFileVersionInfoW(exePath.c_str(), handle, want, vbuf.data()) != 0;
+      check("version: resource readable", got);
+      VS_FIXEDFILEINFO* ffi = nullptr;
+      UINT len = 0;
+      bool found = got && VerQueryValueW(vbuf.data(), L"\\", (LPVOID*)&ffi, &len) != 0 &&
+                   ffi != nullptr && len >= sizeof(VS_FIXEDFILEINFO);
+      check("version: fixed info present", found);
+      if (found)
+      {
+        int major = HIWORD(ffi->dwFileVersionMS);
+        int minor = LOWORD(ffi->dwFileVersionMS);
+        int patch = HIWORD(ffi->dwFileVersionLS);
+        wchar_t expected[64];
+        _snwprintf_s(expected, _TRUNCATE, L"%d.%d.%d", major, minor, patch);
+        check("version: resource matches VERSION file",
+              expected == std::wstring(STITCHUP_VERSION));
+        check("version: file and product versions agree",
+              ffi->dwFileVersionMS == ffi->dwProductVersionMS &&
+              ffi->dwFileVersionLS == ffi->dwProductVersionLS);
+
+        // The numeric block above and the string table are separate parts of the
+        // resource and can disagree, which is what made a bad tag ship unnoticed:
+        // read the strings back too, so both are pinned to the VERSION file.
+        wchar_t expectFull[64];
+        _snwprintf_s(expectFull, _TRUNCATE, L"%s.0", STITCHUP_VERSION);
+        auto readString = [&](const wchar_t* key) {
+          std::wstring path = L"\\StringFileInfo\\040904B0\\" + std::wstring(key);
+          wchar_t* val = nullptr;
+          UINT vlen = 0;
+          if (!VerQueryValueW(vbuf.data(), path.c_str(), (LPVOID*)&val, &vlen) ||
+              !val || vlen == 0)
+            return std::wstring();
+          return std::wstring(val, vlen ? vlen - 1 : 0);
+        };
+        check("version: string FileVersion matches",
+              readString(L"FileVersion") == std::wstring(expectFull));
+        check("version: string ProductVersion matches",
+              readString(L"ProductVersion") == std::wstring(expectFull));
+        check("version: FileDescription set",
+              readString(L"FileDescription") == L"Stitchup PDF Editor");
+      }
+    }
+  }
 
   {
     // --- Tab lifecycle. Closing the active tab used to free its document twice
