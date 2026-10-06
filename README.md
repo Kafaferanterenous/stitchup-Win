@@ -46,6 +46,8 @@ Produces `dist\Stitchup.exe` + `dist\pdfium.dll`.
   toggleable left navigation pane (`F8` or View > Sidebar) for extra canvas
   room; pages are centered horizontally in the main display
 - File menu: New, Open, Save (atomic: temp file + replace), Save As, Import PDF
+  (appends the chosen file's pages, single or multi-page, and scrolls to the
+  first imported page)
 - Edit: rotate page CW/CCW, delete page, add blank page (Letter/A4), drag pages
   in the thumbnails panel to reorder
 - View: zoom in/out, 100%, fit width, fit page, previous/next page, and a
@@ -63,8 +65,9 @@ Produces `dist\Stitchup.exe` + `dist\pdfium.dll`.
 - Annotate (Home > Annotate group or Edit > Annotate menu): pick highlight,
   underline, sticky note, text box, shape, stamp or link, then **drag on the
   page to draw its rectangle** (a plain click uses the kind's default
-  placement; Esc cancels); annotations persist through Save and keep their
-  rendered appearance
+  placement; Esc cancels); the page re-renders immediately so the new annotation
+  is visible without changing zoom; annotations persist through Save and keep
+  their rendered appearance
 - Links: clicking an internal link jumps to its destination page; clicking a
   URI link opens the URL in the default browser (hand cursor over link areas)
 - Link creation (Home > Annotate group "Link..." or Edit > Annotate > Link...):
@@ -80,6 +83,9 @@ Produces `dist\Stitchup.exe` + `dist\pdfium.dll`.
   drag to move it, Ctrl+Del (or Menu > Delete Selected Object) to remove it,
   RecColor to recolor the fill, or Edit Text (double-click) to replace the text
   run; edits persist through Save and reload (4 object tests added)
+- Double-clicking a line of text enters edit mode on it: the run is selected and
+  the Select tool is armed, and the Edit Text dialog opens with that run's text
+  preselected and the caret ready, so the line can be retyped immediately
 - Page management (Home > Pages): Extract the current page into its own PDF,
   Split a document into one file per page, and Auto-Crop the current page to
   its content (white margins trimmed via an ink-bounding-box render pass)

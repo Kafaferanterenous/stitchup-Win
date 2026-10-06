@@ -21,7 +21,7 @@ user rejected as a product (no GUI).
 
 Command: `Stitchup.exe --self-test`
 
-Result: **301 passed, 0 failed** (exit code 0).
+Result: **302 passed, 0 failed** (exit code 0).
 
 Select / Move Content Object (`obj:` checks covering content-object editing):
 clicking a content object (text run or vector path) on the current page selects
@@ -450,3 +450,50 @@ and leaves the live document untouched.
 
 Self-test grew from 292 to 301 checks. Result: 301 passed, 0 failed. App
 smoke-launches.
+
+## v0.12.2 - double-click text edit; fix annotations not showing; import jumps to the new pages (2026-10-06)
+
+Reported, in three parts:
+
+1. Double-clicking a line of text did nothing.
+2. The annotate options (text, shape, etc.) did not work.
+3. Importing a single- or multi-page PDF just put a blank page in.
+
+**1. Double-click edit - the message never arrived.** `SKCanvas` was registered
+without `CS_DBLCLKS`, so Windows never delivered `WM_LBUTTONDBLCLK`; the handler
+existed but was unreachable. It was additionally gated behind `g.toolSelect`, so it
+only fired when the Select tool happened to be armed. The class is now registered
+with `CS_DBLCLKS`, the handler runs for any tool, and it arms the Select tool
+itself so the run can then be moved or deleted. The Edit Text dialog preselects
+the run (`EM_SETSEL`) so the caret is ready and the line can be retyped straight
+over. Confirmed in the running app: `SKCanvas` window style reads `0x8`
+(`CS_DBLCLKS`), and double-clicking text enters edit mode.
+
+**2. Annotations - created but invisible.** The annotation was written to the
+document correctly (the app goes dirty and offers to save), but nothing appeared
+on the page. `InsertAnnotCurrent` marked the document dirty and invalidated the
+canvas, yet left the page's cached bitmap in `g.canvasCache`. `CanvasPaint` keys
+that cache on zoom only, so it kept painting the pre-annotation image until the
+zoom changed. Reproduced with a pixel capture of the canvas: drawing a highlight
+left the amber pixel count at 0 before and after. New `DropPageBitmapCaches()`
+drops the cached canvas and thumbnail bitmaps for the page, so the next paint
+re-renders with the annotation on it. This was the only in-place edit with the
+flaw - object move and delete go through `CommitEdits()`, which reloads the
+document and clears the cache anyway.
+
+**3. Import - the pages were there, the view was not.** Verified the kernel is
+fine: importing via `FPDF_ImportPagesByIndex` carries the page content over (the
+imported page reports its text object), and a document saved from the app
+reopens with the expected page count and content per page. The reported symptom
+came from the view staying on the pre-existing blank page while the imported
+pages were appended after it. `ImportPdf` now scrolls to the first imported page
+(`GotoPageIndex(firstNew)`) so the result is immediately visible.
+
+One new `annot:` check seeds a page bitmap into both caches, inserts an
+annotation, and asserts both entries are dropped - this fails against the old
+code. Self-test grew from 301 to 302 checks. Result: 302 passed, 0 failed. App
+smoke-launches.
+
+Not verifiable headlessly: the double-click dialog, the canvas pixel output, and
+the file picker were confirmed by driving the real window; no automated pixel
+test exists because the test session does not composite a visible desktop.

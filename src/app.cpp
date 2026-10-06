@@ -124,7 +124,7 @@ enum
 
 // App identity shown in the title bar. The open file's name already lives on
 // the document tab below the title bar, so it is not repeated in the caption.
-const wchar_t* const kAppTitle = L"Stitchup PDF Editor  v0.12.1";
+const wchar_t* const kAppTitle = L"Stitchup PDF Editor  v0.12.2";
 
 // ---------------------------------------------------------------------------
 // Application state
@@ -2915,6 +2915,7 @@ static void ImportPdf()
     return;
   }
   CheckLib();
+  const int firstNew = g.pageCount;
   bool ok = FPDF_ImportPagesByIndex(g.doc, src, nullptr, 0, g.pageCount);
   FPDF_CloseDocument(src);
   if (!ok)
@@ -2925,6 +2926,9 @@ static void ImportPdf()
   g.dirty = true;
   RefreshState();
   g.bmDirty = true;
+  // Scroll to the first imported page so the user sees the result rather than
+  // the blank page the view was sitting on.
+  GotoPageIndex(firstNew);
   InvalidateRect(g.canvas, nullptr, TRUE);
   InvalidateRect(g.thumbs, nullptr, TRUE);
 }
@@ -3948,6 +3952,9 @@ static LRESULT CALLBACK TedProc(HWND h, UINT m, WPARAM w, LPARAM l)
                       196, 104, 74, 28, h, (HMENU)2, g.inst, nullptr);
       SetWindowTextW(g_tedEdit, g_tedValue.c_str());
       SetFocus(g_tedEdit);
+      // Leave the caret ready on the line: the run's text is preselected so the
+      // user can type straight over it or click to place the caret.
+      SendMessageW(g_tedEdit, EM_SETSEL, 0, -1);
       return 0;
     case WM_COMMAND:
       if (LOWORD(w) == 1 || LOWORD(w) == 2)
@@ -4605,7 +4612,10 @@ static LRESULT CALLBACK CanvasProc(HWND hw, UINT msg, WPARAM wp, LPARAM lp)
     }
     case WM_LBUTTONDBLCLK:
     {
-      if (!g.toolSelect) return 0;
+      // Double-clicking a run of text enters edit mode on that line: the run is
+      // selected (and the Select tool armed so it can be moved/deleted after)
+      // and the text dialog opens with its content ready to edit. This works
+      // whether or not the Select tool was already active.
       POINT pt{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
       HitInfo hi;
       if (!HitPage(pt, hi)) return 0;
@@ -4616,7 +4626,9 @@ static LRESULT CALLBACK CanvasProc(HWND hw, UINT msg, WPARAM wp, LPARAM lp)
       PageObject best;
       if (HitTestObject(hi.page, px, py, best) && best.isText())
       {
+        SetToolSelect(true);
         g.selDrag = false;
+        g.selDragMoved = false;
         if (g.editPage) { FPDF_ClosePage(g.editPage); g.editPage = nullptr; }
         g.editObj = nullptr;
         g.sel.active = true;
@@ -4624,11 +4636,16 @@ static LRESULT CALLBACK CanvasProc(HWND hw, UINT msg, WPARAM wp, LPARAM lp)
         g.sel.index = best.index;
         g.sel.type = best.type;
         g.sel.l = best.l; g.sel.b = best.b; g.sel.r = best.r; g.sel.t = best.t;
+        g.selected = hi.page;
         std::wstring out;
         if (PromptEditText(best.text, out))
           EditTextObject(hi.page, best.index, out);
         else
           RefreshSelBounds();
+        ClearCanvasCache();
+        InvalidateRect(hw, nullptr, TRUE);
+        InvalidateRect(g.thumbs, nullptr, TRUE);
+        InvalidateRect(g.status, nullptr, TRUE);
       }
       return 0;
     }
@@ -5609,12 +5626,25 @@ static bool InsertAnnot(FPDF_DOCUMENT doc, int pageIdx, int kind,
   return ok;
 }
 
+// Drops any cached bitmaps for one page so its next paint re-renders from the
+// document. Called after an in-place edit (e.g. adding an annotation) that the
+// cached bitmap would otherwise hide.
+static void DropPageBitmapCaches(int page)
+{
+  auto c = g.canvasCache.find(page);
+  if (c != g.canvasCache.end()) { DeleteObject(c->second.bmp); g.canvasCache.erase(c); }
+  auto t = g.thumbCache.find(page);
+  if (t != g.thumbCache.end()) { DeleteObject(t->second); g.thumbCache.erase(t); }
+}
+
 static void InsertAnnotCurrent(int kind, const FS_RECTF* rect = nullptr)
 {
   if (!g.doc || g.pageCount == 0) return;
   if (InsertAnnot(g.doc, g.selected, kind, rect))
   {
     g.dirty = true;
+    DropPageBitmapCaches(g.selected);
+    g.bmDirty = true;
     InvalidateRect(g.canvas, nullptr, TRUE);
     InvalidateRect(g.thumbs, nullptr, TRUE);
     InvalidateRect(g.status, nullptr, TRUE);
@@ -7967,6 +7997,51 @@ check("saved %PDF header", bytes.size() > 8 &&
       }
       FPDF_CloseDocument(an2);
     }
+
+    // Adding an annotation must drop that page's cached bitmap, otherwise the
+    // canvas keeps painting the pre-annotation image and the annotation looks
+    // like it did nothing.
+    {
+      BITMAPINFO bi{};
+      bi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+      bi.bmiHeader.biWidth = 4;
+      bi.bmiHeader.biHeight = -4;
+      bi.bmiHeader.biPlanes = 1;
+      bi.bmiHeader.biBitCount = 32;
+      bi.bmiHeader.biCompression = BI_RGB;
+      void* bitsC = nullptr;
+      void* bitsT = nullptr;
+      HBITMAP hbC = CreateDIBSection(nullptr, &bi, DIB_RGB_COLORS, &bitsC, nullptr, 0);
+      HBITMAP hbT = CreateDIBSection(nullptr, &bi, DIB_RGB_COLORS, &bitsT, nullptr, 0);
+      bool dropped = false;
+      if (hbC && hbT)
+      {
+        FPDF_DOCUMENT savedDoc = g.doc;
+        int savedCount = g.pageCount, savedSel = g.selected;
+        bool savedDirty = g.dirty, savedBm = g.bmDirty;
+        g.doc = an;
+        g.pageCount = 1;
+        g.selected = 0;
+        g.canvasCache[0] = PageCache{ZoomKey(), hbC, 4, 4};
+        g.thumbCache[0] = hbT;
+        InsertAnnotCurrent(ID_ANN_HL);
+        dropped = g.canvasCache.find(0) == g.canvasCache.end() &&
+                  g.thumbCache.find(0) == g.thumbCache.end();
+        if (g.canvasCache.count(0)) { DeleteObject(g.canvasCache[0].bmp); g.canvasCache.erase(0); }
+        if (g.thumbCache.count(0)) { DeleteObject(g.thumbCache[0]); g.thumbCache.erase(0); }
+        g.doc = savedDoc;
+        g.pageCount = savedCount;
+        g.selected = savedSel;
+        g.dirty = savedDirty;
+        g.bmDirty = savedBm;
+      }
+      else
+      {
+        if (hbC) DeleteObject(hbC);
+        if (hbT) DeleteObject(hbT);
+      }
+      check("annot: insertion drops stale page bitmap", dropped);
+    }
     FPDF_CloseDocument(an);
   }
 
@@ -9618,7 +9693,9 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int)
   wc.lpfnWndProc = CanvasProc;
   wc.lpszClassName = L"SKCanvas";
   wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+  wc.style = CS_DBLCLKS;  // canvas needs WM_LBUTTONDBLCLK for text editing
   RegisterClassExW(&wc);
+  wc.style = 0;
 
   wc.lpfnWndProc = StatusProc;
   wc.lpszClassName = L"SKStatus";
