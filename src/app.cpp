@@ -101,6 +101,8 @@ ID_ANN_LINK,
   ID_ROT_ALL,     // Rotate All Pages CW (explicit, for the whole document)
   ID_PRINT,       // Print (Ctrl+P)
   ID_PRINT_PREVIEW,  // Print Preview (Ctrl+Shift+P)
+  ID_UNDO,        // Undo (Ctrl+Z)
+  ID_REDO,        // Redo (Ctrl+Y)
   // Colour-scheme pickers follow in one contiguous block (radio group).
   ID_THEME_FIRST,
   ID_THEME_LIGHT = ID_THEME_FIRST,
@@ -155,6 +157,7 @@ const wchar_t* const kAboutText =
     L"  Ctrl+= / Ctrl+- zoom   Ctrl+0 fit page   Ctrl+1 100%\n"
     L"  Ctrl+F find   F3 next   Shift+F3 previous\n"
     L"  Ctrl+P print   Ctrl+Shift+P print preview\n"
+    L"  Ctrl+Z undo   Ctrl+Y redo\n"
     L"  Del delete page   Ctrl+W fit width   Ctrl+PgUp/PgDn page";
 
 // ---------------------------------------------------------------------------
@@ -198,6 +201,15 @@ struct UserBookmark
   double zoom = 0;     // 0 = keep the reader's default zoom
 };
 
+// One edit-history slot: the whole document as bytes, exactly as it was before
+// an edit, plus the in-memory bookmark list (those travel as a side-channel,
+// because user bookmarks are only folded into the file at save time).
+struct UndoEntry
+{
+  std::vector<unsigned char> bytes;
+  std::vector<UserBookmark> marks;
+};
+
 struct App
 {
   HINSTANCE inst = nullptr;
@@ -237,6 +249,8 @@ struct App
   int ribbonTab = 0;   // 0 = Home, 1 = View, 2 = Tools
   bool bmDirty = true;
   std::vector<UserBookmark> marks;  // user bookmarks not yet written to disk
+  std::vector<UndoEntry> undo;   // edit history, most recent at the back
+  std::vector<UndoEntry> redo;   // undone edits, reapplied by Redo
   bool showSidebar = false;  // hidden until the user asks for it (View / F8)
   bool spread = false;  // two-page side-by-side layout
 
@@ -308,11 +322,20 @@ struct TabDoc
   int scrollX = 0;
   int scrollY = 0;
   std::vector<UserBookmark> marks;
+  std::vector<UndoEntry> undo;
+  std::vector<UndoEntry> redo;
 };
 static std::vector<TabDoc> g_tabs;
 static int g_curTab = -1;
 
 static App g;
+
+// Edit history lives on the live document and mirrors into the current tab, so
+// switching tabs keeps each document's own undo chain.
+static void BeginEdit();
+static void CancelEdit();
+static void UndoEdit();
+static void RedoEdit();
 
 // ---------------------------------------------------------------------------
 // Themes - named colour schemes (light / dark / dark blue / pastel /
@@ -1149,6 +1172,8 @@ static void SnapshotCurrentTab()
   t.zoom = g.zoom;
   t.scrollX = g.scrollX;
   t.scrollY = g.scrollY;
+  t.undo = g.undo;
+  t.redo = g.redo;
 }
 
 static void RefreshTabBar();
@@ -1179,6 +1204,8 @@ static void RestoreTab(int i)
   g.zoom = t.zoom;
   g.scrollX = t.scrollX;
   g.scrollY = t.scrollY;
+  g.undo = t.undo;
+  g.redo = t.redo;
   SetWindowTextW(g.frame, kAppTitle);
   RefreshState();
   g.bmDirty = true;
@@ -1424,6 +1451,8 @@ static void LoadDoc(const std::wstring& file)
   g.bmDirty = true;
   size_t p = file.find_last_of(L"\\/");
   g.name = (p == std::wstring::npos) ? file : file.substr(p + 1);
+  g.undo.clear();
+  g.redo.clear();
   TabDoc nd;
   nd.doc = d;
   nd.path = g.path;
@@ -1453,6 +1482,8 @@ static void NewDoc()
   g.path.clear();
   g.name.clear();
   g.dirty = false;
+  g.undo.clear();
+  g.redo.clear();
   TabDoc nd;
   nd.doc = g.doc;
   nd.pageCount = FPDF_GetPageCount(g.doc);
@@ -2048,8 +2079,10 @@ static void WatermarkCurrentDoc()
                 MB_OK | MB_ICONINFORMATION);
     return;
   }
+  BeginEdit();
   if (!ApplyWatermarkDoc(g.doc, text.c_str(), sizePts, mode))
   {
+    CancelEdit();
     MessageBoxW(g.frame, L"Could not apply watermark.", L"Watermark",
                 MB_OK | MB_ICONERROR);
     return;
@@ -3082,10 +3115,12 @@ static void ImportPdf()
   }
   CheckLib();
   const int firstNew = g.pageCount;
+  BeginEdit();
   bool ok = FPDF_ImportPagesByIndex(g.doc, src, nullptr, 0, g.pageCount);
   FPDF_CloseDocument(src);
   if (!ok)
   {
+    CancelEdit();
     MessageBoxW(g.frame, L"Page import failed.", L"Stitchup", MB_OK | MB_ICONWARNING);
     return;
   }
@@ -4016,6 +4051,7 @@ static void DeleteSelectedPages()
   if (MessageBoxW(g.frame, what.c_str(), L"Stitchup",
                   MB_YESNO | MB_ICONQUESTION) != IDYES)
     return;
+  BeginEdit();
   for (int k = (int)kill.size() - 1; k >= 0; --k)
     FPDFPage_Delete(g.doc, kill[k]);
   g.dirty = true;
@@ -4035,6 +4071,7 @@ static void AddPage()
   if (r == IDCANCEL) return;
   double w = (r == IDYES) ? 612.0 : 595.0;
   double h = (r == IDYES) ? 792.0 : 842.0;
+  BeginEdit();
   if (FPDFPage_New(g.doc, g.selected + 1, w, h))
   {
     g.dirty = true;
@@ -4054,6 +4091,7 @@ static void RotateSelectedPages(int turns)
   if (g.pageCount == 0) return;
   CheckLib();
   PrunePageSel();
+  BeginEdit();
   int touched = 0;
   for (int i = 0; i < g.pageCount; ++i)
   {
@@ -4069,7 +4107,7 @@ static void RotateSelectedPages(int turns)
     auto t = g.thumbCache.find(i);
     if (t != g.thumbCache.end()) { DeleteObject(t->second); g.thumbCache.erase(t); }
   }
-  if (!touched) return;
+  if (!touched) { CancelEdit(); return; }
   g.dirty = true;
   InvalidateRect(g.canvas, nullptr, TRUE);
   InvalidateRect(g.thumbs, nullptr, TRUE);
@@ -4195,6 +4233,7 @@ static void CropCurrentPageToContent()
   R = std::min(R, mR); B = std::max(B, mB);
   if (L < R && B < T)
   {
+    BeginEdit();
     FPDFPage_SetMediaBox(pp, L, B, R, T);
     g.dirty = true;
   }
@@ -4291,6 +4330,7 @@ static void ReorderPagesTo(const std::vector<int>& moving, int to)
   for (int i = 0; i < n; ++i)
     if (order[i] != i) { sameOrder = false; break; }
   if (sameOrder) return;
+  BeginEdit();
 
   // Everything below has to survive the CloseDoc() in the middle, because the
   // rebuild drops it: CloseDoc() clears the file path, and imported pages carry
@@ -5134,9 +5174,14 @@ static void DeleteSelectedObject()
   }
   FPDF_PAGE page = FPDF_LoadPage(g.doc, g.sel.page);
   FPDF_PAGEOBJECT o = page ? FPDFPage_GetObject(page, g.sel.index) : nullptr;
-  if (o) FPDFPage_RemoveObject(page, o);
+  if (o)
+  {
+    BeginEdit();
+    FPDFPage_RemoveObject(page, o);
+  }
   if (page && o) FPDFPage_GenerateContent(page);
   if (page) FPDF_ClosePage(page);
+  if (!o) CancelEdit();
   CommitEdits();
 }
 
@@ -5390,6 +5435,7 @@ static void EditTextObject(int pi, int index, const std::wstring& newText)
   m.e = ol - nl;   // anchor bottom-left of the original run
   m.f = ob - nb;
   FPDFPageObj_SetMatrix(no, &m);
+  BeginEdit();   // everything above can still fail without touching the doc
   FPDFPage_RemoveObject(page, oldObj);
   FPDFPage_InsertObjectAtIndex(page, no, index);
   FPDFPage_GenerateContent(page);
@@ -5404,6 +5450,7 @@ static void ApplyRecolor(int pi, int index, int r, int g_, int b)
   FPDF_PAGEOBJECT o = page ? FPDFPage_GetObject(page, index) : nullptr;
   if (o)
   {
+    BeginEdit();
     FPDFPageObj_SetFillColor(o, (unsigned int)r, (unsigned int)g_, (unsigned int)b, 255);
     FPDFPageObj_SetStrokeColor(o, (unsigned int)r, (unsigned int)g_, (unsigned int)b, 255);
     FPDFPage_GenerateContent(page);
@@ -5697,6 +5744,7 @@ static void AddUserBookmark(int page, bool atView)
   if (!PromptBookmarkName(name, deflt)) return;
   bm.title = name;
 
+  BeginEdit();
   g.marks.push_back(bm);
   g.dirty = true;
   g.bmDirty = true;
@@ -5887,6 +5935,9 @@ static LRESULT CALLBACK CanvasProc(HWND hw, UINT msg, WPARAM wp, LPARAM lp)
               g.selDragMoved = false;
               g.dragLastX = px;
               g.dragLastY = py;
+              // The object is transformed live during the drag, so the undo
+              // snapshot has to be taken before the first WM_MOUSEMOVE.
+              BeginEdit();
               SetCapture(hw);
             }
           }
@@ -6035,6 +6086,12 @@ static LRESULT CALLBACK CanvasProc(HWND hw, UINT msg, WPARAM wp, LPARAM lp)
       if (moved)
       {
         CommitEdits();
+      }
+      else
+      {
+        // The drag armed a snapshot but never moved the object, so it leaves no
+        // empty history slot behind.
+        CancelEdit();
       }
       return 0;
     }
@@ -6953,6 +7010,7 @@ static void DropPageBitmapCaches(int page)
 static void InsertAnnotCurrent(int kind, const FS_RECTF* rect = nullptr)
 {
   if (!g.doc || g.pageCount == 0) return;
+  BeginEdit();
   if (InsertAnnot(g.doc, g.selected, kind, rect))
   {
     g.dirty = true;
@@ -6961,6 +7019,10 @@ static void InsertAnnotCurrent(int kind, const FS_RECTF* rect = nullptr)
     InvalidateRect(g.canvas, nullptr, TRUE);
     InvalidateRect(g.thumbs, nullptr, TRUE);
     InvalidateRect(g.status, nullptr, TRUE);
+  }
+  else
+  {
+    CancelEdit();
   }
 }
 
@@ -7260,6 +7322,7 @@ static bool IsHandledCommand(int id)
     case ID_ANN_SHAPE: case ID_ANN_STAMP: case ID_ANN_LINK:
     case ID_PAGE_EXTRACT: case ID_PAGE_SPLIT: case ID_PAGE_CROP:
     case ID_SEL_ALL: case ID_ROT_ALL: case ID_PRINT: case ID_PRINT_PREVIEW:
+    case ID_UNDO: case ID_REDO:
     case ID_THEME: case ID_ABOUT:
       return true;
     default:
@@ -7291,6 +7354,8 @@ static void DoCommand(int id)
     case ID_SAVE:   SaveInPlace(); break;
     case ID_SAVEAS: SaveAs(); break;
     case ID_SAVEENC: SaveAsEncrypted(); break;
+    case ID_UNDO:    UndoEdit(); break;
+    case ID_REDO:    RedoEdit(); break;
     case ID_IMPORT: ImportPdf(); break;
     case ID_DELETE: DeleteSelectedPages(); break;
     case ID_ADD:    AddPage(); break;
@@ -7406,6 +7471,9 @@ static HMENU BuildMenu()
   AppendMenuW(bar, MF_POPUP, (UINT_PTR)file, L"&File");
 
   HMENU edit = CreatePopupMenu();
+  addItem(edit, ID_UNDO, L"Undo\tCtrl+Z");
+  addItem(edit, ID_REDO, L"Redo\tCtrl+Y");
+  AppendMenuW(edit, MF_SEPARATOR, 0, nullptr);
   addItem(edit, ID_FIND, L"Find...\tCtrl+F");
   addItem(edit, ID_FIND_NEXT, L"Find Next\tF3");
   addItem(edit, ID_FIND_PREV, L"Find Previous\tShift+F3");
@@ -8066,6 +8134,8 @@ static LRESULT CALLBACK FrameProc(HWND hw, UINT msg, WPARAM wp, LPARAM lp)
           case 'P': DoCommand(shift ? ID_PRINT_PREVIEW : ID_PRINT); return 0;
           case 'R': DoCommand(shift ? ID_ROTL : ID_ROTR); return 0;
           case 'A': DoCommand(ID_SEL_ALL); return 0;
+          case 'Z': DoCommand(ID_UNDO); return 0;
+          case 'Y': DoCommand(ID_REDO); return 0;
           case VK_OEM_PLUS: case VK_ADD: DoCommand(ID_ZOOM_IN); return 0;
           case VK_OEM_MINUS: case VK_SUBTRACT: DoCommand(ID_ZOOM_OUT); return 0;
           case '0': DoCommand(ID_FITP); return 0;
@@ -8858,6 +8928,97 @@ static bool SaveAsString(FPDF_DOCUMENT d, std::vector<unsigned char>& out)
   bool ok = FPDF_SaveAsCopy(d, &fw.base, FPDF_NO_INCREMENTAL);
   out.swap(fw.buf);
   return ok;
+}
+
+// ---------------------------------------------------------------------------
+// Undo / Redo. Every edit is captured as the full document bytes just before it
+// happens, so a PDFium mutation needs no inverse of its own: undoing swaps the
+// live document for one parsed from the snapshot bytes. That is robust even
+// when an edit turned the document handle over (Ctrl+S via SaveInPlace, page
+// reorder) because the snapshot is bytes, not handles. The in-memory bookmark
+// list travels alongside, since user bookmarks are only folded into the file at
+// save time.
+// ---------------------------------------------------------------------------
+static const int kUndoDepth = 20;
+
+static bool SwapDocumentTo(const UndoEntry& from, std::vector<UndoEntry>& toOther)
+{
+  if (!g.doc || from.bytes.empty()) return false;
+  FPDF_DOCUMENT nd =
+      FPDF_LoadMemDocument(from.bytes.data(), (int)from.bytes.size(), nullptr);
+  if (!nd) return false;
+
+  UndoEntry cur;
+  if (!SaveAsString(g.doc, cur.bytes))
+  {
+    FPDF_CloseDocument(nd);
+    return false;
+  }
+  cur.marks = g.marks;
+  toOther.push_back(std::move(cur));
+
+  // The swap rebuilds the document (like ReorderPagesTo), so outgoing handles
+  // die with CloseDoc() below and any live edit/annot state must be dropped
+  // first - the same bookkeeping a page reorder has to do.
+  if (g.annDrag || g.selDrag) ReleaseCapture();
+  g.annTool = 0;
+  g.annDrag = false;
+  g.annPage = -1;
+  g.sel.active = false;
+  g.selDrag = false;
+  g.editPage = nullptr;
+  g.editObj = nullptr;
+
+  const std::wstring keepPath = g.path;
+  const std::wstring keepName = g.name;
+  CloseDoc();
+  g.doc = nd;
+  g.path = keepPath;
+  g.name = keepName;
+  g.marks = from.marks;
+  RefreshState();
+  g.dirty = true;
+  g.bmDirty = true;
+  InvalidateRect(g.canvas, nullptr, TRUE);
+  InvalidateRect(g.thumbs, nullptr, TRUE);
+  if (g.status) InvalidateRect(g.status, nullptr, TRUE);
+  return true;
+}
+
+// Called just before an edit mutates the document. Pushes the untouched state
+// and clears the redo chain (a new branch off history).
+static void BeginEdit()
+{
+  if (!g.doc || g.pageCount == 0) return;
+  UndoEntry e;
+  if (!SaveAsString(g.doc, e.bytes)) return;
+  e.marks = g.marks;
+  g.undo.push_back(std::move(e));
+  g.redo.clear();
+  if ((int)g.undo.size() > kUndoDepth) g.undo.erase(g.undo.begin());
+}
+
+// Called when an edit that armed a snapshot turns out to have changed nothing
+// (no-op rotation, dead drop, cancelled dialog) so it leaves no empty slot.
+static void CancelEdit()
+{
+  if (!g.undo.empty()) g.undo.pop_back();
+}
+
+static void UndoEdit()
+{
+  if (g.undo.empty() || !g.doc) return;
+  UndoEntry from = std::move(g.undo.back());
+  g.undo.pop_back();
+  if (!SwapDocumentTo(from, g.redo)) g.undo.push_back(std::move(from));
+}
+
+static void RedoEdit()
+{
+  if (g.redo.empty() || !g.doc) return;
+  UndoEntry from = std::move(g.redo.back());
+  g.redo.pop_back();
+  if (!SwapDocumentTo(from, g.undo)) g.redo.push_back(std::move(from));
 }
 
 // Runs the headless checks, writing test_result.txt next to the exe. Returns
@@ -10813,6 +10974,153 @@ check("saved %PDF header", bytes.size() > 8 &&
   }
 
   {
+    // --- Undo / Redo: byte snapshots reverse edits, LIFO, bounded ---
+    // Every edit is scored through the snapshot engine (BeginEdit takes the
+    // untouched document bytes, UndoEdit/RedoEdit swap the live g.doc for one
+    // parsed from them), so the core is pinned down directly: a snapshot taken
+    // before a mutation, an undo that must return the exact pre-edit document
+    // (rotation included, because it lives in the page tree and must come back
+    // with the bytes), a redo that re-applies it, a fresh edit that branches
+    // the history and clears redo, a cancelled edit leaving no slot, and the
+    // depth cap. The bookmark list must travel with every snapshot.
+    FPDF_DOCUMENT keepURDoc = g.doc;
+    const int keepURCount = g.pageCount;
+    const std::wstring keepURPath = g.path;
+    const std::wstring keepURName = g.name;
+    const std::vector<UserBookmark> keepURMarks = g.marks;
+    const std::vector<UndoEntry> keepURUndo = g.undo;
+    const std::vector<UndoEntry> keepURRedo = g.redo;
+
+    FPDF_DOCUMENT ur = FPDF_CreateNewDocument();
+    check("undo: scratch doc created", ur != nullptr);
+    if (ur)
+    {
+      for (int i = 0; i < 3; ++i) FPDFPage_New(ur, i, 612.0, 792.0);
+      g.doc = ur;
+      g.pageCount = FPDF_GetPageCount(ur);
+      g.path = L"C:\\somewhere\\undo.pdf";
+      g.name = L"undo.pdf";
+      g.marks.clear();
+      PrunePageSel();
+      g.selected = 0;
+      g.undo.clear();
+      g.redo.clear();
+
+      auto rot0 = [&]() {
+        int r = -1;
+        FPDF_PAGE p = FPDF_LoadPage(g.doc, 0);
+        if (p) { r = FPDFPage_GetRotation(p); FPDF_ClosePage(p); }
+        return r;
+      };
+      auto rotate0 = [&](int turns) {
+        FPDF_PAGE p = FPDF_LoadPage(g.doc, 0);
+        if (p) { FPDFPage_SetRotation(p, turns & 3); FPDF_ClosePage(p); }
+      };
+
+      // A cancelled edit leaves no empty slot behind.
+      BeginEdit();
+      checkEq("undo: a fresh edit arms one entry", (int)g.undo.size(), 1);
+      CancelEdit();
+      check("undo: cancelled edit leaves the stack empty", g.undo.empty());
+
+      // Rotation round-trips through the snapshot bytes.
+      {
+        const int before = rot0();
+        BeginEdit();
+        rotate0(2);
+        checkEq("undo: fixture rotation changed", rot0(), 2);
+        checkEq("undo: one entry pushed", (int)g.undo.size(), 1);
+
+        UndoEdit();
+        checkEq("undo: rotation comes back with the bytes", rot0(), before);
+        checkEq("undo: undo hands the current state to redo",
+                (int)g.redo.size(), 1);
+        checkEq("undo: undo consumes its entry", (int)g.undo.size(), 0);
+
+        RedoEdit();
+        checkEq("undo: redo re-applies the edit", rot0(), 2);
+        checkEq("undo: redo moves the entry back", (int)g.undo.size(), 1);
+      }
+
+      // A fresh edit after an undo branches the history and clears redo.
+      {
+        g.undo.clear();
+        g.redo.clear();
+        const int rotBefore = rot0();
+        BeginEdit();
+        rotate0(rotBefore + 1);
+        UndoEdit();
+        checkEq("undo: redo stays available after undo", (int)g.redo.size(), 1);
+        checkEq("undo: doc back to the pre-edit rotation", rot0(), rotBefore);
+        BeginEdit();
+        check("undo: a new edit clears redo", g.redo.empty());
+        checkEq("undo: history depth reflects the branch", (int)g.undo.size(), 1);
+      }
+
+      // The depth cap drops the oldest entry, keeping the newest on top.
+      {
+        g.undo.clear();
+        g.redo.clear();
+        for (int i = 0; i < kUndoDepth + 3; ++i)
+        {
+          BeginEdit();
+          rotate0(i);
+        }
+        checkEq("undo: depth is capped at kUndoDepth",
+                (int)g.undo.size(), kUndoDepth);
+        UndoEdit();
+        // The oldest three snapshots were dropped; undoing the newest edit
+        // (iteration kUndoDepth+2) lands on the state after iteration
+        // kUndoDepth+1.
+        checkEq("undo: newest edit sits on top of the stack",
+                rot0(), (kUndoDepth + 1) & 3);
+        checkEq("undo: capped slot reached bottom", (int)g.redo.size(), 1);
+      }
+
+      // The in-memory bookmark list travels with the snapshot.
+      {
+        UserBookmark bm;
+        bm.title = L"Undo me";
+        bm.page = 1;
+        g.marks.clear();
+        BeginEdit();
+        g.marks.push_back(bm);
+        checkEq("undo: mark recorded", (int)g.marks.size(), 1);
+        UndoEdit();
+        check("undo: mark list restored by undo", g.marks.empty());
+      }
+
+      // Page deletions are structural edits: the undo must bring the page count
+      // itself back, which also proves the swap rebuilds the whole document.
+      {
+        const int countBefore = g.pageCount;
+        BeginEdit();
+        FPDFPage_Delete(g.doc, 2);
+        g.pageCount = FPDF_GetPageCount(g.doc);
+        checkEq("undo: page deleted", g.pageCount, countBefore - 1);
+        checkEq("undo: live page count follows the doc", FPDF_GetPageCount(g.doc), countBefore - 1);
+
+        UndoEdit();
+        checkEq("undo: page count restored", g.pageCount, countBefore);
+        checkEq("undo: restored doc reports the full count",
+                FPDF_GetPageCount(g.doc), countBefore);
+        check("undo: restore leaves a live document", g.doc != nullptr);
+      }
+
+      FPDF_DOCUMENT builtUR = g.doc;
+      g.doc = keepURDoc;
+      g.pageCount = keepURCount;
+      g.path = keepURPath;
+      g.name = keepURName;
+      g.marks = keepURMarks;
+      g.undo = keepURUndo;
+      g.redo = keepURRedo;
+      PrunePageSel();
+      FPDF_CloseDocument(builtUR);
+    }
+  }
+
+  {
     // --- Print: fitting a page onto a device, and rasterising it ---
     // The fitted rectangle and the orientation of the raster are the parts of
     // printing that can be wrong without anything failing visibly, and they are
@@ -11326,6 +11634,9 @@ check("saved %PDF header", bytes.size() > 8 &&
             wcsstr(kAboutText, L"Ctrl+P print") != nullptr);
       check("about: advertises the print preview shortcut",
             wcsstr(kAboutText, L"Ctrl+Shift+P print preview") != nullptr);
+      check("about: advertises the undo/redo shortcuts",
+            wcsstr(kAboutText, L"Ctrl+Z undo") != nullptr &&
+            wcsstr(kAboutText, L"Ctrl+Y redo") != nullptr);
       check("about: states why the program exists",
             wcsstr(kAboutText, L"pay again.") != nullptr);
       check("about: still lists the save shortcut",

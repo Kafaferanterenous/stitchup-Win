@@ -65,6 +65,14 @@ Produces `dist\Stitchup.exe` + `dist\pdfium.dll`.
   or wheel). Print uses the shown settings - the preview's paper and
   orientation are written into the print job's DEVMODE, so what you see is what
   a printer with those settings produces. `Esc` cancels; `Enter`/Print commits.
+- Undo / Redo (Edit > Undo / Redo, `Ctrl+Z` / `Ctrl+Y`): every edit is reversible
+  down to the last 20 steps, each tab keeping its own chain. Before an edit the
+  untouched document is captured as bytes, so undoing simply swaps the live
+  document for that exact earlier state - rotation, crop, content-object edits,
+  annotations, page add/delete/reorder and imports all come back precisely, and
+  even the in-memory user bookmarks are restored with the step. A new edit after
+  an undo starts a fresh branch (redo clears); a cancelled edit (dead drop,
+  no-op rotate) leaves no empty step behind.
 - Thumbnails panel: gains its own scroll bar whenever the list is taller than
   the pane, and scrolls with the wheel whenever the pointer is over it (the
   wheel still scrolls the canvas when it is over the document). It auto-follows
@@ -155,8 +163,8 @@ Produces `dist\Stitchup.exe` + `dist\pdfium.dll`.
 - Shortcuts: Ctrl+N/O/S, Ctrl+Shift+S, Ctrl+R (rotate), Ctrl+[/Ctrl+], Delete,
   Ctrl+0/1/2 (100%/fit width/fit page), Ctrl+A (select all pages), Ctrl+F (find),
   F3 / Shift+F3 (find next / previous), Ctrl+D (dark mode), Ctrl+P (print),
-  Ctrl+Shift+P (print preview), PgUp/PgDn, Ctrl+wheel to zoom, F5 (two-page
-  spread), F8 (toggle sidebar), Ctrl+T (new tab),
+  Ctrl+Shift+P (print preview), Ctrl+Z (undo), Ctrl+Y (redo), PgUp/PgDn,
+  Ctrl+wheel to zoom, F5 (two-page spread), F8 (toggle sidebar), Ctrl+T (new tab),
   Ctrl+Tab/Ctrl+Shift+Tab (next/previous tab)
 
 ## Building / continuous integration
@@ -213,7 +221,6 @@ project (github.com/bblanchon/pdfium-binaries). Non-GPL build.
 
 Not yet implemented, roughly by how much a user notices them missing:
 
-- Undo / Redo — every edit is immediate and cannot be reversed from the UI
 - Merge / Combine PDFs — only Import (append) is available
 - File compression / reduce file size
 - Digital signatures (needs a crypto library beyond what is linked)

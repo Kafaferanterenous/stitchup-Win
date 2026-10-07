@@ -725,3 +725,48 @@ test). Self-test grew from 412 to 440 checks: 440 passed, 0 failed, exit code 0.
 
 Not verified on this desktop (it has no printer): a physical round-trip, the
 DEVMODE seeding against a real driver, and the dialog's feel by mouse.
+
+## v0.12.9 - undo / redo (2026-10-07)
+
+The top missing feature, now closed: every edit is reversible, with its own
+chain per tab, down to the last 20 steps.
+
+- The core trick is that an edit is not stored as an inverse operation but as
+  the untouched document: `BeginEdit()` serialises the live document to bytes
+  (via `SaveAsString`) and pushes an entry; `UndoEdit()` / `RedoEdit()` hand the
+  current document into the opposite stack and swap the live `g.doc` for one
+  parsed from the saved bytes through `SwapDocumentTo()` - the same
+  close-and-reload ownership dance `ReorderPagesTo()` uses, only without the
+  page permutation. `FPDF_LoadMemDocument` parses a serialised buffer, so the
+  byte snapshot round-trips exactly, `/Rotate`, MediaBox and all. The cap is
+  `kUndoDepth = 20`; a new edit after an undo branches the history (redo
+  clears); `CancelEdit()` pops an armed-but-cancelled step, so a dead drop on a
+  page edge or a no-op rotate leaves no empty slot.
+- The bookmark problem: `SaveAsString` serialises page objects only, it cannot
+  write user bookmarks. The in-memory `g.marks` list is copied into the snapshot
+  and restored on swap, so undoing a session bookmark comes back too.
+- Every mutating path arms the entry: add / delete / rotate / crop / reorder /
+  import / watermark, content-object select-move / delete / recolor / edit-text,
+  all annotation inserts, and user bookmarks. Page-count changes (add, delete,
+  import) are covered by the same swap because `RefreshState()` recomputes the
+  count from the restored document. Stacks are cleared on open / new, preserved
+  across tab switches through `SnapshotCurrentTab` / `RestoreTab`, and the
+  restored document is dirty (the edit is still unsaved - the snapshots hold
+  pre-edit bytes, so even an undo across a save restores the exact pre-edit
+  state).
+- Menu wiring: Edit > Undo / Redo (`Ctrl+Z` / `Ctrl+Y`), always enabled, added
+  to `BuildMenu` and `IsHandledCommand` so the menu walker sees no dead items;
+  the About box advertises both shortcuts. Guarded additions: `BeginEdit` runs
+  only after every prompt / precondition that can fail, so a cancelled dialog
+  cannot push a phantom edit.
+- 25 new `undo:` checks: the round-trip (arm, mutate by direct FPDF calls,
+  undo restores the exact file bytes - rotation, page count and bookmark list
+  come back), redo re-applies, undo hands the current state to redo, a new edit
+  clears redo, the depth cap drops the oldest while the newest stays on top, and
+  a cancelled edit leaves the stack empty. Self-test grew from 440 to 465
+  checks: 465 passed, 0 failed, exit code 0.
+
+Not verified on this desktop: the actual Ctrl+Z / Ctrl+Y keystrokes and the
+thumbnails-pane and canvas gestures by mouse (the pane reports a zero-width
+rect here), and the depth cap's memory behaviour over a long interactive
+session. The engine, hooks and shortcuts are the covered parts.
