@@ -48,6 +48,21 @@ Produces `dist\Stitchup.exe` + `dist\pdfium.dll`.
 - File menu: New, Open, Save (atomic: temp file + replace), Save As, Import PDF
   (appends the chosen file's pages, single or multi-page, and scrolls to the
   first imported page)
+- Print (File > Print... or `Ctrl+P`): the print dialog offers all pages, a
+  range, and copies; every page is fitted to the paper through the same
+  aspect-preserving, centred maths as Fit Page, honours its own rotation, and
+  is rasterised with the annotation layer so watermarks and stamps come out
+  too. (No printer was attached to the test machine; the fit, orientation and
+  rasterisation math is covered by the self-test.)
+- Thumbnails panel: gains its own scroll bar whenever the list is taller than
+  the pane, and scrolls with the wheel whenever the pointer is over it (the
+  wheel still scrolls the canvas when it is over the document). It auto-follows
+  the main view only when that view actually moves onto another page, so you
+  can browse thumbnails of pages you are not currently looking at without being
+  yanked back by the next repaint.
+- View: the status bar shows the open file name (with an `*` while changes are
+  unsaved) and, on the right, the current page of the total page count, the
+  multi-select count and the zoom level
 - Edit: rotate page CW/CCW, delete page, add blank page (Letter/A4), drag pages
   in the thumbnails panel to reorder
 - Multi-page selection in the Pages panel: Ctrl-click adds or removes a page,
@@ -128,9 +143,9 @@ Produces `dist\Stitchup.exe` + `dist\pdfium.dll`.
 - Drag & drop a PDF onto the window to open it; open via command-line argument
 - Shortcuts: Ctrl+N/O/S, Ctrl+Shift+S, Ctrl+R (rotate), Ctrl+[/Ctrl+], Delete,
   Ctrl+0/1/2 (100%/fit width/fit page), Ctrl+A (select all pages), Ctrl+F (find),
-  F3 / Shift+F3 (find next / previous), Ctrl+D (dark mode), PgUp/PgDn,
-  Ctrl+wheel to zoom, F5 (two-page spread), F8 (toggle sidebar), Ctrl+T (new tab),
-  Ctrl+Tab/Ctrl+Shift+Tab (next/previous tab)
+  F3 / Shift+F3 (find next / previous), Ctrl+D (dark mode), Ctrl+P (print),
+  PgUp/PgDn, Ctrl+wheel to zoom, F5 (two-page spread), F8 (toggle sidebar),
+  Ctrl+T (new tab), Ctrl+Tab/Ctrl+Shift+Tab (next/previous tab)
 
 ## Building / continuous integration
 
@@ -186,14 +201,14 @@ project (github.com/bblanchon/pdfium-binaries). Non-GPL build.
 
 Not yet implemented, roughly by how much a user notices them missing:
 
-- Print / Print Preview — no print command exists yet
+- Print Preview — printing itself (File > Print..., `Ctrl+P`) is done, but
+  there is no on-screen preview of what will reach the paper
 - Undo / Redo — every edit is immediate and cannot be reversed from the UI
 - Merge / Combine PDFs — only Import (append) is available
 - File compression / reduce file size
 - Digital signatures (needs a crypto library beyond what is linked)
 - Redaction (needs real content removal, not an overlay)
-- Multi-page rotate/delete now works from a Pages-pane selection; Extract,
-  Split and Auto-Crop still act on the focused page only
+- Extract, Split and Auto-Crop still act on the focused page only
 - Internal page-destination link creation — blocked: PDFium reads destinations
   but exposes no API to write one
 - Static single-exe build — blocked: requires rebuilding PDFium from source with

@@ -25,6 +25,7 @@
 
 #include <cstdio>
 #include <cstdlib>
+#include <cstddef>
 #include <cwchar>
 #include <cmath>
 #include <functional>
@@ -98,6 +99,7 @@ ID_ANN_LINK,
   ID_FIND_PREV,
   ID_SEL_ALL,     // Select All pages (Pages pane / Ctrl+A)
   ID_ROT_ALL,     // Rotate All Pages CW (explicit, for the whole document)
+  ID_PRINT,       // Print (Ctrl+P)
   // Colour-scheme pickers follow in one contiguous block (radio group).
   ID_THEME_FIRST,
   ID_THEME_LIGHT = ID_THEME_FIRST,
@@ -135,6 +137,24 @@ enum
 #endif
 
 const wchar_t* const kAppTitle = L"Stitchup PDF Editor  v" STITCHUP_VERSION;
+
+// Help > About. Kept as a named string so the self-test can check that the
+// shortcuts it advertises and the reason it gives for existing are both
+// actually there, rather than silently drifting out of the dialog.
+const wchar_t* const kAboutText =
+    L"Stitchup PDF Editor\n\nPortable PDF viewer/editor\n"
+    L"Engine: PDFium (BSD-3-Clause, Chromium project)\n"
+    L"UI: native Win32 (zero runtime dependencies)\n\n"
+    L"I asked Ai to code this basic pdf editor, because software\n"
+    L"company I bought my previous pdf editor from and paid for, removed the\n"
+    L"ability to reactivate it and called it fair - buy new version, pay again.\n\n"
+    L"Shortcuts:\n"
+    L"  Ctrl+O open   Ctrl+S save   Ctrl+Shift+S save as\n"
+    L"  Ctrl+R rotate CW   Ctrl+Shift+R rotate CCW\n"
+    L"  Ctrl+= / Ctrl+- zoom   Ctrl+0 fit page   Ctrl+1 100%\n"
+    L"  Ctrl+F find   F3 next   Shift+F3 previous\n"
+    L"  Ctrl+P print\n"
+    L"  Del delete page   Ctrl+W fit width   Ctrl+PgUp/PgDn page";
 
 // ---------------------------------------------------------------------------
 // Application state
@@ -1135,6 +1155,8 @@ static void RefreshState();
 static void UpdateScrollbars();
 static void ResetThumbScroll();
 static void SyncThumbScroll();
+// The canvas page the thumbnail list last auto-followed. -1 forces a re-follow.
+static int s_thumbFollowed = -1;
 static void FitWidth();
 static void RelayoutPanes(int w, int h);
 static void GotoPageIndex(int idx);
@@ -1256,6 +1278,7 @@ static void RefreshState()
     g_tabs[g_curTab].pageCount = g.pageCount;
   ClearCanvasCache();
   ClearThumbCache();
+  s_thumbFollowed = -1;
   ResetThumbScroll();
   if (g.status) InvalidateRect(g.status, nullptr, TRUE);
 }
@@ -3075,6 +3098,244 @@ static void ImportPdf()
   InvalidateRect(g.thumbs, nullptr, TRUE);
 }
 
+// ---------------------------------------------------------------------------
+// Print
+// ---------------------------------------------------------------------------
+// This PDFium build has no FPDF_PrintPage, so a page is rasterised at printer
+// resolution and blitted onto the printer DC. That is also what print preview
+// does, so preview and printed output share one rendering path and cannot drift
+// apart.
+
+// Where a page lands when it is rendered into a fixed pixel area.
+struct PageFit
+{
+  int w = 1, h = 1;   // bitmap size to render at, in pixels
+  int x = 0, y = 0;   // top-left of that bitmap inside the area
+};
+
+// Fits a page `pageW` x `pageH` (points, 72 to the inch) into `availW` x
+// `availH` pixels at `dpiX`/`dpiY` pixels per inch. Aspect ratio is preserved,
+// the result is centred, and it is never larger than the area - so margins are
+// respected even when the page is a different shape than the paper.
+static PageFit FitPageToArea(double pageW, double pageH, double dpiX,
+                             double dpiY, int availW, int availH)
+{
+  PageFit f;
+  if (!(pageW > 0) || !(pageH > 0) || !(dpiX > 0) || !(dpiY > 0) ||
+      availW < 1 || availH < 1)
+    return f;
+  const double wantW = pageW * dpiX / 72.0;
+  const double wantH = pageH * dpiY / 72.0;
+  double scale = std::min((double)availW / wantW, (double)availH / wantH);
+  if (scale > 1.0) scale = 1.0;
+  f.w = (int)std::floor(wantW * scale + 0.5);
+  f.h = (int)std::floor(wantH * scale + 0.5);
+  if (f.w < 1) f.w = 1;
+  if (f.h < 1) f.h = 1;
+  // Rounding can push the last pixel one past the area; pull it back.
+  if (f.w > availW) f.w = availW;
+  if (f.h > availH) f.h = availH;
+  f.x = (availW - f.w) / 2;
+  f.y = (availH - f.h) / 2;
+  return f;
+}
+
+// Rasterises `page` at `w` x `h` pixels with PDFium's `rotate` (0..3), paper
+// white behind it, annotations included. The caller owns the returned bitmap.
+static FPDF_BITMAP RenderPageToFit(FPDF_PAGE page, int w, int h, int rotate)
+{
+  if (!page || w < 1 || h < 1) return nullptr;
+  FPDF_BITMAP bmp = FPDFBitmap_Create(w, h, 0);
+  if (!bmp) return nullptr;
+  FPDFBitmap_FillRect(bmp, 0, 0, w, h, 0xFFFFFFFFu);
+  FPDF_RenderPageBitmap(bmp, page, 0, 0, w, h, rotate, FPDF_ANNOT);
+  return bmp;
+}
+
+// Copies a FPDF bitmap into `dc` at device-pixel (x, y). PDFium stores rows
+// top-down in BGRA/BGRx, which is exactly the layout a negative-height BI_RGB
+// header describes, but its stride can exceed width*4, so rows are repacked
+// before the blit rather than assumed to be contiguous.
+static bool BlitPageBitmap(HDC dc, FPDF_BITMAP src, int x, int y)
+{
+  if (!dc || !src) return false;
+  const int w = FPDFBitmap_GetWidth(src);
+  const int h = FPDFBitmap_GetHeight(src);
+  const int stride = FPDFBitmap_GetStride(src);
+  const auto* base = static_cast<const unsigned char*>(FPDFBitmap_GetBuffer(src));
+  if (w < 1 || h < 1 || !base) return false;
+  if (stride > 0 && stride < w * 4) return false;
+  if (stride < 0 && stride > -(w * 4)) return false;
+
+  // Rows are repacked rather than handed straight to GDI: the stride can exceed
+  // width*4 and it can be negative (bottom-up). Signed pointer arithmetic keeps
+  // both cases walking the rows the way the bitmap describes them.
+  std::vector<unsigned char> packed((size_t)w * (size_t)h * 4);
+  for (int r = 0; r < h; ++r)
+  {
+    const unsigned char* row = base + (std::ptrdiff_t)r * (std::ptrdiff_t)stride;
+    memcpy(packed.data() + (size_t)r * w * 4, row, (size_t)w * 4);
+  }
+
+  BITMAPINFO bi{};
+  bi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+  bi.bmiHeader.biWidth = w;
+  bi.bmiHeader.biHeight = -h;     // top-down
+  bi.bmiHeader.biPlanes = 1;
+  bi.bmiHeader.biBitCount = 32;
+  bi.bmiHeader.biCompression = BI_RGB;
+  bi.bmiHeader.biSizeImage = (DWORD)packed.size();
+  const int rows = (int)StretchDIBits(dc, x, y, w, h, 0, 0, w, h, packed.data(),
+                                     &bi, DIB_RGB_COLORS, SRCCOPY);
+  // StretchDIBits returns GDI_ERROR on failure; anything else is rows written.
+  return rows > 0;
+}
+
+// Draws one page into `dc` scaled to fit the full device surface.
+static bool PrintOnePage(HDC dc, int pageIndex, double dpiX, double dpiY,
+                         int devW, int devH)
+{
+  FPDF_PAGE page = FPDF_LoadPage(g.doc, pageIndex);
+  if (!page) return false;
+
+  double pw = FPDF_GetPageWidth(page);
+  double ph = FPDF_GetPageHeight(page);
+  // /Rotate is not applied by FPDF_LoadPage; the printed page must match what
+  // the app shows, so the rendered rectangle is swapped for 90/270.
+  int rot = FPDFPage_GetRotation(page) % 4;
+  if (rot < 0) rot += 4;
+  if (rot & 1) std::swap(pw, ph);
+
+  const PageFit fit = FitPageToArea(pw, ph, dpiX, dpiY, devW, devH);
+  FPDF_BITMAP bmp = RenderPageToFit(page, fit.w, fit.h, rot);
+  FPDF_ClosePage(page);
+  if (!bmp) return false;
+
+  const bool ok = BlitPageBitmap(dc, bmp, fit.x, fit.y);
+  FPDFBitmap_Destroy(bmp);
+  return ok;
+}
+
+// The SDK defines the DM_ORIENTATION flag but not the two values it takes;
+// these are the long-standing ones (1 = portrait, 2 = landscape).
+static const WORD kOrientPortrait = 1;
+static const WORD kOrientLandscape = 2;
+
+// Picks the printer orientation for a page. Returns true if the DEVMODE was
+// changed, in which case the caller has to ResetDC() for it to take effect.
+// A landscape page fitted onto portrait paper still lands in the printable
+// area without this, but telling the driver keeps the media selection and the
+// reported HORZRES/VERTRES honest.
+static bool OrientationForPage(DEVMODEW* dm, double pageW, double pageH)
+{
+  if (!dm) return false;
+  if (dm->dmSize < offsetof(DEVMODEW, dmOrientation) + sizeof(WORD)) return false;
+  const WORD want = (pageW > pageH) ? kOrientLandscape : kOrientPortrait;
+  if (dm->dmOrientation == want) return false;
+  dm->dmOrientation = want;
+  dm->dmFields |= DM_ORIENTATION;
+  return true;
+}
+
+static void PrintDoc()
+{
+  if (!g.doc || g.pageCount < 1)
+  {
+    MessageBoxW(g.frame, L"There is nothing to print.", L"Stitchup",
+                MB_OK | MB_ICONINFORMATION);
+    return;
+  }
+
+  PRINTDLGW pd{};
+  pd.lStructSize = sizeof(pd);
+  pd.hwndOwner = g.frame;
+  pd.Flags = PD_ALLPAGES | PD_PAGENUMS | PD_NOSELECTION | PD_RETURNDC;
+  pd.nMinPage = 1;
+  pd.nMaxPage = (WORD)std::min(g.pageCount, 9999);
+  pd.nFromPage = 1;
+  pd.nToPage = pd.nMaxPage;
+  if (!PrintDlgW(&pd)) return;          // cancelled: nothing to release yet
+
+  HDC dc = pd.hDC;
+  if (!dc)
+  {
+    if (pd.hDevMode) GlobalFree(pd.hDevMode);
+    if (pd.hDevNames) GlobalFree(pd.hDevNames);
+    MessageBoxW(g.frame, L"No printer is available.", L"Stitchup",
+                MB_OK | MB_ICONWARNING);
+    return;
+  }
+
+  // pd.hDevMode is an HGLOBAL, so it has to be locked before it can be read
+  // from or written to.
+  DEVMODEW* dm = pd.hDevMode ? (DEVMODEW*)GlobalLock(pd.hDevMode) : nullptr;
+
+  int first = 1;
+  int last = g.pageCount;
+  if (pd.Flags & PD_PAGENUMS)
+  {
+    first = (int)pd.nFromPage;
+    last = (int)pd.nToPage;
+  }
+  if (first < 1) first = 1;
+  if (last > g.pageCount) last = g.pageCount;
+  const int copies = (pd.nCopies > 0) ? pd.nCopies : 1;
+
+  // The printable area is only meaningful once the paper orientation is known,
+  // and that depends on the first page of the range.
+  double firstW = 0, firstH = 0;
+  {
+    FPDF_PAGE p = FPDF_LoadPage(g.doc, first - 1);
+    if (p)
+    {
+      firstW = FPDF_GetPageWidth(p);
+      firstH = FPDF_GetPageHeight(p);
+      if (FPDFPage_GetRotation(p) & 1) std::swap(firstW, firstH);
+      FPDF_ClosePage(p);
+    }
+  }
+  if (OrientationForPage(dm, firstW, firstH))
+    ResetDCW(dc, dm);
+  if (dm) GlobalUnlock(pd.hDevMode);
+
+  const int dpiX = std::max(1, GetDeviceCaps(dc, LOGPIXELSX));
+  const int dpiY = std::max(1, GetDeviceCaps(dc, LOGPIXELSY));
+  const int devW = std::max(1, GetDeviceCaps(dc, HORZRES));
+  const int devH = std::max(1, GetDeviceCaps(dc, VERTRES));
+
+  DOCINFOW di{};
+  di.cbSize = sizeof(di);
+  di.lpszDocName = g.name.empty() ? L"Stitchup document" : g.name.c_str();
+
+  int written = 0;
+  if (StartDocW(dc, &di) <= 0)
+  {
+    MessageBoxW(g.frame, L"The printer refused to start a job.", L"Stitchup",
+                MB_OK | MB_ICONWARNING);
+    written = -1;
+  }
+  else
+  {
+    for (int copy = 0; copy < copies && written >= 0; ++copy)
+    {
+      for (int p1 = first; p1 <= last && written >= 0; ++p1)
+      {
+        if (StartPage(dc) <= 0) { written = -1; break; }
+        const bool ok = PrintOnePage(dc, p1 - 1, dpiX, dpiY, devW, devH);
+        if (EndPage(dc) <= 0) { written = -1; break; }
+        if (!ok) { written = -1; break; }
+        ++written;
+      }
+    }
+    if (written < 0) AbortDoc(dc);
+    else EndDoc(dc);
+  }
+
+  if (pd.hDevMode) GlobalFree(pd.hDevMode);
+  if (pd.hDevNames) GlobalFree(pd.hDevNames);
+  DeleteDC(dc);
+}
+
 // Deletes every selected page, highest index first so the remaining indices
 // stay valid. Leaves at least one page behind.
 static void DeleteSelectedPages()
@@ -3509,12 +3770,17 @@ static LRESULT CALLBACK StatusProc(HWND hw, UINT msg, WPARAM wp, LPARAM lp)
       return 1;
 case WM_PAINT:
     {
+      // A non-zero wParam is a device context to paint into - the WM_PAINT
+      // convention used by the self-test to render the bar into a bitmap
+      // without a screen. Nothing is laid out or drawn differently in that
+      // case; only BeginPaint/EndPaint are skipped.
+      HDC dc = reinterpret_cast<HDC>(wp);
       PAINTSTRUCT ps;
-      HDC dc = BeginPaint(hw, &ps);
+      if (!dc) dc = BeginPaint(hw, &ps);
       RECT rc;
       GetClientRect(hw, &rc);
       const UiTheme& th = ThemeNow();
-      HBRUSH bg = CreateSolidBrush(th.ribbonBg);
+      HBRUSH bg = CreateSolidBrush(th.statusBg);
       FillRect(dc, &rc, bg);
 DeleteObject(bg);
       SetBkMode(dc, TRANSPARENT);
@@ -3547,7 +3813,7 @@ DeleteObject(bg);
       rrc.right -= 10;
       SetTextAlign(dc, TA_RIGHT | TA_TOP);
       DrawTextW(dc, right.c_str(), -1, &rrc, DT_SINGLELINE | DT_VCENTER | DT_RIGHT);
-      EndPaint(hw, &ps);
+      if (!reinterpret_cast<HDC>(wp)) EndPaint(hw, &ps);
       return 0;
     }
   }
@@ -3578,17 +3844,15 @@ static int ThumbForY(int y)
   return -1;
 }
 
-// Set the thumbnails scrollbar range so long documents actually scroll.
-static void ResetThumbScroll()
+// Total height of the thumbnail list as WM_PAINT draws it, in the same
+// coordinates: a 34px header, then every thumbnail slot.
+static int ThumbContentHeight()
 {
-  if (!g.thumbs) return;
   RECT rc;
   GetClientRect(g.thumbs, &rc);
-  int view = rc.bottom - rc.top;
-  int content = 34;
-  int w = rc.right - rc.left;
-  int thumbW = w - 26;
+  int thumbW = (rc.right - rc.left) - 26;
   if (thumbW < 50) thumbW = 50;
+  int content = 34;
   for (int i = 0; i < g.pageCount; ++i)
   {
     float pw = PageW(i), ph = PageH(i);
@@ -3597,21 +3861,71 @@ static void ResetThumbScroll()
                             220.0 / (double)ph);
     content += (int)std::ceil(ph * scale) + 16;
   }
+  return content;
+}
+
+// Last reachable scroll position for a list of `content` pixels shown through a
+// `view`-pixel window. Win32 stops a scroll bar at nMax - nPage + 1, so the
+// nMax a caller stores has to be the extent of the content (content - 1) and
+// this is what that turns into; storing content - view as nMax as well would
+// make the bottom `view - 1` pixels of a long list unreachable.
+static int ScrollLastPos(int content, int view)
+{
+  if (view < 1 || content <= view) return 0;
+  return content - view;
+}
+
+// Whether the thumbnail pane is showing its own scroll bar.
+static bool s_thumbBar = false;
+// ShowScrollBar() resizes the client area, which sends WM_SIZE straight back
+// into ResetThumbScroll(). One of the two calls has to stop.
+static bool s_inThumbReset = false;
+
+// Set the thumbnails scrollbar range so long documents actually scroll, and
+// show the bar only when there is something to scroll.
+static void ResetThumbScroll()
+{
+  if (!g.thumbs || s_inThumbReset) return;
+  s_inThumbReset = true;
+
+  int content = 0, view = 0;
+  bool need = false;
+  // Showing the bar takes width away from the list, which makes every thumbnail
+  // narrower and so the list taller, so the decision needs two passes to settle
+  // rather than one - the same reason UpdateScrollbars() loops.
+  for (int pass = 0; pass < 2; ++pass)
+  {
+    RECT rc;
+    GetClientRect(g.thumbs, &rc);
+    view = rc.bottom - rc.top;
+    content = ThumbContentHeight();
+    need = content > view + 2;
+    if (need == s_thumbBar) break;
+    s_thumbBar = need;
+    ShowScrollBar(g.thumbs, SB_VERT, need ? TRUE : FALSE);
+  }
+
   SCROLLINFO si{};
   si.cbSize = sizeof(si);
   si.fMask = SIF_RANGE | SIF_PAGE | SIF_POS;
   GetScrollInfo(g.thumbs, SB_VERT, &si);
   si.nMin = 0;
-  si.nMax = std::max(0, content - view);
+  // nMax is the extent of the content, not the distance it can travel: with a
+  // page size set the last reachable position is nMax - nPage + 1, which is
+  // content - view. Taking content - view here as well made the bottom of a
+  // long list unreachable by a further pane height.
+  si.nMax = std::max(0, content - 1);
   si.nPage = std::max(1, view);
-  if (si.nPos > si.nMax) si.nPos = si.nMax;
+  const int maxPos = ScrollLastPos(content, view);
+  if (si.nPos > maxPos) si.nPos = maxPos;
   SetScrollInfo(g.thumbs, SB_VERT, &si, TRUE);
+  s_inThumbReset = false;
 }
 
-// The thumbnails pane has no scrollbar of its own; it auto-follows the page
-// nearest the top of the main view so the canvas bar stays the only vertical
-// scrollbar. Range/pos are still stored so ThumbForY hit-testing (and
-// drag-to-reorder) keeps working with the same geometry as WM_PAINT.
+// The thumbnails pane scrolls on its own and also follows the page nearest the
+// top of the main view, so a document can be navigated from either side.
+// Range/pos are stored so ThumbForY hit-testing (and drag-to-reorder) keeps
+// working with the same geometry as WM_PAINT.
 static void SyncThumbScroll()
 {
   if (!g.thumbs || !g.doc || g.pageCount <= 0) return;
@@ -3658,23 +3972,95 @@ static void SyncThumbScroll()
     else if (i == target) slotH = hi;
   }
 
-  int pos = 0;
-  if (yTop < 0) pos = 0;
-  else if (yTop + slotH > view) pos = yTop + slotH - view + 8;
-  else pos = yTop - 8;
-  pos = std::max(0, std::min(std::max(0, content - view), pos));
+  // Follow the canvas only when it has moved onto a different page. The old
+  // behaviour re-centred the list on every scroll of the canvas, so browsing
+  // the thumbnails of pages you were not on was undone the moment anything
+  // else redrew - there was no way to sit and look at them.
+  if (target == s_thumbFollowed) return;
+  s_thumbFollowed = target;
 
   SCROLLINFO si{};
   si.cbSize = sizeof(si);
   si.fMask = SIF_POS;
   GetScrollInfo(g.thumbs, SB_VERT, &si);
+
+  // yTop is in list coordinates, so this asks whether the page is already on
+  // screen from where the list currently sits - not where it would be if the
+  // list were at the top, which is what the old comparison assumed.
+  int pos = si.nPos;
+  if (yTop < pos) pos = yTop - 8;
+  else if (yTop + slotH > pos + view) pos = yTop + slotH - view + 8;
+  pos = std::max(0, std::min(ScrollLastPos(content, view), pos));
+
   if (si.nPos != pos)
   {
-    si.fMask = SIF_POS;
     si.nPos = pos;
     SetScrollInfo(g.thumbs, SB_VERT, &si, TRUE);
     InvalidateRect(g.thumbs, nullptr, FALSE);
   }
+}
+
+// ---------------------------------------------------------------------------
+// Mouse wheel routing
+//
+// WM_MOUSEWHEEL is delivered to whichever window currently holds keyboard
+// focus, not the one under the pointer. Clicking a thumbnail gives focus to
+// the frame, so a wheel rolled over the page list used to land on a window
+// that ignored it entirely - the list never moved. Route by cursor position so
+// the wheel always drives whichever pane the pointer is actually over.
+// ---------------------------------------------------------------------------
+static bool WheelOverThumbs(LPARAM lp)
+{
+  if (!g.thumbs || !g.doc || !g.showSidebar || g.pane != 0) return false;
+  // Unlike WM_MOUSEMOVE, the wheel's lParam is in screen coordinates.
+  POINT pt{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
+  ScreenToClient(g.thumbs, &pt);
+  RECT rc;
+  GetClientRect(g.thumbs, &rc);
+  return PtInRect(&rc, pt) != FALSE;
+}
+
+static void ScrollThumbsBy(int delta)
+{
+  SCROLLINFO si{};
+  si.cbSize = sizeof(si);
+  si.fMask = SIF_RANGE | SIF_PAGE | SIF_POS;
+  GetScrollInfo(g.thumbs, SB_VERT, &si);
+  const int maxPos = std::max((int)si.nMin, (int)si.nMax - (int)si.nPage + 1);
+  const int pos = std::max((int)si.nMin, std::min(maxPos, si.nPos + delta));
+  if (pos == si.nPos) return;
+  si.fMask = SIF_POS;
+  si.nPos = pos;
+  SetScrollInfo(g.thumbs, SB_VERT, &si, TRUE);
+  InvalidateRect(g.thumbs, nullptr, FALSE);
+}
+
+static void HandleWheel(WPARAM wp, LPARAM lp)
+{
+  short d = GET_WHEEL_DELTA_WPARAM(wp);
+  if (d == 0) return;
+  if (GET_KEYSTATE_WPARAM(wp) & MK_CONTROL)
+  {
+    const double f = (d > 0) ? 1.25 : 0.8;
+    if (f <= 0.0) return;
+    g.zoom = std::max(0.1, std::min(8.0, g.zoom * f));
+    ClearCanvasCache();
+    UpdateScrollbars();
+    if (g.canvas) InvalidateRect(g.canvas, nullptr, TRUE);
+    if (g.status) InvalidateRect(g.status, nullptr, TRUE);
+    return;
+  }
+  if (WheelOverThumbs(lp))
+  {
+    // A thumbnail slot is a couple of hundred pixels tall, so a canvas-sized
+    // step would barely move it.
+    ScrollThumbsBy(-(int)((double)d / WHEEL_DELTA) * 120);
+    return;
+  }
+  if (!g.canvas) return;
+  g.scrollY = std::max(0, g.scrollY + (int)(-(d / WHEEL_DELTA) * 60));
+  UpdateScrollbars();
+  InvalidateRect(g.canvas, nullptr, FALSE);
 }
 
 static HBITMAP GetThumb(int i)
@@ -3701,10 +4087,8 @@ static LRESULT CALLBACK ThumbsProc(HWND hw, UINT msg, WPARAM wp, LPARAM lp)
     case WM_ERASEBKGND:
       return 1;
     case WM_CREATE:
-      // The thumbnails pane deliberately has no scrollbar of its own: the main
-      // canvas scrollbar is the single vertical bar, and SyncThumbScroll() keeps
-      // the active page's thumbnail in view. The hidden range is still used for
-      // hit-testing and drag-to-reorder.
+      // Start with the bar hidden. s_thumbBar tracks this state, and
+      // ResetThumbScroll() shows it only when the list is taller than the pane.
       ShowScrollBar(hw, SB_VERT, FALSE);
       return 0;
     case WM_SIZE:
@@ -3814,6 +4198,10 @@ static LRESULT CALLBACK ThumbsProc(HWND hw, UINT msg, WPARAM wp, LPARAM lp)
       si.fMask = SIF_ALL;
       GetScrollInfo(hw, SB_VERT, &si);
       int pos = si.nPos;
+      // With a page size set the reachable range stops at nMax - nPage + 1;
+      // clamping to nMax would leave a pane height of blank space at the end.
+      const int maxPos = std::max((int)si.nMin,
+                                  (int)si.nMax - (int)si.nPage + 1);
       switch (LOWORD(wp))
       {
         case SB_LINEUP: pos -= 24; break;
@@ -3822,9 +4210,9 @@ static LRESULT CALLBACK ThumbsProc(HWND hw, UINT msg, WPARAM wp, LPARAM lp)
         case SB_PAGEDOWN: pos += si.nPage; break;
         case SB_THUMBTRACK: pos = HIWORD(wp); break;
         case SB_TOP: pos = si.nMin; break;
-        case SB_BOTTOM: pos = si.nMax; break;
+        case SB_BOTTOM: pos = maxPos; break;
       }
-      pos = std::max(si.nMin, std::min((int)si.nMax, pos));
+      pos = std::max((int)si.nMin, std::min(maxPos, pos));
       si.nPos = pos;
       si.fMask = SIF_POS;
       SetScrollInfo(hw, SB_VERT, &si, TRUE);
@@ -3832,26 +4220,10 @@ static LRESULT CALLBACK ThumbsProc(HWND hw, UINT msg, WPARAM wp, LPARAM lp)
       return 0;
     }
     case WM_MOUSEWHEEL:
-    {
-      short d = GET_WHEEL_DELTA_WPARAM(wp);
-      if (d != 0 && g.canvas)
-      {
-        int step = (int)(-(d / WHEEL_DELTA) * 60);
-        SCROLLINFO si{};
-        si.cbSize = sizeof(si);
-        si.fMask = SIF_RANGE | SIF_PAGE | SIF_POS;
-        GetScrollInfo(g.canvas, SB_VERT, &si);
-        int pos = std::max(si.nMin, std::min(si.nMax, si.nPos + step));
-        g.scrollY = pos;
-        si.fMask = SIF_POS;
-        si.nPos = pos;
-        SetScrollInfo(g.canvas, SB_VERT, &si, TRUE);
-        UpdateScrollbars();
-        InvalidateRect(g.canvas, nullptr, FALSE);
-        InvalidateRect(hw, nullptr, FALSE);
-      }
+      // Routed by cursor, so rolling over the list scrolls the list even when
+      // some other window holds focus.
+      HandleWheel(wp, lp);
       return 0;
-    }
     case WM_LBUTTONDOWN:
     {
       SetFocus(g.frame);
@@ -4740,32 +5112,10 @@ static LRESULT CALLBACK CanvasProc(HWND hw, UINT msg, WPARAM wp, LPARAM lp)
       return 0;
     }
     case WM_MOUSEWHEEL:
-    {
-      short d = GET_WHEEL_DELTA_WPARAM(wp);
-      if (GET_KEYSTATE_WPARAM(wp) & MK_CONTROL)
-      {
-        double f = (d > 0) ? 1.25 : 0.8;
-        if (f > 0.0)
-        {
-          g.zoom = std::max(0.1, std::min(8.0, g.zoom * f));
-          ClearCanvasCache();
-          UpdateScrollbars();
-          InvalidateRect(hw, nullptr, TRUE);
-          InvalidateRect(g.status, nullptr, TRUE);
-        }
-      }
-      else
-      {
-        SCROLLINFO si{};
-        si.cbSize = sizeof(si);
-        si.fMask = SIF_POS;
-        GetScrollInfo(hw, SB_VERT, &si);
-        g.scrollY = std::max(0, g.scrollY + (int)(-(d / WHEEL_DELTA) * 60));
-        UpdateScrollbars();
-        InvalidateRect(hw, nullptr, FALSE);
-      }
+      // Routed by cursor: over the canvas this scrolls the canvas as before,
+      // over the page list it scrolls the page list instead.
+      HandleWheel(wp, lp);
       return 0;
-    }
     case WM_SETCURSOR:
     {
       POINT cur;
@@ -5407,6 +5757,8 @@ static void BuildToolbar(HWND)
      L"Write the document text out to a .txt file"},
     {ID_EXPORT_CSV,   L"Export CSV", 66, 0, 0xE8FD, false,
      L"Write page data out to a .csv file"},
+    {ID_PRINT,        L"Print",      62, 0, 0xE749, false,
+     L"Print the document, all pages or a page range (Ctrl+P)"},
     {ID_ROTL,         L"Rotate CCW", 88, 1, 0xE7AD, true,
      L"Rotate the current page 90 degrees counter-clockwise (Ctrl+Shift+R)"},
     {ID_ROTR,         L"Rotate CW",  86, 1, 0xE7AD, false,
@@ -6185,7 +6537,7 @@ static void RelayoutPanes(int w, int h)
   SetWindowPos(g.status, nullptr, 0, h - STATUS_H, w, STATUS_H, SWP_NOZORDER);
   SetWindowPos(g.thumbs, nullptr, 0, paneY, sw, paneH, SWP_NOZORDER);
   SetWindowPos(g.bookmarks, nullptr, 0, paneY, sw, paneH, SWP_NOZORDER);
-  ShowScrollBar(g.thumbs, SB_VERT, FALSE); // thumbnails follow the canvas bar
+  ResetThumbScroll(); // shows or hides the list's own scroll bar for the new size
   SetWindowPos(g.split, nullptr, sw, tabY + RIB_H, 6,
                PANE_TAB_H + paneH, SWP_NOZORDER);
   SetWindowPos(g.canvas, nullptr, sb ? sw + 6 : 0, tabY + RIB_H,
@@ -6247,7 +6599,7 @@ static bool IsHandledCommand(int id)
     case ID_ANN_HL: case ID_ANN_UL: case ID_ANN_NOTE: case ID_ANN_TEXT:
     case ID_ANN_SHAPE: case ID_ANN_STAMP: case ID_ANN_LINK:
     case ID_PAGE_EXTRACT: case ID_PAGE_SPLIT: case ID_PAGE_CROP:
-    case ID_SEL_ALL: case ID_ROT_ALL:
+    case ID_SEL_ALL: case ID_ROT_ALL: case ID_PRINT:
     case ID_THEME: case ID_ABOUT:
       return true;
     default:
@@ -6341,6 +6693,7 @@ static void DoCommand(int id)
     case ID_EXPORT_TEXT:  ExportTextAll(); break;
     case ID_EXPORT_CSV:   ExportCsvAll(); break;
     case ID_WATERMARK:    WatermarkCurrentDoc(); break;
+    case ID_PRINT:        PrintDoc(); break;
     case ID_THEME:        ToggleTheme(); break;
     case ID_THEME_FIRST:
     case ID_THEME_DARK:
@@ -6353,17 +6706,8 @@ static void DoCommand(int id)
       SetTheme(id - ID_THEME_FIRST, true);
       break;
     case ID_ABOUT:
-      MessageBoxW(g.frame,
-        L"Stitchup PDF Editor\n\nPortable PDF viewer/editor\n"
-        L"Engine: PDFium (BSD-3-Clause, Chromium project)\n"
-        L"UI: native Win32 (zero runtime dependencies)\n\n"
-        L"Shortcuts:\n"
-        L"  Ctrl+O open   Ctrl+S save   Ctrl+Shift+S save as\n"
-        L"  Ctrl+R rotate CW   Ctrl+Shift+R rotate CCW\n"
-        L"  Ctrl+= / Ctrl+- zoom   Ctrl+0 fit page   Ctrl+1 100%\n"
-        L"  Ctrl+F find   F3 next   Shift+F3 previous\n"
-        L"  Del delete page   Ctrl+W fit width   Ctrl+PgUp/PgDn page",
-        L"About Stitchup", MB_OK | MB_ICONINFORMATION);
+      MessageBoxW(g.frame, kAboutText, L"About Stitchup",
+                  MB_OK | MB_ICONINFORMATION);
       break;
     case ID_EXIT:
       PostMessageW(g.frame, WM_CLOSE, 0, 0);
@@ -6393,6 +6737,8 @@ static HMENU BuildMenu()
   addItem(file, ID_EXPORT_TEXT, L"Export Text...");
   addItem(file, ID_EXPORT_CSV, L"Export CSV...");
   addItem(file, ID_WATERMARK, L"Watermark...");
+  AppendMenuW(file, MF_SEPARATOR, 0, nullptr);
+  addItem(file, ID_PRINT, L"Print...\tCtrl+P");
   AppendMenuW(file, MF_SEPARATOR, 0, nullptr);
   addItem(file, ID_EXIT, L"Exit");
   AppendMenuW(bar, MF_POPUP, (UINT_PTR)file, L"&File");
@@ -6967,6 +7313,11 @@ static LRESULT CALLBACK FrameProc(HWND hw, UINT msg, WPARAM wp, LPARAM lp)
       SetFocus(hw);
       break;
     }
+    case WM_MOUSEWHEEL:
+      // The frame is the focus window at startup and after clicking a
+      // thumbnail, so without this the wheel was swallowed here entirely.
+      HandleWheel(wp, lp);
+      return 0;
     case WM_COMMAND:
       if (HIWORD(wp) == 0 || HIWORD(wp) == 1)
         DoCommand(LOWORD(wp));
@@ -7050,6 +7401,7 @@ static LRESULT CALLBACK FrameProc(HWND hw, UINT msg, WPARAM wp, LPARAM lp)
           case VK_TAB: DoCommand(shift ? ID_PREV_TAB : ID_NEXT_TAB); return 0;
           case VK_F4: if (shift) DoCommand(ID_CLOSE_TAB); return 0;
           case 'S': DoCommand(shift ? ID_SAVEAS : ID_SAVE); return 0;
+          case 'P': DoCommand(ID_PRINT); return 0;
           case 'R': DoCommand(shift ? ID_ROTL : ID_ROTR); return 0;
           case 'A': DoCommand(ID_SEL_ALL); return 0;
           case VK_OEM_PLUS: case VK_ADD: DoCommand(ID_ZOOM_IN); return 0;
@@ -9797,6 +10149,432 @@ check("saved %PDF header", bytes.size() > 8 &&
       FPDF_CloseDocument(seed);
     }
   }
+
+  {
+    // --- Print: fitting a page onto a device, and rasterising it ---
+    // The fitted rectangle and the orientation of the raster are the parts of
+    // printing that can be wrong without anything failing visibly, and they are
+    // the same maths the (not visible here) printer path runs.
+    {
+      const PageFit f = FitPageToArea(612, 792, 72, 72, 612, 792);
+      checkEq("print: letter fits exactly", f.w, 612);
+      checkEq("print: letter fits exactly (h)", f.h, 792);
+      checkEq("print: exact fit leaves no x offset", f.x, 0);
+      checkEq("print: exact fit leaves no y offset", f.y, 0);
+    }
+    {
+      // 300dpi letter is 2550 x 3300 device pixels; an area that size is an
+      // exact fit with no scaling at all.
+      const PageFit f = FitPageToArea(612, 792, 300, 300, 2550, 3300);
+      checkEq("print: 300dpi letter fills the area", f.w, 2550);
+      checkEq("print: 300dpi letter fills the area (h)", f.h, 3300);
+      checkEq("print: 300dpi letter leaves no offset", f.x + f.w, 2550);
+    }
+    {
+      // Smaller than the area: centred, not stretched to fill.
+      const PageFit f = FitPageToArea(612, 792, 72, 72, 1000, 1000);
+      checkEq("print: undersized page is centred (x)", f.x, (1000 - f.w) / 2);
+      checkEq("print: undersized page is centred (y)", f.y, (1000 - f.h) / 2);
+      check("print: undersized page keeps its size", f.w == 612 && f.h == 792);
+    }
+    {
+      // Landscape page onto portrait paper: the width drives the scale.
+      const PageFit f = FitPageToArea(792, 612, 72, 72, 612, 792);
+      checkEq("print: landscape page spans the area width", f.w, 612);
+      check("print: landscape page never overflows height", f.h <= 792);
+      checkEq("print: landscape page is centred (y)", f.y, (792 - f.h) / 2);
+    }
+    {
+      // Sweep: no combination may overflow the area, and the aspect ratio must
+      // survive within rounding.
+      const double sizes[][2] = {{612, 792}, {792, 612}, {200, 200},
+                                 {1000, 100}, {1, 1000}};
+      const double dpis[] = {72, 96, 150, 300, 600};
+      const int areas[][2] = {{612, 792}, {100, 100}, {4000, 4000}, {37, 51}};
+      bool overflows = false, badAspect = false;
+      for (auto& sz : sizes)
+        for (double dpi : dpis)
+          for (auto& ar : areas)
+          {
+            const PageFit f = FitPageToArea(sz[0], sz[1], dpi, dpi, ar[0], ar[1]);
+            if (f.w < 1 || f.h < 1 || f.w > ar[0] || f.h > ar[1]) overflows = true;
+            if (f.x < 0 || f.y < 0 || f.x + f.w > ar[0] || f.y + f.h > ar[1])
+              overflows = true;
+            const double want = sz[0] / sz[1];
+            const double got = (double)f.w / (double)f.h;
+            // Integer dimensions make the aspect ratio irrecoverable once a
+            // side is only a few pixels long, so below 8px the sweep still
+            // checks that the fit stays inside the area but not the ratio.
+            if (f.w >= 8 && f.h >= 8)
+            {
+              const double tol = want * 0.5 * (1.0 / f.w + 1.0 / f.h);
+              if (got < want - tol || got > want + tol) badAspect = true;
+            }
+          }
+      check("print: fitted page never overflows its area", !overflows);
+      check("print: fitted page keeps its aspect ratio", !badAspect);
+    }
+    {
+      const PageFit f = FitPageToArea(0, -5, 0, 0, 0, 0);
+      check("print: degenerate input still yields a usable size",
+            f.w >= 1 && f.h >= 1);
+    }
+
+    // Orientation: the sample page draws its text and blue bar near the TOP of
+    // the page (PDF y=720 and y=672 of a 792-tall page). Rendering it upside
+    // down must move that content to the bottom, so the two bboxes tell apart
+    // "rendered correctly" from "flipped".
+    FPDF_DOCUMENT pr = FPDF_LoadMemDocument(sample.data(), (int)sample.size(), nullptr);
+    check("print: sample page loads", pr != nullptr);
+    if (pr)
+    {
+      FPDF_PAGE pp = FPDF_LoadPage(pr, 0);
+      check("print: sample page opens", pp != nullptr);
+      if (pp)
+      {
+        const int W = 612, H = 792;
+        struct BBox { int l = W, t = H, r = -1, b = -1; };
+        auto inkBox = [&](int rot, BBox& box) {
+          FPDF_BITMAP bmp = RenderPageToFit(pp, W, H, rot);
+          if (!bmp) return false;
+          const auto* p = (const unsigned char*)FPDFBitmap_GetBuffer(bmp);
+          const int stride = FPDFBitmap_GetStride(bmp);
+          bool any = false;
+          for (int y = 0; y < H; ++y)
+          {
+            const unsigned char* row = p + (std::ptrdiff_t)y * (std::ptrdiff_t)stride;
+            for (int x = 0; x < W; ++x)
+            {
+              const unsigned char* q = row + x * 4;
+              if (q[0] > 0xF0 && q[1] > 0xF0 && q[2] > 0xF0) continue;
+              any = true;
+              if (x < box.l) box.l = x;
+              if (y < box.t) box.t = y;
+              if (x > box.r) box.r = x;
+              if (y > box.b) box.b = y;
+            }
+          }
+          FPDFBitmap_Destroy(bmp);
+          return any;
+        };
+
+        BBox up, down;
+        const bool drewUp = inkBox(0, up);
+        const bool drewDown = inkBox(2, down);
+        check("print: page renders to the bitmap", drewUp && drewDown);
+        if (drewUp && drewDown)
+        {
+          check("print: content is in the upper half when upright", up.b < H / 2);
+          check("print: content is in the lower half when rotated 180",
+                down.t > H / 2);
+          // Mirroring a raster sends pixel x to (W-1-x), so the two ink boxes
+          // should be the same size. Edge antialiasing can push one pixel
+          // across the not-quite-white threshold in one orientation and not the
+          // other, hence a pixel of slack rather than exact equality.
+          check("print: 180 rotation mirrors the ink width",
+                std::abs((up.r - up.l) - (down.r - down.l)) <= 1);
+          check("print: 180 rotation mirrors the ink height",
+                std::abs((up.b - up.t) - (down.b - down.t)) <= 1);
+          // And the mirror should be around the page centre.
+          check("print: mirror is around the page centre",
+                std::abs((int)(up.t + down.b) - (H - 1)) <= 1);
+        }
+
+        // The blit path. Geometry and stride handling are checked with a source
+        // whose contents are known, because a wrong copy on a real printer page
+        // would be a skewed or offset page and nothing else.
+        HDC mem = CreateCompatibleDC(nullptr);
+        check("print: memory DC created", mem != nullptr);
+        if (mem)
+        {
+          BITMAPINFO bi{};
+          bi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+          bi.bmiHeader.biWidth = 400;
+          bi.bmiHeader.biHeight = -200;    // top-down
+          bi.bmiHeader.biPlanes = 1;
+          bi.bmiHeader.biBitCount = 32;
+          bi.bmiHeader.biCompression = BI_RGB;
+          void* bits = nullptr;
+          HBITMAP dib = CreateDIBSection(mem, &bi, DIB_RGB_COLORS, &bits,
+                                         nullptr, 0);
+          check("print: DIB section created", dib != nullptr && bits != nullptr);
+          if (dib && bits)
+          {
+            HGDIOBJ old = SelectObject(mem, dib);
+            const auto px = [&](int x, int y) {
+              const auto* s = (const unsigned char*)bits +
+                              ((size_t)y * 400 + x) * 4;
+              return (int)s[0];           // blue channel carries the marker
+            };
+
+            // (a) Solid source at a known offset: geometry only. The colour is
+            // ARGB with blue set, since the destination is read back through the
+            // blue channel and the background is black.
+            memset(bits, 0x00, (size_t)400 * 200 * 4);
+            FPDF_BITMAP solid = FPDFBitmap_Create(100, 50, 0);
+            bool blitA = false;
+            if (solid)
+            {
+              FPDFBitmap_FillRect(solid, 0, 0, 100, 50, 0x000000FFu);  // blue
+              blitA = BlitPageBitmap(mem, solid, 20, 30);
+              FPDFBitmap_Destroy(solid);
+            }
+            check("print: page blits onto the device", blitA);
+            if (blitA)
+            {
+              GdiFlush();
+              check("print: blit honours the x offset", px(20, 30) > 0);
+              check("print: blit honours the y offset", px(20, 30) > 0);
+              check("print: nothing is drawn before the offset", px(19, 30) == 0);
+              check("print: nothing is drawn above the offset", px(20, 29) == 0);
+              check("print: blit honours the width", px(119, 30) > 0);
+              check("print: nothing is drawn past the width", px(120, 30) == 0);
+              check("print: blit honours the height", px(20, 79) > 0);
+              check("print: nothing is drawn past the height", px(20, 80) == 0);
+            }
+
+            // (b) Padded stride: each source row is marked with its own index,
+            // so a repack that dropped the stride would smear them. The values
+            // are read back through GetBuffer/GetStride, which is the same
+            // interface the blit uses, so this checks that it honours it.
+            const int sw = 100, sh = 50, pad = 16;
+            const int sstride = sw * 4 + pad;
+            std::vector<unsigned char> sbuf((size_t)sstride * sh, 0);
+            FPDF_BITMAP padded = FPDFBitmap_CreateEx(sw, sh, FPDFBitmap_BGRx,
+                                                     sbuf.data(), sstride);
+            bool blitB = false;
+            if (padded)
+            {
+              const auto* sp = (const unsigned char*)FPDFBitmap_GetBuffer(padded);
+              const int ss = FPDFBitmap_GetStride(padded);
+              for (int r = 0; r < sh && sp; ++r)
+              {
+                unsigned char* row = const_cast<unsigned char*>(sp) +
+                                     (std::ptrdiff_t)r * (std::ptrdiff_t)ss;
+                for (int c = 0; c < sw; ++c)
+                {
+                  row[c * 4 + 0] = (unsigned char)r;   // blue = row index
+                  row[c * 4 + 1] = 0;
+                  row[c * 4 + 2] = 0;
+                  row[c * 4 + 3] = 0xFF;
+                }
+              }
+              memset(bits, 0x00, (size_t)400 * 200 * 4);
+              blitB = BlitPageBitmap(mem, padded, 0, 0);
+              FPDFBitmap_Destroy(padded);
+            }
+            check("print: padded-stride source blits", blitB);
+            if (blitB)
+            {
+              GdiFlush();
+              bool rowsOk = true;
+              for (int y = 0; y < sh && rowsOk; ++y)
+                if (px(0, y) != y || px(sw - 1, y) != y) rowsOk = false;
+              check("print: rows are repacked without skew", rowsOk);
+            }
+
+            // (c) The whole one-page path, which is otherwise only reachable
+            // through a dialog that cannot be driven here. It reads g.doc, so
+            // the sample document is put in its place for the duration.
+            {
+              const int DW = 400, DH = 200;
+              const PageFit f = FitPageToArea(612, 792, 96, 96, DW, DH);
+              FPDF_DOCUMENT keepPD = g.doc;
+              g.doc = pr;
+              // White paper: ink here means "not white".
+              memset(bits, 0xFF, (size_t)DW * DH * 4);
+              const bool printed = PrintOnePage(mem, 0, 96, 96, DW, DH);
+              g.doc = keepPD;
+              check("print: a page renders onto the device", printed);
+              if (printed)
+              {
+                GdiFlush();
+                int inFit = 0, outside = 0, lowestInk = -1;
+                for (int y = 0; y < DH; ++y)
+                {
+                  const auto* row = (const unsigned char*)bits + (size_t)y * DW * 4;
+                  for (int x = 0; x < DW; ++x)
+                  {
+                    const unsigned char* q = row + x * 4;
+                    const bool ink = (q[0] + q[1] + q[2]) < 0x280;
+                    if (!ink) continue;
+                    const bool inside = x >= f.x && x < f.x + f.w &&
+                                        y >= f.y && y < f.y + f.h;
+                    if (inside) { ++inFit; if (y > lowestInk) lowestInk = y; }
+                    else ++outside;
+                  }
+                }
+                check("print: the page lands inside its fitted rectangle",
+                      inFit > 0);
+                check("print: nothing is drawn outside the fitted rectangle",
+                      outside == 0);
+                // Upright sample: the text and bar sit near the top of the page,
+                // so the ink must stay in the upper part of the fitted area.
+                check("print: the page is not rendered upside down",
+                      lowestInk >= 0 && lowestInk < f.y + f.h / 2);
+              }
+            }
+
+            SelectObject(mem, old);
+            DeleteObject(dib);
+          }
+          DeleteDC(mem);
+        }
+        FPDF_ClosePage(pp);
+      }
+      FPDF_CloseDocument(pr);
+    }
+  }
+
+  {
+    // --- Scroll geometry, status-bar legibility, About text ---
+    // The pane-level parts (showing the bar, routing the wheel by cursor)
+    // need real windows and cannot run in this harness; the range maths, the
+    // colour pair the status bar is painted with, and the About string can.
+    {
+      checkEq("scroll: list scrolled to its end", ScrollLastPos(1000, 400), 600);
+      checkEq("scroll: one pixel of overflow scrolls one pixel",
+              ScrollLastPos(401, 400), 1);
+      checkEq("scroll: exactly one screen scrolls nowhere",
+              ScrollLastPos(400, 400), 0);
+      checkEq("scroll: empty list scrolls nowhere", ScrollLastPos(0, 400), 0);
+      checkEq("scroll: degenerate view scrolls nowhere",
+              ScrollLastPos(1000, 0), 0);
+      // Win32 stops a scroll bar at nMax - nPage + 1, so the nMax that has to
+      // be stored is the content extent (content - 1). Storing content - view
+      // instead, which is what this code used to do, makes the bar stop a whole
+      // pane short of the bottom.
+      const int content = 1000, view = 400;
+      checkEq("scroll: stored range reaches the true end",
+              (content - 1) - view + 1, ScrollLastPos(content, view));
+      check("scroll: the old range fell a pane short of the end",
+            (content - view) - view + 1 < ScrollLastPos(content, view));
+    }
+    {
+      // The status bar is a colour pair: statusTxt sits on statusBg. It was
+      // being painted with ribbonBg instead, which in the default light theme
+      // is near-white behind near-white text, so the filename and the page
+      // counter were drawn but could not be seen. Every theme has to keep the
+      // pair it was designed around readable.
+      auto lin = [](double v) {
+        v /= 255.0;
+        return v <= 0.04045 ? v / 12.92 : std::pow((v + 0.055) / 1.055, 2.4);
+      };
+      auto lum = [&](COLORREF c) {
+        // COLORREF is 0x00BBGGRR.
+        return 0.2126 * lin((double)(c & 0xFF)) +
+               0.7152 * lin((double)((c >> 8) & 0xFF)) +
+               0.0722 * lin((double)((c >> 16) & 0xFF));
+      };
+      double worst = 99.0;
+      int worstTheme = -1;
+      for (int t = 0; t < THEME_COUNT; ++t)
+      {
+        const double a = lum(kThemes[t].statusTxt);
+        const double b = lum(kThemes[t].statusBg);
+        const double r = (std::max(a, b) + 0.05) / (std::min(a, b) + 0.05);
+        if (r < worst) { worst = r; worstTheme = t; }
+      }
+      if (worst < 4.5)
+        emit("FAIL status bar theme " + std::to_string(worstTheme) +
+             " contrast " + std::to_string(worst));
+      check("status: page counter is readable on the status bar", worst >= 4.5);
+    }
+    {
+      // Help > About keeps both the shortcuts it advertises and the reason the
+      // program exists.
+      check("about: advertises the print shortcut",
+            wcsstr(kAboutText, L"Ctrl+P print") != nullptr);
+      check("about: states why the program exists",
+            wcsstr(kAboutText, L"pay again.") != nullptr);
+      check("about: still lists the save shortcut",
+            wcsstr(kAboutText, L"Ctrl+S save") != nullptr);
+      check("about: still credits PDFium",
+            wcsstr(kAboutText, L"PDFium") != nullptr);
+    }
+  }
+
+    {
+      // --- Status bar: what it actually paints ---
+      // The page counter and the file name live in the status bar, and in the
+      // light theme they were being drawn near-white onto ribbonBg, a near-white
+      // fill: present, but invisible. Rendering the real window into a bitmap
+      // checks the pair as it reaches the screen rather than as the theme table
+      // declares it. Skipped rather than failed if a window cannot be created.
+      const UiTheme& th = ThemeNow();
+      const int BW = 800, BH = STATUS_H;
+      WNDCLASSEXW wc{};
+      wc.cbSize = sizeof(wc);
+      wc.lpfnWndProc = StatusProc;
+      wc.hInstance = GetModuleHandleW(nullptr);
+      wc.hbrBackground = nullptr;
+      wc.lpszClassName = L"SKStatusProbe";
+      if (RegisterClassExW(&wc) || GetLastError() == ERROR_CLASS_ALREADY_EXISTS)
+      {
+        const std::wstring keepName = g.name;
+        const int keepCount = g.pageCount, keepSel = g.selected;
+        g.name = L"probe.pdf";
+        g.pageCount = 5;
+        g.selected = 2;
+
+        HWND sw = CreateWindowExW(0, L"SKStatusProbe", L"", WS_POPUP, 0, 0, BW,
+                                  BH, nullptr, nullptr,
+                                  GetModuleHandleW(nullptr), nullptr);
+        if (sw)
+        {
+          BITMAPINFO bi{};
+          bi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+          bi.bmiHeader.biWidth = BW;
+          bi.bmiHeader.biHeight = -BH;   // top-down
+          bi.bmiHeader.biPlanes = 1;
+          bi.bmiHeader.biBitCount = 32;
+          bi.bmiHeader.biCompression = BI_RGB;
+          void* bits = nullptr;
+          HBITMAP dib = CreateDIBSection(nullptr, &bi, DIB_RGB_COLORS, &bits,
+                                         nullptr, 0);
+          HDC mem = CreateCompatibleDC(nullptr);
+          if (dib && mem && bits)
+          {
+            HGDIOBJ old = SelectObject(mem, dib);
+            SendMessageW(sw, WM_PAINT, (WPARAM)mem, 0);
+            GdiFlush();
+            const auto px = [&](int x, int y) {
+              const auto* q = (const unsigned char*)bits +
+                              ((size_t)y * BW + x) * 4;
+              return RGB(q[2], q[1], q[0]);   // buffer is B,G,R,X
+            };
+            bool bgOk = false, counterInk = false, nameInk = false;
+            {
+              bgOk = px(BW / 2, 2) == th.statusBg;
+              for (int x = 400; x < BW - 4 && !counterInk; ++x)
+                for (int y = 1; y < BH - 1 && !counterInk; ++y)
+                  if (px(x, y) != th.statusBg) counterInk = true;
+              for (int x = 8; x < 390 && !nameInk; ++x)
+                for (int y = 1; y < BH - 1 && !nameInk; ++y)
+                  if (px(x, y) != th.statusBg) nameInk = true;
+            }
+            check("status: the bar is filled with its own colour", bgOk);
+            check("status: the page counter is drawn on the bar", counterInk);
+            check("status: the file name is drawn on the bar", nameInk);
+            SelectObject(mem, old);
+          }
+          else
+            emit("SKIP status bar render: bitmap unavailable");
+          if (mem) DeleteDC(mem);
+          if (dib) DeleteObject(dib);
+          DestroyWindow(sw);
+        }
+        else
+          emit("SKIP status bar render: window could not be created");
+        g.name = keepName;
+        g.pageCount = keepCount;
+        g.selected = keepSel;
+      }
+      else
+        emit("SKIP status bar render: class could not be registered");
+      UnregisterClassW(L"SKStatusProbe", GetModuleHandleW(nullptr));
+    }
+
 
   {
     // --- Content-object editing (FPDFEdit API) ---

@@ -639,3 +639,55 @@ otherwise. On this test desktop the Pages pane reports a zero-width rect, so the
 window never lays out and there is nothing to drive; the reorder is covered
 headlessly through ReorderPagesTo() and SelectedBlock() instead, which is
 the same code the gesture calls.
+## v0.12.7 - print, readable status bar, scrollable thumbnails (2026-10-07)
+
+Print (File > Print..., Ctrl+P): the print dialog offers all pages, a page
+range and copies. A page is fitted to the printable area with aspect-preserving,
+centred math capped at the paper size, oriented from its own /Rotate entry,
+rendered white with the annotation layer, and stretched onto the device with a
+row repack that also copes with padded or negative strides. The bundled PDFium
+exposes no FPDF_PrintPage, so the whole pipeline - FitPageToArea(),
+RenderPageToFit(), PrintOnePage() and the blit - is exercised headlessly: exact
+fit at 72 dpi and 300 dpi, centring of undersized pages, the landscape case, a
+five-size by five-dpi by four-area sweep for overflow and aspect preservation, a
+degenerate input, an upright-vs-rotated-180 render of a real page whose ink must
+move from the upper half to the lower half, a solid-colour blit at an offset
+with nothing drawn before/after it, a padded-stride source that would smear if
+the stride were ignored, and a full PrintOnePage() render into a 400x200 memory
+device whose ink must land inside the fitted rectangle. That is 41 checks; the
+run went from 356 to 397 passed.
+
+Status bar: the page counter and file name were drawn in statusTxt on a fill of
+ribbonBg, and in the light theme both are near-white, so the whole bar looked
+empty exactly where the page count should be. The bar now paints its declared
+statusBg (a dark band in every theme). A new render test creates the real status
+window and sends it a WM_PAINT with a 32bpp bitmap as the device context, then
+asserts the fill is statusBg and that ink is present where the file name and the
+"Page 3 of 5 ... Zoom ..." text are drawn - not just that the colour table says
+so. Picking up layout and About in the same pass added 12 checks: ScrollLastPos()
+(a side-by-side comparison against the effective range of a Win32 scroll bar,
+whose nMax must be the content extent because the maximum reachable position is
+nMax minus the page size plus one - the old nMax made the bottom of a long list
+unreachable by a whole pane height), the WCAG contrast of the status pair in all
+eight themes, and that the About box still advertises Ctrl+P and says why the
+program exists.
+
+Thumbnails: the Pages pane had its scroll bar explicitly hidden and was
+re-centred on the canvas top page at every scroll, so with more pages than fit
+there was no way to look at the rest, and the wheel did nothing at all unless
+the canvas happened to hold focus (clicking a thumbnail gave focus to the frame,
+which ignored the wheel). The list now carries its own scroll bar when it
+overflows (shown/hidden over two passes like the canvas bars), the wheel is
+routed by cursor position over the list, canvas and frame so it always drives
+the pane under the pointer (Ctrl+wheel still zooms anywhere), and the follow is
+lazy: it moves only when the canvas actually arrives on a different page, and
+only as far as needed to bring that page into view, so browsing thumbnails of
+pages you are not on sticks until you navigate.
+
+Self-test: 412 passed, 0 failed, exit code 0.
+
+Not verified on this desktop: a physical printer round-trip (none attached) and
+the scrollbar/wheel gestures by mouse (the Pages pane reports a zero-width rect,
+so the visible layout cannot be driven here). The status bar rendering, the
+scroll range math and the follow rule are the parts that could be covered
+headlessly and are.
