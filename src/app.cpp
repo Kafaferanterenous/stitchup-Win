@@ -100,6 +100,7 @@ ID_ANN_LINK,
   ID_SEL_ALL,     // Select All pages (Pages pane / Ctrl+A)
   ID_ROT_ALL,     // Rotate All Pages CW (explicit, for the whole document)
   ID_PRINT,       // Print (Ctrl+P)
+  ID_PRINT_PREVIEW,  // Print Preview (Ctrl+Shift+P)
   // Colour-scheme pickers follow in one contiguous block (radio group).
   ID_THEME_FIRST,
   ID_THEME_LIGHT = ID_THEME_FIRST,
@@ -153,7 +154,7 @@ const wchar_t* const kAboutText =
     L"  Ctrl+R rotate CW   Ctrl+Shift+R rotate CCW\n"
     L"  Ctrl+= / Ctrl+- zoom   Ctrl+0 fit page   Ctrl+1 100%\n"
     L"  Ctrl+F find   F3 next   Shift+F3 previous\n"
-    L"  Ctrl+P print\n"
+    L"  Ctrl+P print   Ctrl+Shift+P print preview\n"
     L"  Del delete page   Ctrl+W fit width   Ctrl+PgUp/PgDn page";
 
 // ---------------------------------------------------------------------------
@@ -3237,7 +3238,44 @@ static bool OrientationForPage(DEVMODEW* dm, double pageW, double pageH)
   return true;
 }
 
-static void PrintDoc()
+// Pins the printer's paper to the preview's choice. `pwPts`/`phPts` are the
+// portrait-basis sizes, `orient` is 0/1. The DEVMODE paper length/width are in
+// tenths of a millimetre; DMPAPER_USER together with those two overrides any
+// tray media selection, so the paper the driver reports back in HORZRES/VERTRES
+// is the paper the preview promised.
+static bool ForcePaper(DEVMODEW* dm, double pwPts, double phPts, int orient)
+{
+  if (!dm) return false;
+  if (dm->dmSize < offsetof(DEVMODEW, dmOrientation) + sizeof(WORD)) return false;
+  const WORD o = orient ? kOrientLandscape : kOrientPortrait;
+  const unsigned short mL =
+      (unsigned short)std::floor(phPts * 25.4 / 72.0 * 10.0 + 0.5);
+  const unsigned short mW =
+      (unsigned short)std::floor(pwPts * 25.4 / 72.0 * 10.0 + 0.5);
+  if (mL > 0 && dm->dmPaperLength != mL)
+  {
+    dm->dmPaperLength = mL;
+    dm->dmFields |= DM_PAPERLENGTH;
+  }
+  if (mW > 0 && dm->dmPaperWidth != mW)
+  {
+    dm->dmPaperWidth = mW;
+    dm->dmFields |= DM_PAPERWIDTH;
+  }
+  if (dm->dmPaperSize != DMPAPER_USER)
+  {
+    dm->dmPaperSize = DMPAPER_USER;
+    dm->dmFields |= DM_PAPERSIZE;
+  }
+  if (dm->dmOrientation != o)
+  {
+    dm->dmOrientation = o;
+    dm->dmFields |= DM_ORIENTATION;
+  }
+  return true;
+}
+
+static void PrintDocWith(double pwPts, double phPts, int orient, bool have)
 {
   if (!g.doc || g.pageCount < 1)
   {
@@ -3281,10 +3319,17 @@ static void PrintDoc()
   if (last > g.pageCount) last = g.pageCount;
   const int copies = (pd.nCopies > 0) ? pd.nCopies : 1;
 
-  // The printable area is only meaningful once the paper orientation is known,
-  // and that depends on the first page of the range.
-  double firstW = 0, firstH = 0;
+  // A preview carries its paper and orientation; otherwise the orientation
+  // follows the first page of the range, because the printable area is only
+  // meaningful once the paper orientation is known.
+  bool resetDc = false;
+  if (have)
   {
+    resetDc = ForcePaper(dm, pwPts, phPts, orient);
+  }
+  else
+  {
+    double firstW = 0, firstH = 0;
     FPDF_PAGE p = FPDF_LoadPage(g.doc, first - 1);
     if (p)
     {
@@ -3293,9 +3338,9 @@ static void PrintDoc()
       if (FPDFPage_GetRotation(p) & 1) std::swap(firstW, firstH);
       FPDF_ClosePage(p);
     }
+    resetDc = OrientationForPage(dm, firstW, firstH);
   }
-  if (OrientationForPage(dm, firstW, firstH))
-    ResetDCW(dc, dm);
+  if (resetDc) ResetDCW(dc, dm);
   if (dm) GlobalUnlock(pd.hDevMode);
 
   const int dpiX = std::max(1, GetDeviceCaps(dc, LOGPIXELSX));
@@ -3334,6 +3379,619 @@ static void PrintDoc()
   if (pd.hDevMode) GlobalFree(pd.hDevMode);
   if (pd.hDevNames) GlobalFree(pd.hDevNames);
   DeleteDC(dc);
+}
+
+static void PrintDoc()
+{
+  // Plain print: the printer dialog decides the paper and orientation.
+  PrintDocWith(0, 0, 0, false);
+}
+
+// ---------------------------------------------------------------------------
+// Print preview
+// ---------------------------------------------------------------------------
+// The preview shows the current page on a paper representation at the exact
+// fit the printer path would use, so what is on screen is what reaches the
+// paper. The paper model, the zoom scale and the layout are plain arithmetic so
+// the self-test can pin them down; the window is Win32 chrome around that
+// arithmetic.
+
+// Paper sizes in points, portrait basis (ISO A-series and the US inch sizes).
+struct PaperSpec
+{
+  const wchar_t* name;
+  double wPts;
+  double hPts;
+};
+
+static const PaperSpec kPapers[] = {
+    {L"Letter",    612.0,   792.0},
+    {L"Legal",     612.0,   1008.0},
+    {L"A4",        595.28,  841.89},
+    {L"A5",        419.53,  595.28},
+    {L"A3",        841.89,  1190.55},
+    {L"Executive", 522.0,   756.0},
+};
+static const int kPaperCount = (int)(sizeof(kPapers) / sizeof(kPapers[0]));
+
+// Zoom model: two fit modes plus explicit percentages.
+enum { PV_FIT_PAGE = 0, PV_FIT_WIDTH = 1, PV_PCT = 2 };
+static const int kPvPcts[] = { 50, 75, 100, 125, 150, 200, 300, 400 };
+static const int kPvPctCount = (int)(sizeof(kPvPcts) / sizeof(kPvPcts[0]));
+static const wchar_t* const kPvZoomItems[] = {
+    L"Fit to page", L"Fit to width",
+    L"50%", L"75%", L"100%", L"125%", L"150%", L"200%", L"300%", L"400%",
+};
+static const int kPvInset = 24;   // breathing room around the paper (px)
+
+// Where the paper lands on a `cw` x `ch` preview surface at a given scale.
+struct PvLayout
+{
+  int paperX = 0, paperY = 0;
+  int paperW = 1, paperH = 1;   // paper rect in surface pixels
+  int printInset = 0;           // printable-area margin inside the paper
+  int scrollMax = 0;            // vertical scroll range (0 when everything fits)
+};
+
+// Zoom scale (per-mille: 1000 == 100%) for mode + pct on `cw` x `ch`.
+static int PvScale(int cw, int ch, int inset, double pwPts, double phPts,
+                   int orient, int mode, int pct)
+{
+  double w = pwPts, h = phPts;
+  if (orient) std::swap(w, h);
+  const double wpx = w * 96.0 / 72.0;   // paper dimensions at 100%
+  const double hpx = h * 96.0 / 72.0;
+  const double availW = (double)std::max(1, cw - 2 * inset);
+  const double availH = (double)std::max(1, ch - 2 * inset);
+  double per = 1.0;
+  if (mode == PV_FIT_PAGE)
+    per = std::min(availW / wpx, availH / hpx);
+  else if (mode == PV_FIT_WIDTH)
+    per = availW / wpx;
+  else
+    per = (double)pct / 100.0;
+  int s = (int)std::floor(per * 1000.0 + 0.5);
+  if (s < 10) s = 10;      // clamp to 1%..400%
+  if (s > 4000) s = 4000;
+  return s;
+}
+
+// Lays the paper onto `cw` x `ch`. The paper is centred horizontally; when it
+// is taller than the surface a vertical scroll at `scrollPos` exposes the rest
+// (the position is clamped to the reachable range). `inset` is the fixed margin
+// kept between the paper and the surface edges.
+static PvLayout PvCompute(int cw, int ch, int inset, double pwPts, double phPts,
+                          int orient, int scale, int scrollPos)
+{
+  PvLayout L;
+  double w = pwPts, h = phPts;
+  if (orient) std::swap(w, h);
+  const double z = (double)scale / 1000.0;   // 1.0 == 100%
+  L.paperW = std::max(1, (int)std::floor(w * 96.0 / 72.0 * z + 0.5));
+  L.paperH = std::max(1, (int)std::floor(h * 96.0 / 72.0 * z + 0.5));
+  L.printInset = std::max(1, (int)std::floor(18.0 * 96.0 / 72.0 * z + 0.5));
+  L.paperX = (cw - L.paperW) / 2;
+  const int contentH = L.paperH + 2 * inset;
+  L.scrollMax = std::max(0, contentH - ch);
+  const int pos = std::max(0, std::min(scrollPos, L.scrollMax));
+  if (contentH <= ch)
+    L.paperY = inset + (ch - contentH) / 2;
+  else
+    L.paperY = inset - pos;
+  return L;
+}
+
+// Everything the surface paints from, and what print will be told to use.
+struct PvState
+{
+  double paperW = 612.0, paperH = 792.0;  // points, portrait basis
+  int orient = 0;                         // 0 portrait, 1 landscape
+  int page = 0;                           // 0-based page being previewed
+  int mode = PV_FIT_PAGE;
+  int pct = 100;
+};
+
+// Paints one preview frame into `dc` (a window or a memory DC) at `cw` x `ch`.
+// The page itself is rasterised with the same fit, rotation and blit that
+// PrintOnePage uses at printer resolution - just at 96 dpi here - so the frame
+// is a literal miniature of the printout, printable margin and all. This is the
+// only place g.doc is touched, so the self-test can swap in a fixture the same
+// way it does for PrintOnePage().
+static void PvPaintSurface(HDC dc, int cw, int ch, int inset,
+                           const PvState& st, int scrollPos)
+{
+  const UiTheme& th = ThemeNow();
+  RECT wndrc{0, 0, cw, ch};
+  {
+    HBRUSH bg = CreateSolidBrush(th.canvasBg);
+    FillRect(dc, &wndrc, bg);
+    DeleteObject(bg);
+  }
+  const int scale = PvScale(cw, ch, inset, st.paperW, st.paperH, st.orient,
+                            st.mode, st.pct);
+  const PvLayout L = PvCompute(cw, ch, inset, st.paperW, st.paperH, st.orient,
+                               scale, scrollPos);
+
+  // Soft drop shadow under the paper, then the paper itself.
+  RECT sh = {L.paperX + 2, L.paperY + 2, L.paperX + L.paperW + 2,
+             L.paperY + L.paperH + 2};
+  {
+    HBRUSH sb = CreateSolidBrush(th.pageFrame);
+    FillRect(dc, &sh, sb);
+    DeleteObject(sb);
+  }
+  RECT paper = {L.paperX, L.paperY, L.paperX + L.paperW, L.paperY + L.paperH};
+  {
+    HBRUSH pb = CreateSolidBrush(RGB(0xFF, 0xFF, 0xFF));
+    FillRect(dc, &paper, pb);
+    DeleteObject(pb);
+  }
+  {
+    HBRUSH fb = CreateSolidBrush(th.pageFrame);
+    FrameRect(dc, &paper, fb);
+    DeleteObject(fb);
+  }
+
+  // Printable-area guide: a dashed frame inset 0.25" from the paper edge.
+  const int m = L.printInset;
+  {
+    HPEN pen = CreatePen(PS_DOT, 1, RGB(0x9A, 0x9A, 0x9C));
+    HGDIOBJ oldp = SelectObject(dc, pen);
+    const int x0 = L.paperX + m, y0 = L.paperY + m;
+    const int x1 = L.paperX + L.paperW - m, y1 = L.paperY + L.paperH - m;
+    MoveToEx(dc, x0, y0, nullptr);
+    LineTo(dc, x1, y0);
+    LineTo(dc, x1, y1);
+    LineTo(dc, x0, y1);
+    LineTo(dc, x0, y0);
+    SelectObject(dc, oldp);
+    DeleteObject(pen);
+  }
+
+  // The page, fitted to the printable area exactly as the printer path fits it.
+  if (!g.doc) return;
+  const int availW = std::max(1, L.paperW - 2 * m);
+  const int availH = std::max(1, L.paperH - 2 * m);
+  FPDF_PAGE page = FPDF_LoadPage(g.doc, st.page);
+  if (!page) return;
+  double pw = FPDF_GetPageWidth(page);
+  double ph = FPDF_GetPageHeight(page);
+  int rot = FPDFPage_GetRotation(page) % 4;
+  if (rot < 0) rot += 4;
+  if (rot & 1) std::swap(pw, ph);
+  const PageFit f = FitPageToArea(pw, ph, 96.0, 96.0, availW, availH);
+  FPDF_BITMAP bmp = RenderPageToFit(page, f.w, f.h, rot);
+  FPDF_ClosePage(page);
+  if (!bmp) return;
+  BlitPageBitmap(dc, bmp, L.paperX + m + f.x, L.paperY + m + f.y);
+  FPDFBitmap_Destroy(bmp);
+}
+
+struct PvCtx
+{
+  PvState st;
+  std::wstring fileName;
+  HWND pane = nullptr, zoomCmb = nullptr, paperCmb = nullptr;
+  HWND pageLbl = nullptr, prevBtn = nullptr, nextBtn = nullptr;
+  int scale = 1000;
+  int scrollPos = 0;
+  bool ok = false;
+};
+
+static PvCtx* PvFrom(HWND h)
+{
+  return reinterpret_cast<PvCtx*>(GetWindowLongPtrW(GetParent(h), GWLP_USERDATA));
+}
+
+static void PvUpdatePage(PvCtx* ctx, bool redraw)
+{
+  wchar_t buf[48];
+  _snwprintf_s(buf, _TRUNCATE, L"%d / %d", ctx->st.page + 1, g.pageCount);
+  SetWindowTextW(ctx->pageLbl, buf);
+  EnableWindow(ctx->prevBtn, ctx->st.page > 0);
+  EnableWindow(ctx->nextBtn, ctx->st.page < g.pageCount - 1);
+  if (redraw && ctx->pane) InvalidateRect(ctx->pane, nullptr, TRUE);
+}
+
+static void PvSyncScroll(PvCtx* ctx)
+{
+  RECT rc;
+  GetClientRect(ctx->pane, &rc);
+  const PvLayout L = PvCompute(rc.right - rc.left, rc.bottom - rc.top, kPvInset,
+                               ctx->st.paperW, ctx->st.paperH, ctx->st.orient,
+                               ctx->scale, ctx->scrollPos);
+  if (L.scrollMax > 0)
+  {
+    SCROLLINFO si{};
+    si.cbSize = sizeof(si);
+    si.fMask = SIF_RANGE | SIF_PAGE | SIF_POS;
+    si.nMin = 0;
+    si.nMax = L.scrollMax;
+    si.nPage = (UINT)std::max(1, (int)(rc.bottom - rc.top - 2 * kPvInset));
+    si.nPos = std::max(0, std::min(ctx->scrollPos, L.scrollMax));
+    ctx->scrollPos = si.nPos;
+    SetScrollInfo(ctx->pane, SB_VERT, &si, TRUE);
+    ShowScrollBar(ctx->pane, SB_VERT, TRUE);
+  }
+  else
+  {
+    ShowScrollBar(ctx->pane, SB_VERT, FALSE);
+    ctx->scrollPos = 0;
+  }
+}
+
+static void PvRecalcScale(PvCtx* ctx)
+{
+  RECT rc;
+  GetClientRect(ctx->pane, &rc);
+  ctx->scale = PvScale(rc.right - rc.left, rc.bottom - rc.top, kPvInset,
+                       ctx->st.paperW, ctx->st.paperH, ctx->st.orient,
+                       ctx->st.mode, ctx->st.pct);
+}
+
+static void PvZoomSelection(PvCtx* ctx, int sel)
+{
+  if (sel == 0) ctx->st.mode = PV_FIT_PAGE;
+  else if (sel == 1) ctx->st.mode = PV_FIT_WIDTH;
+  else if (sel >= 2 && sel < 2 + kPvPctCount)
+  {
+    ctx->st.mode = PV_PCT;
+    ctx->st.pct = kPvPcts[sel - 2];
+  }
+}
+
+static LRESULT CALLBACK PrvPaneProc(HWND h, UINT m, WPARAM w, LPARAM l)
+{
+  switch (m)
+  {
+    case WM_PAINT:
+    {
+      PvCtx* ctx = PvFrom(h);
+      PAINTSTRUCT ps;
+      HDC dc = (HDC)w;
+      if (!dc) dc = BeginPaint(h, &ps);
+      RECT rc;
+      GetClientRect(h, &rc);
+      if (ctx)
+        PvPaintSurface(dc, rc.right - rc.left, rc.bottom - rc.top, kPvInset,
+                       ctx->st, ctx->scrollPos);
+      if (!(HDC)w) EndPaint(h, &ps);
+      return 0;
+    }
+    case WM_ERASEBKGND:
+      return 1;
+    case WM_MOUSEWHEEL:
+    {
+      PvCtx* ctx = PvFrom(h);
+      if (ctx)
+      {
+        ctx->scrollPos -= GET_WHEEL_DELTA_WPARAM(w) / 120 * 48;
+        PvSyncScroll(ctx);
+        InvalidateRect(h, nullptr, TRUE);
+      }
+      return 0;
+    }
+    case WM_VSCROLL:
+    {
+      PvCtx* ctx = PvFrom(h);
+      if (ctx)
+      {
+        RECT rc;
+        GetClientRect(h, &rc);
+        const PvLayout L = PvCompute(rc.right - rc.left, rc.bottom - rc.top,
+                                     kPvInset, ctx->st.paperW, ctx->st.paperH,
+                                     ctx->st.orient, ctx->scale, ctx->scrollPos);
+        const int pageStep = std::max(1, (int)(rc.bottom - rc.top - 2 * kPvInset));
+        switch (LOWORD(w))
+        {
+          case SB_LINEUP:   ctx->scrollPos -= 24; break;
+          case SB_LINEDOWN: ctx->scrollPos += 24; break;
+          case SB_PAGEUP:   ctx->scrollPos -= pageStep; break;
+          case SB_PAGEDOWN: ctx->scrollPos += pageStep; break;
+          case SB_THUMBTRACK: ctx->scrollPos = (int)HIWORD(w); break;
+          case SB_TOP:      ctx->scrollPos = 0; break;
+          case SB_BOTTOM:   ctx->scrollPos = L.scrollMax; break;
+        }
+        ctx->scrollPos = std::max(0, std::min(ctx->scrollPos, L.scrollMax));
+        SetScrollPos(h, SB_VERT, ctx->scrollPos, TRUE);
+        InvalidateRect(h, nullptr, TRUE);
+      }
+      return 0;
+    }
+  }
+  return DefWindowProcW(h, m, w, l);
+}
+
+static LRESULT CALLBACK PrvProc(HWND h, UINT m, WPARAM w, LPARAM l)
+{
+  switch (m)
+  {
+    case WM_CREATE:
+    {
+      PvCtx* ctx = reinterpret_cast<PvCtx*>(
+          reinterpret_cast<CREATESTRUCTW*>(l)->lpCreateParams);
+      SetWindowLongPtrW(h, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(ctx));
+      CreateWindowExW(0, L"STATIC", L"Page:", WS_CHILD | WS_VISIBLE, 14, 12,
+                      40, 20, h, nullptr, g.inst, nullptr);
+      ctx->prevBtn = CreateWindowExW(0, L"BUTTON", L"\x25C0",
+                                     WS_CHILD | WS_VISIBLE | WS_TABSTOP,
+                                     58, 10, 32, 24, h, (HMENU)10, g.inst, nullptr);
+      ctx->pageLbl = CreateWindowExW(0, L"STATIC", L"1 / 1",
+                                     WS_CHILD | WS_VISIBLE | SS_CENTER,
+                                     92, 12, 90, 20, h, nullptr, g.inst, nullptr);
+      ctx->nextBtn = CreateWindowExW(0, L"BUTTON", L"\x25B6",
+                                     WS_CHILD | WS_VISIBLE | WS_TABSTOP,
+                                     186, 10, 32, 24, h, (HMENU)11, g.inst, nullptr);
+      CreateWindowExW(0, L"STATIC", L"Zoom:", WS_CHILD | WS_VISIBLE, 238, 12,
+                      40, 20, h, nullptr, g.inst, nullptr);
+      ctx->zoomCmb = CreateWindowExW(0, L"COMBOBOX", L"",
+                                     WS_CHILD | WS_VISIBLE | WS_TABSTOP |
+                                         CBS_DROPDOWNLIST,
+                                     282, 8, 150, 260, h, (HMENU)20, g.inst, nullptr);
+      CreateWindowExW(0, L"STATIC", L"Paper:", WS_CHILD | WS_VISIBLE, 452, 12,
+                      42, 20, h, nullptr, g.inst, nullptr);
+      ctx->paperCmb = CreateWindowExW(0, L"COMBOBOX", L"",
+                                      WS_CHILD | WS_VISIBLE | WS_TABSTOP |
+                                          CBS_DROPDOWNLIST,
+                                      498, 8, 130, 240, h, (HMENU)21, g.inst, nullptr);
+      CreateWindowExW(0, L"BUTTON", L"Portrait",
+                      WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTORADIOBUTTON |
+                          WS_GROUP,
+                      648, 12, 78, 20, h, (HMENU)12, g.inst, nullptr);
+      CreateWindowExW(0, L"BUTTON", L"Landscape",
+                      WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTORADIOBUTTON,
+                      730, 12, 92, 20, h, (HMENU)13, g.inst, nullptr);
+      ctx->pane = CreateWindowExW(WS_EX_CLIENTEDGE, L"SKPrvPane", L"",
+                                  WS_CHILD | WS_VISIBLE | WS_VSCROLL,
+                                  10, 44, 100, 100, h, nullptr, g.inst, nullptr);
+      CreateWindowExW(0, L"STATIC", L"", WS_CHILD | WS_VISIBLE, 12, 614, 620,
+                      20, h, (HMENU)30, g.inst, nullptr);
+      CreateWindowExW(0, L"BUTTON", L"Print",
+                      WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_DEFPUSHBUTTON,
+                      796, 606, 84, 28, h, (HMENU)1, g.inst, nullptr);
+      CreateWindowExW(0, L"BUTTON", L"Cancel",
+                      WS_CHILD | WS_VISIBLE | WS_TABSTOP,
+                      888, 606, 84, 28, h, (HMENU)2, g.inst, nullptr);
+
+      for (const wchar_t* zi : kPvZoomItems)
+        SendMessageW(ctx->zoomCmb, CB_ADDSTRING, 0, (LPARAM)zi);
+      for (int i = 0; i < kPaperCount; ++i)
+        SendMessageW(ctx->paperCmb, CB_ADDSTRING, 0, (LPARAM)kPapers[i].name);
+
+      // Select the paper nearest the state (the default printer's size).
+      {
+        double best = 1e18;
+        int sel = 0;
+        for (int i = 0; i < kPaperCount; ++i)
+        {
+          const double d = std::abs(kPapers[i].wPts - ctx->st.paperW) +
+                           std::abs(kPapers[i].hPts - ctx->st.paperH);
+          if (d < best) { best = d; sel = i; }
+        }
+        SendMessageW(ctx->paperCmb, CB_SETCURSEL, sel, 0);
+      }
+      {
+        int sel = (ctx->st.mode == PV_PCT) ? 2 + 0 : ctx->st.mode;
+        for (int i = 0; i < kPvPctCount; ++i)
+          if (ctx->st.mode == PV_PCT && ctx->st.pct == kPvPcts[i]) sel = 2 + i;
+        SendMessageW(ctx->zoomCmb, CB_SETCURSEL, sel, 0);
+      }
+      SetWindowTextW(GetDlgItem(h, 30), ctx->fileName.c_str());
+      CheckRadioButton(h, 12, 13, ctx->st.orient ? 13 : 12);
+      PvUpdatePage(ctx, false);
+      PvRecalcScale(ctx);
+      return 0;
+    }
+    case WM_COMMAND:
+    {
+      const int id = LOWORD(w);
+      PvCtx* ctx = reinterpret_cast<PvCtx*>(GetWindowLongPtrW(h, GWLP_USERDATA));
+      if (id == 1 || id == 2)
+      {
+        if (ctx) ctx->ok = (id == 1);
+        DestroyWindow(h);
+        return 0;
+      }
+      if (!ctx) break;
+      const int code = HIWORD(w);
+      if (code == BN_CLICKED)
+      {
+        switch (id)
+        {
+          case 10:
+            ctx->st.page = std::max(0, ctx->st.page - 1);
+            PvUpdatePage(ctx, true);
+            return 0;
+          case 11:
+            ctx->st.page = std::min(g.pageCount - 1, ctx->st.page + 1);
+            PvUpdatePage(ctx, true);
+            return 0;
+          case 12:
+            ctx->st.orient = 0;
+            PvRecalcScale(ctx);
+            PvSyncScroll(ctx);
+            InvalidateRect(ctx->pane, nullptr, TRUE);
+            return 0;
+          case 13:
+            ctx->st.orient = 1;
+            PvRecalcScale(ctx);
+            PvSyncScroll(ctx);
+            InvalidateRect(ctx->pane, nullptr, TRUE);
+            return 0;
+        }
+      }
+      else if (code == CBN_SELCHANGE)
+      {
+        HWND who = (HWND)l;
+        if (who == ctx->zoomCmb)
+        {
+          PvZoomSelection(ctx, (int)SendMessageW(ctx->zoomCmb, CB_GETCURSEL, 0, 0));
+          PvRecalcScale(ctx);
+          PvSyncScroll(ctx);
+          InvalidateRect(ctx->pane, nullptr, TRUE);
+        }
+        else if (who == ctx->paperCmb)
+        {
+          const int sel = (int)SendMessageW(ctx->paperCmb, CB_GETCURSEL, 0, 0);
+          if (sel >= 0 && sel < kPaperCount)
+          {
+            ctx->st.paperW = kPapers[sel].wPts;
+            ctx->st.paperH = kPapers[sel].hPts;
+            PvRecalcScale(ctx);
+            PvSyncScroll(ctx);
+            InvalidateRect(ctx->pane, nullptr, TRUE);
+          }
+        }
+        return 0;
+      }
+      break;
+    }
+    case WM_SIZE:
+    {
+      PvCtx* ctx = reinterpret_cast<PvCtx*>(GetWindowLongPtrW(h, GWLP_USERDATA));
+      if (ctx)
+      {
+        const int W = LOWORD(l), H = HIWORD(l);
+        MoveWindow(ctx->pane, 10, 44, W - 20, H - 72, TRUE);
+        HWND fileLbl = GetDlgItem(h, 30);
+        MoveWindow(fileLbl, 12, H - 24, W - 400, 20, TRUE);
+        MoveWindow(GetDlgItem(h, 1), W - 188, H - 34, 84, 28, TRUE);
+        MoveWindow(GetDlgItem(h, 2), W - 96, H - 34, 84, 28, TRUE);
+        PvRecalcScale(ctx);
+        PvSyncScroll(ctx);
+        InvalidateRect(ctx->pane, nullptr, TRUE);
+      }
+      return 0;
+    }
+    case WM_GETMINMAXINFO:
+    {
+      MINMAXINFO* mm = reinterpret_cast<MINMAXINFO*>(l);
+      mm->ptMinTrackSize.x = 780;
+      mm->ptMinTrackSize.y = 520;
+      return 0;
+    }
+    case WM_KEYDOWN:
+    {
+      const int vk = (int)w;
+      if (vk == VK_LEFT || vk == VK_PRIOR)
+        PostMessageW(h, WM_COMMAND, 10, 0);
+      else if (vk == VK_RIGHT || vk == VK_NEXT)
+        PostMessageW(h, WM_COMMAND, 11, 0);
+      return 0;
+    }
+    case WM_CLOSE:
+    {
+      PvCtx* ctx = reinterpret_cast<PvCtx*>(GetWindowLongPtrW(h, GWLP_USERDATA));
+      if (ctx) ctx->ok = false;
+      DestroyWindow(h);
+      return 0;
+    }
+  }
+  return DefWindowProcW(h, m, w, l);
+}
+
+static void PrintPreviewDialog()
+{
+  if (!g.doc || g.pageCount < 1)
+  {
+    MessageBoxW(g.frame, L"There is nothing to preview.", L"Stitchup",
+                MB_OK | MB_ICONINFORMATION);
+    return;
+  }
+  const wchar_t paneCls[] = L"SKPrvPane";
+  const wchar_t dlgCls[] = L"SKPrvDlg";
+  static bool reg = false;
+  if (!reg)
+  {
+    WNDCLASSEXW wc{};
+    wc.cbSize = sizeof(wc);
+    wc.hInstance = g.inst;
+    wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+    wc.lpszClassName = paneCls;
+    wc.lpfnWndProc = PrvPaneProc;
+    RegisterClassExW(&wc);
+    wc.lpfnWndProc = PrvProc;
+    wc.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
+    wc.lpszClassName = dlgCls;
+    RegisterClassExW(&wc);
+    reg = true;
+  }
+
+  PvCtx ctx;
+  ctx.st.page = std::max(0, std::min(g.selected, g.pageCount - 1));
+  ctx.fileName = g.name.empty() ? std::wstring(L"Untitled") : g.name;
+
+  // Start from the default printer's paper and orientation, when there is one,
+  // so the preview matches what "Print" would have proposed.
+  {
+    PRINTDLGW pd{};
+    pd.lStructSize = sizeof(pd);
+    pd.Flags = PD_RETURNDEFAULT;
+    if (PrintDlgW(&pd) && pd.hDevMode)
+    {
+      DEVMODEW* dm = (DEVMODEW*)GlobalLock(pd.hDevMode);
+      if (dm)
+      {
+        ctx.st.orient = (dm->dmOrientation == kOrientLandscape) ? 1 : 0;
+        if (dm->dmSize >= offsetof(DEVMODEW, dmPaperWidth) + sizeof(WORD) &&
+            dm->dmPaperWidth > 0 && dm->dmPaperLength > 0)
+        {
+          const double wpts = (dm->dmPaperWidth / 10.0) * 72.0 / 25.4;
+          const double hpts = (dm->dmPaperLength / 10.0) * 72.0 / 25.4;
+          double best = 1e18;
+          int sel = -1;
+          for (int i = 0; i < kPaperCount; ++i)
+          {
+            const double d = std::abs(kPapers[i].wPts - wpts) +
+                             std::abs(kPapers[i].hPts - hpts);
+            if (d < best) { best = d; sel = i; }
+          }
+          if (sel >= 0)
+          {
+            ctx.st.paperW = kPapers[sel].wPts;
+            ctx.st.paperH = kPapers[sel].hPts;
+          }
+        }
+        GlobalUnlock(pd.hDevMode);
+      }
+      GlobalFree(pd.hDevMode);
+    }
+    if (pd.hDevNames) GlobalFree(pd.hDevNames);
+  }
+
+  const std::wstring cap = L"Print Preview - " + ctx.fileName;
+  HWND hw = CreateWindowExW(WS_EX_DLGMODALFRAME, dlgCls, cap.c_str(),
+                            WS_POPUP | WS_CAPTION | WS_SYSMENU | WS_THICKFRAME,
+                            CW_USEDEFAULT, CW_USEDEFAULT, 980, 640,
+                            g.frame, nullptr, g.inst, &ctx);
+  if (!hw) return;
+  RECT fr, rc;
+  GetWindowRect(g.frame, &fr);
+  GetWindowRect(hw, &rc);
+  SetWindowPos(hw, nullptr,
+               fr.left + (fr.right - fr.left - (rc.right - rc.left)) / 2,
+               std::max(40, (int)(fr.top + (fr.bottom - fr.top -
+                                            (rc.bottom - rc.top)) / 2)),
+               0, 0, SWP_NOSIZE | SWP_NOZORDER);
+  ShowWindow(hw, SW_SHOW);
+  UpdateWindow(hw);
+  EnableWindow(g.frame, FALSE);
+  MSG msg;
+  while (IsWindow(hw))
+  {
+    const BOOL r = GetMessageW(&msg, nullptr, 0, 0);
+    if (r <= 0) break;
+    if (!IsDialogMessageW(hw, &msg))
+    {
+      TranslateMessage(&msg);
+      DispatchMessageW(&msg);
+    }
+  }
+  EnableWindow(g.frame, TRUE);
+  SetActiveWindow(g.frame);
+  SetFocus(g.frame);
+  if (ctx.ok)
+    PrintDocWith(ctx.st.paperW, ctx.st.paperH, ctx.st.orient, true);
 }
 
 // Deletes every selected page, highest index first so the remaining indices
@@ -5759,6 +6417,8 @@ static void BuildToolbar(HWND)
      L"Write page data out to a .csv file"},
     {ID_PRINT,        L"Print",      62, 0, 0xE749, false,
      L"Print the document, all pages or a page range (Ctrl+P)"},
+    {ID_PRINT_PREVIEW, L"Preview",   74, 0, 0xE749, false,
+     L"See how the document looks on paper before printing (Ctrl+Shift+P)"},
     {ID_ROTL,         L"Rotate CCW", 88, 1, 0xE7AD, true,
      L"Rotate the current page 90 degrees counter-clockwise (Ctrl+Shift+R)"},
     {ID_ROTR,         L"Rotate CW",  86, 1, 0xE7AD, false,
@@ -6599,7 +7259,7 @@ static bool IsHandledCommand(int id)
     case ID_ANN_HL: case ID_ANN_UL: case ID_ANN_NOTE: case ID_ANN_TEXT:
     case ID_ANN_SHAPE: case ID_ANN_STAMP: case ID_ANN_LINK:
     case ID_PAGE_EXTRACT: case ID_PAGE_SPLIT: case ID_PAGE_CROP:
-    case ID_SEL_ALL: case ID_ROT_ALL: case ID_PRINT:
+    case ID_SEL_ALL: case ID_ROT_ALL: case ID_PRINT: case ID_PRINT_PREVIEW:
     case ID_THEME: case ID_ABOUT:
       return true;
     default:
@@ -6694,6 +7354,7 @@ static void DoCommand(int id)
     case ID_EXPORT_CSV:   ExportCsvAll(); break;
     case ID_WATERMARK:    WatermarkCurrentDoc(); break;
     case ID_PRINT:        PrintDoc(); break;
+    case ID_PRINT_PREVIEW: PrintPreviewDialog(); break;
     case ID_THEME:        ToggleTheme(); break;
     case ID_THEME_FIRST:
     case ID_THEME_DARK:
@@ -6739,6 +7400,7 @@ static HMENU BuildMenu()
   addItem(file, ID_WATERMARK, L"Watermark...");
   AppendMenuW(file, MF_SEPARATOR, 0, nullptr);
   addItem(file, ID_PRINT, L"Print...\tCtrl+P");
+  addItem(file, ID_PRINT_PREVIEW, L"Print Preview\tCtrl+Shift+P");
   AppendMenuW(file, MF_SEPARATOR, 0, nullptr);
   addItem(file, ID_EXIT, L"Exit");
   AppendMenuW(bar, MF_POPUP, (UINT_PTR)file, L"&File");
@@ -7401,7 +8063,7 @@ static LRESULT CALLBACK FrameProc(HWND hw, UINT msg, WPARAM wp, LPARAM lp)
           case VK_TAB: DoCommand(shift ? ID_PREV_TAB : ID_NEXT_TAB); return 0;
           case VK_F4: if (shift) DoCommand(ID_CLOSE_TAB); return 0;
           case 'S': DoCommand(shift ? ID_SAVEAS : ID_SAVE); return 0;
-          case 'P': DoCommand(ID_PRINT); return 0;
+          case 'P': DoCommand(shift ? ID_PRINT_PREVIEW : ID_PRINT); return 0;
           case 'R': DoCommand(shift ? ID_ROTL : ID_ROTR); return 0;
           case 'A': DoCommand(ID_SEL_ALL); return 0;
           case VK_OEM_PLUS: case VK_ADD: DoCommand(ID_ZOOM_IN); return 0;
@@ -10427,6 +11089,183 @@ check("saved %PDF header", bytes.size() > 8 &&
   }
 
   {
+    // --- Print preview: paper model, zoom scale, layout, a rendered frame ---
+    // The preview window cannot be driven on this desktop, so its parts are
+    // pinned down separately: the paper table and the zoom/size arithmetic, the
+    // layout (including when it must scroll), and a real frame painted into a
+    // memory device, which has to look like a page on paper and reuse the exact
+    // rasterisation path the printer uses.
+    {
+      bool okPaper = true;
+      for (int i = 0; i < kPaperCount; ++i)
+        if (!(kPapers[i].wPts > 100) || !(kPapers[i].hPts >= kPapers[i].wPts))
+          okPaper = false;
+      check("preview: every paper is positive and portrait-basis", okPaper);
+      const double iso = 841.89 / 595.28;          // sqrt(2)
+      const double us[] = {792.0 / 612.0,           // letter
+                           1008.0 / 612.0,          // legal
+                           756.0 / 522.0};          // executive
+      for (int i = 0; i < kPaperCount; ++i)
+      {
+        const double r = kPapers[i].hPts / kPapers[i].wPts;
+        bool fine = std::abs(r - iso) < 0.02;
+        for (double u : us)
+          if (std::abs(r - u) < 0.02) fine = true;
+        okPaper = okPaper && fine;
+      }
+      check("preview: papers keep their defining aspect ratio", okPaper);
+      // A5 is exactly half of an A4 landscape sheet.
+      const double a4rea = kPapers[2].wPts * kPapers[2].hPts;
+      const double a5rea = kPapers[3].wPts * kPapers[3].hPts;
+      check("preview: A5 is half of A4",
+            std::abs(a4rea - 2 * a5rea) / a4rea < 0.01);
+    }
+    {
+      // The paper is tied to points at 96 dpi (the app's UI density), and fit
+      // modes must keep the whole sheet inside the surface.
+      checkEq("preview: 100% letter paper width",
+              (int)kPapers[0].wPts * 96 / 72, 816);
+      checkEq("preview: 100% letter paper height",
+              (int)kPapers[0].hPts * 96 / 72, 1056);
+      const int sFit = PvScale(900, 700, 24, 612, 792, 0, PV_FIT_PAGE, 100);
+      checkEq("preview: fit-page scale in a 900x700 surface", sFit, 617);
+      checkEq("preview: an explicit 50% is honoured",
+              PvScale(900, 700, 24, 612, 792, 0, PV_PCT, 50), 500);
+      checkEq("preview: 200% doubles the paper",
+              PvScale(900, 700, 24, 612, 792, 0, PV_PCT, 200), 2000);
+      {
+        const int sl = PvScale(900, 700, 24, 612, 792, 1, PV_FIT_PAGE, 100);
+        const PvLayout LL = PvCompute(900, 700, 24, 612, 792, 1, sl, 0);
+        check("preview: landscape lays the paper wide", LL.paperW > LL.paperH);
+        check("preview: landscape still fits the surface", LL.scrollMax == 0);
+      }
+      const int sW = PvScale(1200, 700, 24, 612, 792, 0, PV_FIT_WIDTH, 100);
+      check("preview: fit-to-width scales past fit-page",
+            sW > PvScale(1200, 700, 24, 612, 792, 0, PV_FIT_PAGE, 100));
+    }
+    {
+      // Layout: centring, the printable margin, and when the sheet must scroll.
+      const PvLayout Lc = PvCompute(900, 700, 24, 612, 792, 0, 617, 0);
+      check("preview: fit-page paper is centered horizontally",
+            Lc.paperX == (900 - Lc.paperW) / 2);
+      check("preview: fit-page sheet fits without scrolling", Lc.scrollMax == 0);
+      check("preview: fit-page sheet fills the height", Lc.paperH > 600);
+      checkEq("preview: printable margin scales with zoom",
+              Lc.printInset, (int)std::floor(24.0 * 0.617 + 0.5));
+      {
+        const PvLayout L1 = PvCompute(1200, 1400, 24, 612, 792, 0, 1000, 0);
+        checkEq("preview: 0.25in printable margin at 100%", L1.printInset, 24);
+        checkEq("preview: 100% letter paper is 816 wide", L1.paperW, 816);
+        check("preview: 100% paper is centered",
+              L1.paperX == (1200 - L1.paperW) / 2);
+      }
+      const int sW = PvScale(1200, 700, 24, 612, 792, 0, PV_FIT_WIDTH, 100);
+      const PvLayout Lw = PvCompute(1200, 700, 24, 612, 792, 0, sW, 0);
+      check("preview: a taller-than-surface sheet scrolls", Lw.scrollMax > 0);
+      {
+        const PvLayout Lb = PvCompute(1200, 700, 24, 612, 792, 0, sW, 999999);
+        check("preview: over-scrolling clamps to the last row",
+              Lb.paperY == 24 - Lb.scrollMax);
+        const PvLayout Lt = PvCompute(1200, 700, 24, 612, 792, 0, sW, -50);
+        check("preview: under-scrolling clamps to the first row",
+              Lt.paperY == 24);
+      }
+    }
+    {
+      // A real frame painted into a memory device. The same rasterisation path
+      // PrintOnePage runs, so if page fitting broke, this drawing would too.
+      FPDF_DOCUMENT pvd =
+          FPDF_LoadMemDocument(sample.data(), (int)sample.size(), nullptr);
+      check("preview: fixture loads for rendering", pvd != nullptr);
+      if (pvd)
+      {
+        const int CW = 900, CH = 700;
+        BITMAPINFO bi{};
+        bi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+        bi.bmiHeader.biWidth = CW;
+        bi.bmiHeader.biHeight = -CH;    // top-down
+        bi.bmiHeader.biPlanes = 1;
+        bi.bmiHeader.biBitCount = 32;
+        bi.bmiHeader.biCompression = BI_RGB;
+        void* bits = nullptr;
+        HBITMAP dib = CreateDIBSection(nullptr, &bi, DIB_RGB_COLORS, &bits,
+                                       nullptr, 0);
+        HDC mem = CreateCompatibleDC(nullptr);
+        if (dib && mem && bits)
+        {
+          HGDIOBJ old = SelectObject(mem, dib);
+          const UiTheme& th = ThemeNow();
+          PvState st;
+          st.page = 0;
+          st.mode = PV_FIT_PAGE;
+          FPDF_DOCUMENT keepPv = g.doc;
+          g.doc = pvd;
+          memset(bits, 0xAA, (size_t)CW * CH * 4);  // sentinel for untouched px
+          PvPaintSurface(mem, CW, CH, 24, st, 0);
+          g.doc = keepPv;
+          GdiFlush();
+          const auto px = [&](int x, int y) {
+            const auto* q = (const unsigned char*)bits + ((size_t)y * CW + x) * 4;
+            return RGB(q[2], q[1], q[0]);
+          };
+          const int scale = PvScale(CW, CH, 24, 612, 792, 0, PV_FIT_PAGE, 100);
+          const PvLayout L = PvCompute(CW, CH, 24, 612, 792, 0, scale, 0);
+          const int mpx = L.printInset;
+          check("preview: surface around the paper is canvas grey",
+                px(2, 2) == th.canvasBg && px(2, CH - 2) == th.canvasBg &&
+                px(CW - 2, CH - 2) == th.canvasBg && px(CW - 2, 2) == th.canvasBg);
+          check("preview: paper interior just inside the margin is white",
+                px(L.paperX + mpx + 2, L.paperY + mpx + 2) == RGB(0xFF, 0xFF, 0xFF));
+          // The dashed printable-area guide sits on the printed edge (it is
+          // dashed, so probe two spots rather than one).
+          check("preview: printable-area frame is drawn",
+                px(L.paperX + mpx + 4, L.paperY + mpx) != RGB(0xFF, 0xFF, 0xFF) ||
+                px(L.paperX + mpx + 8, L.paperY + mpx) != RGB(0xFF, 0xFF, 0xFF));
+          // Ink: everything on the paper, and nothing outside the printable
+          // area. The dashed guide on the margin edges is the frame itself, not
+          // page drawing, so it is skipped rather than counted as stray ink.
+          int inPrint = 0, outside = 0, topInk = -1, botInk = -1;
+          for (int y = L.paperY + 1; y < L.paperY + L.paperH - 1; ++y)
+          {
+            const auto* row = (const unsigned char*)bits + (size_t)y * CW * 4;
+            for (int x = L.paperX + 1; x < L.paperX + L.paperW - 1; ++x)
+            {
+              const unsigned char* q = row + x * 4;
+              if ((q[0] + q[1] + q[2]) >= 0x280) continue;
+              const bool guide =
+                  x == L.paperX + mpx || x == L.paperX + L.paperW - mpx ||
+                  y == L.paperY + mpx || y == L.paperY + L.paperH - mpx;
+              if (guide) continue;
+              const bool inPrintA =
+                  x > L.paperX + mpx && x < L.paperX + L.paperW - mpx &&
+                  y > L.paperY + mpx && y < L.paperY + L.paperH - mpx;
+              if (inPrintA)
+              {
+                ++inPrint;
+                if (topInk < 0) topInk = y;
+                botInk = y;
+              }
+              else ++outside;
+            }
+          }
+          check("preview: ink is inside the printable area only",
+                outside == 0 && inPrint > 0);
+          // The upright sample draws near the top of its page, so the ink must
+          // stay in the upper half of the printable area - flipped output would
+          // fail this exactly like it fails the print test.
+          const int midPrint = L.paperY + mpx + (L.paperH - 2 * mpx) / 2;
+          check("preview: page renders upright (not flipped)",
+                topInk >= 0 && botInk < midPrint);
+          SelectObject(mem, old);
+          DeleteObject(dib);
+        }
+        DeleteDC(mem);
+        FPDF_CloseDocument(pvd);
+      }
+    }
+  }
+
+  {
     // --- Scroll geometry, status-bar legibility, About text ---
     // The pane-level parts (showing the bar, routing the wheel by cursor)
     // need real windows and cannot run in this harness; the range maths, the
@@ -10485,6 +11324,8 @@ check("saved %PDF header", bytes.size() > 8 &&
       // program exists.
       check("about: advertises the print shortcut",
             wcsstr(kAboutText, L"Ctrl+P print") != nullptr);
+      check("about: advertises the print preview shortcut",
+            wcsstr(kAboutText, L"Ctrl+Shift+P print preview") != nullptr);
       check("about: states why the program exists",
             wcsstr(kAboutText, L"pay again.") != nullptr);
       check("about: still lists the save shortcut",

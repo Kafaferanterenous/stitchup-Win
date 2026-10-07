@@ -54,6 +54,17 @@ Produces `dist\Stitchup.exe` + `dist\pdfium.dll`.
   is rasterised with the annotation layer so watermarks and stamps come out
   too. (No printer was attached to the test machine; the fit, orientation and
   rasterisation math is covered by the self-test.)
+- Print Preview (File > Print Preview or `Ctrl+Shift+P`): a paper-white sheet on
+  the app's canvas grey, with the 0.25" printable-area guide drawn as a dashed
+  frame and the page rendered inside it through the *same* fit, rotation and
+  rasterisation path the printer uses, at screen scale - so the preview is a
+  literal miniature of the printout. Toolbar: page back/forward with a page
+  count, a zoom list (Fit to page, Fit to width, 50-400%), paper size (Letter,
+  Legal, A4, A5, A3, Executive; seeded from the default printer), and
+  Portrait/Landscape. When the sheet is taller than the window it scrolls (bar
+  or wheel). Print uses the shown settings - the preview's paper and
+  orientation are written into the print job's DEVMODE, so what you see is what
+  a printer with those settings produces. `Esc` cancels; `Enter`/Print commits.
 - Thumbnails panel: gains its own scroll bar whenever the list is taller than
   the pane, and scrolls with the wheel whenever the pointer is over it (the
   wheel still scrolls the canvas when it is over the document). It auto-follows
@@ -144,8 +155,9 @@ Produces `dist\Stitchup.exe` + `dist\pdfium.dll`.
 - Shortcuts: Ctrl+N/O/S, Ctrl+Shift+S, Ctrl+R (rotate), Ctrl+[/Ctrl+], Delete,
   Ctrl+0/1/2 (100%/fit width/fit page), Ctrl+A (select all pages), Ctrl+F (find),
   F3 / Shift+F3 (find next / previous), Ctrl+D (dark mode), Ctrl+P (print),
-  PgUp/PgDn, Ctrl+wheel to zoom, F5 (two-page spread), F8 (toggle sidebar),
-  Ctrl+T (new tab), Ctrl+Tab/Ctrl+Shift+Tab (next/previous tab)
+  Ctrl+Shift+P (print preview), PgUp/PgDn, Ctrl+wheel to zoom, F5 (two-page
+  spread), F8 (toggle sidebar), Ctrl+T (new tab),
+  Ctrl+Tab/Ctrl+Shift+Tab (next/previous tab)
 
 ## Building / continuous integration
 
@@ -201,8 +213,6 @@ project (github.com/bblanchon/pdfium-binaries). Non-GPL build.
 
 Not yet implemented, roughly by how much a user notices them missing:
 
-- Print Preview — printing itself (File > Print..., `Ctrl+P`) is done, but
-  there is no on-screen preview of what will reach the paper
 - Undo / Redo — every edit is immediate and cannot be reversed from the UI
 - Merge / Combine PDFs — only Import (append) is available
 - File compression / reduce file size

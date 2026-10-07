@@ -691,3 +691,37 @@ the scrollbar/wheel gestures by mouse (the Pages pane reports a zero-width rect,
 so the visible layout cannot be driven here). The status bar rendering, the
 scroll range math and the follow rule are the parts that could be covered
 headlessly and are.
+
+## v0.12.8 - print preview (2026-10-07)
+
+A professional print preview, drawn as a literal miniature of the printout: the
+current page is rendered on a paper-white sheet floating on the app's canvas
+grey, the 0.25" printable area is shown as a dashed frame, and the page is
+fitted inside it with the same FitPageToArea / RenderPageToFit / blit path the
+printer uses - just at 96 dpi - so the preview and the printout cannot drift
+apart. The toolbar offers page back/forward with a "Page X of Y" counter
+(arrow keys and PgUp/PgDn work too), a zoom list from Fit to page / Fit to
+width up to 400%, paper sizes Letter/Legal/A4/A5/A3/Executive seeded from the
+default printer, and Portrait/Landscape. A sheet taller than the window
+scrolls with the bar or the wheel; Esc cancels, Enter (or the Print button)
+commits. The preview's paper and orientation are written into the print job's
+DEVMODE (DMPAPER_USER together with paper width/length and the orientation),
+so the settings on screen are the settings that print.
+
+The window itself cannot be driven on this desktop, so the feature is split
+into parts that can be pinned down, 27 new checks: the paper table (positive,
+portrait-basis, ISO A sizes keep sqrt(2), A5 is half of A4, US sizes keep
+their own ratios); the zoom scale (100% letter at 96 dpi is 816x1056, fit-page
+in a 900x700 surface is 617 per mille, explicit 50%/200% land exactly,
+landscape swaps the sheet and still fits, fit-to-width scales beyond fit-page);
+the layout (horizontal centring, the printable margin scaling with zoom - 24px
+at 100%, 15px when fitted - the sheet filling the height, and scroll: over and
+under-scrolling clamp to the first and last rows); and a real frame painted
+into a 900x700 memory device that must look like a page on paper: canvas grey
+around a centred white sheet, blank paper just inside the margin, the dashed
+guide present, ink only inside the printable area, and the upright sample's ink
+staying in the upper half (a flipped page fails exactly as it fails the print
+test). Self-test grew from 412 to 440 checks: 440 passed, 0 failed, exit code 0.
+
+Not verified on this desktop (it has no printer): a physical round-trip, the
+DEVMODE seeding against a real driver, and the dialog's feel by mouse.
