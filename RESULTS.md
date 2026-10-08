@@ -770,3 +770,12 @@ Not verified on this desktop: the actual Ctrl+Z / Ctrl+Y keystrokes and the
 thumbnails-pane and canvas gestures by mouse (the pane reports a zero-width
 rect here), and the depth cap's memory behaviour over a long interactive
 session. The engine, hooks and shortcuts are the covered parts.
+
+
+## v0.12.10 - merge / combine PDFs (2026-10-07)
+
+- File menu gains 'Merge PDFs...' (append multiple PDFs to the current document, preserving order) and 'Combine into New...' (create a new combined document from multiple PDFs). Both use multi-select file dialogs and import pages via FPDF_ImportPagesByIndex.
+- If no document is open, 'Merge PDFs...' opens the first selected file as a new document.
+
+Self-test: 465 passed, 0 failed (UI and logic added; no new automated checks).
+

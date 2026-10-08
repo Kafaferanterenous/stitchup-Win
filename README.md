@@ -221,7 +221,6 @@ project (github.com/bblanchon/pdfium-binaries). Non-GPL build.
 
 Not yet implemented, roughly by how much a user notices them missing:
 
-- Merge / Combine PDFs — only Import (append) is available
 - File compression / reduce file size
 - Digital signatures (needs a crypto library beyond what is linked)
 - Redaction (needs real content removal, not an overlay)

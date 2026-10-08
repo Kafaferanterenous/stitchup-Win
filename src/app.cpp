@@ -45,6 +45,8 @@ enum
   ID_SAVE,
   ID_SAVEAS,
   ID_IMPORT,
+  ID_MERGE_APPEND,
+  ID_COMBINE_NEW,
   ID_DELETE,
   ID_ADD,
   ID_ROTL,
@@ -7310,7 +7312,7 @@ static bool IsHandledCommand(int id)
   switch (id)
   {
     case ID_NEW: case ID_OPEN: case ID_SAVE: case ID_SAVEAS: case ID_SAVEENC:
-    case ID_IMPORT: case ID_EXPORT_TEXT: case ID_EXPORT_CSV: case ID_WATERMARK:
+    case ID_IMPORT: case ID_MERGE_APPEND: case ID_COMBINE_NEW: case ID_EXPORT_TEXT: case ID_EXPORT_CSV: case ID_WATERMARK:
     case ID_EXIT: case ID_ROTR: case ID_ROTL: case ID_DELETE: case ID_ADD:
     case ID_TOOL_SELECT: case ID_OBJ_EDIT: case ID_OBJ_DELETE:
     case ID_OBJ_RECOLOR: case ID_ZOOM_IN: case ID_ZOOM_OUT: case ID_ZOOM100:
@@ -7322,6 +7324,7 @@ static bool IsHandledCommand(int id)
     case ID_ANN_SHAPE: case ID_ANN_STAMP: case ID_ANN_LINK:
     case ID_PAGE_EXTRACT: case ID_PAGE_SPLIT: case ID_PAGE_CROP:
     case ID_SEL_ALL: case ID_ROT_ALL: case ID_PRINT: case ID_PRINT_PREVIEW:
+    case ID_MERGE_APPEND: case ID_COMBINE_NEW:
     case ID_UNDO: case ID_REDO:
     case ID_THEME: case ID_ABOUT:
       return true;
@@ -7357,6 +7360,9 @@ static void DoCommand(int id)
     case ID_UNDO:    UndoEdit(); break;
     case ID_REDO:    RedoEdit(); break;
     case ID_IMPORT: ImportPdf(); break;
+  case ID_MERGE_APPEND: MergeAppend(); break;
+  case ID_COMBINE_NEW: CombineNew(); break;
+  case ID_COMBINE_NEW: CombineNew(); break;
     case ID_DELETE: DeleteSelectedPages(); break;
     case ID_ADD:    AddPage(); break;
     case ID_ROTL:   RotateSelectedPages(3); break;
