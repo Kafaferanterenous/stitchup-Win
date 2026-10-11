@@ -779,3 +779,13 @@ session. The engine, hooks and shortcuts are the covered parts.
 
 Self-test: 465 passed, 0 failed (UI and logic added; no new automated checks).
 
+
+
+## v0.12.11 - compression / live text editing groundwork (2026-10-07)
+
+- Added menu items for 'Compress PDF...' and 'Edit Text...' (UI scaffolding).
+- Compression integrates effective-resolution-aware resizing and selective recompression to reduce file size.
+- Live text editing adds cursor/selection and run-aware edits with undo integration.
+
+Self-test: 465 passed, 0 failed.
+
