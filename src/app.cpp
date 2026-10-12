@@ -5437,6 +5437,25 @@ static void EditTextObject(int pi, int index, const std::wstring& newText)
   }();
   std::string fn = foundHere.fontName.empty() ? "Helvetica" : foundHere.fontName;
   FPDF_PAGEOBJECT no = FPDFPageObj_NewTextObj(g.doc, fn.c_str(), size);
+  if (!no)
+  {
+    // Only the base-14 fonts are available to a newly created text object;
+    // embedded/subset names (e.g. "ABCDEF+Foobar") make NewTextObj fail, which
+    // would silently drop the edit, so fall back to a built-in family and use
+    // its (slightly different) metrics for the new run.
+    fn = "Helvetica";
+    no = FPDFPageObj_NewTextObj(g.doc, fn.c_str(), size);
+    if (!no)
+    {
+      fn = "Times-Roman";
+      no = FPDFPageObj_NewTextObj(g.doc, fn.c_str(), size);
+    }
+    if (!no)
+    {
+      fn = "Courier";
+      no = FPDFPageObj_NewTextObj(g.doc, fn.c_str(), size);
+    }
+  }
   if (!no) { FPDF_ClosePage(page); return; }
   const unsigned short* u16t = reinterpret_cast<const unsigned short*>(newText.c_str());
   if (!FPDFText_SetText(no, u16t)) { FPDFPageObj_Destroy(no); FPDF_ClosePage(page); return; }
@@ -5740,7 +5759,10 @@ static void CanvasPaint(HDC dc, int cw, int ch)
           int boxT = y + (int)std::lround((phh - stx) * s);
           int boxR = x + (int)std::lround(srx * s);
           int boxB = y + (int)std::lround((phh - sbx) * s);
-          int fh = (int)std::lround(g.sel.fontSize > 0 ? g.sel.fontSize * s : 12.0 * s);
+          // The box height is the run's true on-screen glyph size; the raw PDF
+          // font size can be magnified by the text matrix, so deriving the font
+          // from it renders the overlay text larger than the original.
+          int fh = boxB - boxT;
           if (fh < 6) fh = 6;
           HFONT fnt = CreateFontW(-fh, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
                                   DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
