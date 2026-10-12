@@ -5740,14 +5740,6 @@ static void CanvasPaint(HDC dc, int cw, int ch)
           int boxT = y + (int)std::lround((phh - stx) * s);
           int boxR = x + (int)std::lround(srx * s);
           int boxB = y + (int)std::lround((phh - sbx) * s);
-          HPEN dash = CreatePen(PS_DASH, 1, th.accent);
-          HPEN oldp = (HPEN)SelectObject(dc, dash);
-          HBRUSH oldbr = (HBRUSH)SelectObject(dc, GetStockObject(NULL_BRUSH));
-          Rectangle(dc, boxL, boxT, boxR, boxB);
-          SelectObject(dc, oldbr);
-          SelectObject(dc, oldp);
-          DeleteObject(dash);
-
           int fh = (int)std::lround(g.sel.fontSize > 0 ? g.sel.fontSize * s : 12.0 * s);
           if (fh < 6) fh = 6;
           HFONT fnt = CreateFontW(-fh, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
@@ -5756,23 +5748,49 @@ static void CanvasPaint(HDC dc, int cw, int ch)
           HFONT of = (HFONT)SelectObject(dc, fnt);
           int oldBk = SetBkMode(dc, TRANSPARENT);
           COLORREF oldTc = SetTextColor(dc, th.text);
-          RECT tr{boxL + 1, boxT, boxR + 200, boxB};
+
+          // Measure the run and its prefix up to the caret so the box, the text
+          // and the caret all advance together as the user types.
+          SIZE sz{};
+          GetTextExtentPoint32W(dc, g.sel.textEditBuf.c_str(),
+                                (int)g.sel.textEditBuf.size(), &sz);
+          const std::wstring pre = g.sel.textEditBuf.substr(0, g.sel.textEditPos);
+          SIZE preSz{};
+          GetTextExtentPoint32W(dc, pre.c_str(), (int)pre.size(), &preSz);
+
+          // The page bitmap below still shows the original glyphs, so repaint
+          // the run's area with the paper colour before drawing the live buffer
+          // (otherwise the old text stays visible underneath and doubles up).
+          const int boxEnd = std::max(boxR, boxL + (int)sz.cx + 4);
+          HBRUSH paper = CreateSolidBrush(RGB(255, 255, 255));
+          RECT paperRect{boxL, boxT, boxEnd, boxB};
+          FillRect(dc, &paperRect, paper);
+          DeleteObject(paper);
+
+          HPEN dash = CreatePen(PS_DASH, 1, th.accent);
+          HPEN oldp = (HPEN)SelectObject(dc, dash);
+          HBRUSH oldbr = (HBRUSH)SelectObject(dc, GetStockObject(NULL_BRUSH));
+          Rectangle(dc, boxL, boxT, boxEnd, boxB);
+          SelectObject(dc, oldbr);
+          SelectObject(dc, oldp);
+          DeleteObject(dash);
+
+          RECT tr{boxL + 1, boxT, boxEnd + 200, boxB};
           DrawTextW(dc, g.sel.textEditBuf.c_str(), -1, &tr,
                     DT_LEFT | DT_BOTTOM | DT_SINGLELINE | DT_NOPREFIX);
           SetTextColor(dc, oldTc);
           SetBkMode(dc, oldBk);
-          SelectObject(dc, of);
-          DeleteObject(fnt);
 
-          const int charW = (int)std::lround(fh * 0.52);
-          int caretX = boxL + (int)std::lround(g.sel.textEditPos * charW) + 1;
-          if (caretX > boxR + 200) caretX = boxR + 200;
+          int caretX = boxL + preSz.cx + 1;
+          if (caretX > boxEnd) caretX = boxEnd;
           HPEN cp = CreatePen(PS_SOLID, 2, th.accent);
           HPEN ocp = (HPEN)SelectObject(dc, cp);
           MoveToEx(dc, caretX, boxT + 1, nullptr);
           LineTo(dc, caretX, boxB);
           SelectObject(dc, ocp);
           DeleteObject(cp);
+          SelectObject(dc, of);
+          DeleteObject(fnt);
         }
       }
     }
@@ -6211,6 +6229,11 @@ static LRESULT CALLBACK CanvasProc(HWND hw, UINT msg, WPARAM wp, LPARAM lp)
       }
       return 0;
     }
+    case WM_KEYDOWN:
+    case WM_CHAR:
+      if (g.sel.textEditing)
+        return SendMessageW(g.frame, msg, wp, lp);
+      break;
   }
   return DefWindowProcW(hw, msg, wp, lp);
 }

@@ -788,6 +788,10 @@ Self-test: 465 passed, 0 failed (UI and logic added; no new automated checks).
 - Text editing is now live and in-place: double-click a run of text to edit it on
   the canvas (box outline + caret), Enter commits, Escape cancels, Delete/Backspace
   and cursor keys work; the legacy prompt dialog is kept for the Edit Text menu item.
+- In-place editor fixes: the page bitmap's original glyphs are painted over before
+  drawing the live buffer (previously the old and new text doubled up on top of each
+  other), and keystrokes are forwarded from the canvas to the frame so typed text
+  reliably appears while the canvas holds focus.
 - File >> Compress PDF... rewrites the document non-incrementally to drop orphaned
   objects and reports the size delta.
 - Fixed the build that had regressed after v0.12.9 (duplicate case labels, missing
