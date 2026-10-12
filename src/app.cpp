@@ -47,6 +47,8 @@ enum
   ID_IMPORT,
   ID_MERGE_APPEND,
   ID_COMBINE_NEW,
+  ID_COMPRESS_PDF,
+  ID_EDIT_TEXT,
   ID_DELETE,
   ID_ADD,
   ID_ROTL,
@@ -7362,7 +7364,11 @@ static void DoCommand(int id)
     case ID_IMPORT: ImportPdf(); break;
   case ID_MERGE_APPEND: MergeAppend(); break;
   case ID_COMBINE_NEW: CombineNew(); break;
+  case ID_COMPRESS_PDF: CompressPdf(); break;
+  case ID_EDIT_TEXT: EditText(); break;
   case ID_COMBINE_NEW: CombineNew(); break;
+  case ID_COMPRESS_PDF: CompressPdf(); break;
+  case ID_EDIT_TEXT: EditText(); break;
     case ID_DELETE: DeleteSelectedPages(); break;
     case ID_ADD:    AddPage(); break;
     case ID_ROTL:   RotateSelectedPages(3); break;
@@ -7466,6 +7472,9 @@ static HMENU BuildMenu()
   addItem(file, ID_SAVEAS, L"Save As...\tCtrl+Shift+S");
   addItem(file, ID_SAVEENC, L"Save As Encrypted...");
   addItem(file, ID_IMPORT, L"Import PDF...");
+  addItem(file, ID_MERGE_APPEND, L"Merge PDFs...");
+  addItem(file, ID_COMBINE_NEW, L"Combine into New...");
+  addItem(file, ID_COMPRESS_PDF, L"Compress PDF...");
   addItem(file, ID_EXPORT_TEXT, L"Export Text...");
   addItem(file, ID_EXPORT_CSV, L"Export CSV...");
   addItem(file, ID_WATERMARK, L"Watermark...");
