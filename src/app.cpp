@@ -285,6 +285,10 @@ struct App
     int index = -1;
     int type = 0;
     float l = 0, b = 0, r = 0, t = 0;
+    bool textEditing = false;
+    std::wstring textEditBuf;
+    int textEditPos = 0;
+    int textEditSel = 0;
   } sel;
   // Text search (Ctrl+F). findHits holds every match in page order; findCur
   // indexes it (-1 = no active search). findQuery is kept so F3 / Shift+F3 can
@@ -6002,10 +6006,12 @@ static LRESULT CALLBACK CanvasProc(HWND hw, UINT msg, WPARAM wp, LPARAM lp)
         g.sel.l = best.l; g.sel.b = best.b; g.sel.r = best.r; g.sel.t = best.t;
         g.selected = hi.page;
         std::wstring out;
-        if (PromptEditText(best.text, out))
-          EditTextObject(hi.page, best.index, out);
-        else
-          RefreshSelBounds();
+        // Start in-place text editing
+        g.sel.textEditing = true;
+        g.sel.textEditBuf = best.text;
+        g.sel.textEditPos = (int)g.sel.textEditBuf.length();
+        g.sel.textEditSel = 0;
+        RefreshSelBounds();
         ClearCanvasCache();
         InvalidateRect(hw, nullptr, TRUE);
         InvalidateRect(g.thumbs, nullptr, TRUE);
