@@ -289,6 +289,7 @@ struct App
     std::wstring textEditBuf;
     int textEditPos = 0;
     int textEditSel = 0;
+    float fontSize = 12.0f;
   } sel;
   // Text search (Ctrl+F). findHits holds every match in page order; findCur
   // indexes it (-1 = no active search). findQuery is kept so F3 / Shift+F3 can
@@ -1189,6 +1190,10 @@ static void RefreshState();
 static void UpdateScrollbars();
 static void ResetThumbScroll();
 static void SyncThumbScroll();
+static void MergeAppend();
+static void CombineNew();
+static void CompressPdf();
+static void EditText();
 // The canvas page the thumbnail list last auto-followed. -1 forces a re-follow.
 static int s_thumbFollowed = -1;
 static void FitWidth();
@@ -5489,6 +5494,55 @@ static void EditSelectedText()
     EditTextObject(g.sel.page, g.sel.index, out);
 }
 
+// Menu/F11 path to text editing: start live in-place editing on the selected
+// text object, falling back to the dialog when nothing text-like is selected.
+static void EditText()
+{
+  if (g.sel.active && g.sel.type == FPDF_PAGEOBJ_TEXT)
+  {
+    for (const PageObject& po : ListPageObjects(g.sel.page))
+      if (po.index == g.sel.index)
+      {
+        g.sel.textEditing = true;
+        g.sel.textEditBuf = po.text;
+        g.sel.textEditPos = (int)g.sel.textEditBuf.size();
+        g.sel.textEditSel = 0;
+        g.sel.fontSize = po.fontSize;
+        ClearCanvasCache();
+        if (g.canvas) InvalidateRect(g.canvas, nullptr, TRUE);
+        if (g.status) InvalidateRect(g.status, nullptr, TRUE);
+        return;
+      }
+  }
+  EditSelectedText();
+}
+
+// In-place text editing: the double-click handler loads the run's text into
+// g.sel.textEditBuf and sets g.sel.textEditing; keystrokes edit the buffer live
+// on the canvas and Enter commits it back to the page object, Escape discards.
+static void TextEditCommit()
+{
+  if (!g.sel.textEditing) return;
+  g.sel.textEditing = false;
+  EditTextObject(g.sel.page, g.sel.index, g.sel.textEditBuf);
+  g.sel.textEditBuf.clear();
+  g.sel.textEditPos = 0;
+  ClearCanvasCache();
+  if (g.canvas) InvalidateRect(g.canvas, nullptr, TRUE);
+  if (g.status) InvalidateRect(g.status, nullptr, TRUE);
+}
+
+static void TextEditCancel()
+{
+  if (!g.sel.textEditing) return;
+  g.sel.textEditing = false;
+  g.sel.textEditBuf.clear();
+  g.sel.textEditPos = 0;
+  ClearCanvasCache();
+  if (g.canvas) InvalidateRect(g.canvas, nullptr, TRUE);
+  if (g.status) InvalidateRect(g.status, nullptr, TRUE);
+}
+
 static void CanvasPaint(HDC dc, int cw, int ch)
 {
   const UiTheme& th = ThemeNow();
@@ -5671,6 +5725,54 @@ static void CanvasPaint(HDC dc, int cw, int ch)
           }
           DeleteObject(acc);
           DeleteObject(wh);
+        }
+      }
+
+      // In-place text editing overlay: a dashed box around the run, the live
+      // buffer drawn over it, and a caret at the edit position.
+      if (g.sel.textEditing && g.sel.page == i && g.sel.type == FPDF_PAGEOBJ_TEXT)
+      {
+        float slx = g.sel.l, sbx = g.sel.b, srx = g.sel.r, stx = g.sel.t;
+        if (srx > slx && stx > sbx)
+        {
+          const float phh = PageH(i);
+          int boxL = x + (int)std::lround(slx * s);
+          int boxT = y + (int)std::lround((phh - stx) * s);
+          int boxR = x + (int)std::lround(srx * s);
+          int boxB = y + (int)std::lround((phh - sbx) * s);
+          HPEN dash = CreatePen(PS_DASH, 1, th.accent);
+          HPEN oldp = (HPEN)SelectObject(dc, dash);
+          HBRUSH oldbr = (HBRUSH)SelectObject(dc, GetStockObject(NULL_BRUSH));
+          Rectangle(dc, boxL, boxT, boxR, boxB);
+          SelectObject(dc, oldbr);
+          SelectObject(dc, oldp);
+          DeleteObject(dash);
+
+          int fh = (int)std::lround(g.sel.fontSize > 0 ? g.sel.fontSize * s : 12.0 * s);
+          if (fh < 6) fh = 6;
+          HFONT fnt = CreateFontW(-fh, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+                                  DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+                                  CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI");
+          HFONT of = (HFONT)SelectObject(dc, fnt);
+          int oldBk = SetBkMode(dc, TRANSPARENT);
+          COLORREF oldTc = SetTextColor(dc, th.text);
+          RECT tr{boxL + 1, boxT, boxR + 200, boxB};
+          DrawTextW(dc, g.sel.textEditBuf.c_str(), -1, &tr,
+                    DT_LEFT | DT_BOTTOM | DT_SINGLELINE | DT_NOPREFIX);
+          SetTextColor(dc, oldTc);
+          SetBkMode(dc, oldBk);
+          SelectObject(dc, of);
+          DeleteObject(fnt);
+
+          const int charW = (int)std::lround(fh * 0.52);
+          int caretX = boxL + (int)std::lround(g.sel.textEditPos * charW) + 1;
+          if (caretX > boxR + 200) caretX = boxR + 200;
+          HPEN cp = CreatePen(PS_SOLID, 2, th.accent);
+          HPEN ocp = (HPEN)SelectObject(dc, cp);
+          MoveToEx(dc, caretX, boxT + 1, nullptr);
+          LineTo(dc, caretX, boxB);
+          SelectObject(dc, ocp);
+          DeleteObject(cp);
         }
       }
     }
@@ -5907,6 +6009,8 @@ static LRESULT CALLBACK CanvasProc(HWND hw, UINT msg, WPARAM wp, LPARAM lp)
     case WM_LBUTTONDOWN:
     {
       SetFocus(g.frame);
+      // A click that starts a new interaction commits any in-place text edit.
+      if (g.sel.textEditing) TextEditCommit();
       POINT pt{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
       HitInfo hi;
       if (HitPage(pt, hi))
@@ -6005,12 +6109,14 @@ static LRESULT CALLBACK CanvasProc(HWND hw, UINT msg, WPARAM wp, LPARAM lp)
         g.sel.type = best.type;
         g.sel.l = best.l; g.sel.b = best.b; g.sel.r = best.r; g.sel.t = best.t;
         g.selected = hi.page;
-        std::wstring out;
-        // Start in-place text editing
+        // Start in-place text editing: the run's text becomes the live buffer,
+        // edited on the canvas and committed with Enter (Escape cancels).
         g.sel.textEditing = true;
         g.sel.textEditBuf = best.text;
         g.sel.textEditPos = (int)g.sel.textEditBuf.length();
         g.sel.textEditSel = 0;
+        g.sel.fontSize = best.fontSize;
+        SetFocus(g.frame);   // keystrokes for the live buffer go to FrameProc
         RefreshSelBounds();
         ClearCanvasCache();
         InvalidateRect(hw, nullptr, TRUE);
@@ -7320,7 +7426,7 @@ static bool IsHandledCommand(int id)
   switch (id)
   {
     case ID_NEW: case ID_OPEN: case ID_SAVE: case ID_SAVEAS: case ID_SAVEENC:
-    case ID_IMPORT: case ID_MERGE_APPEND: case ID_COMBINE_NEW: case ID_EXPORT_TEXT: case ID_EXPORT_CSV: case ID_WATERMARK:
+    case ID_IMPORT: case ID_MERGE_APPEND: case ID_COMBINE_NEW: case ID_COMPRESS_PDF: case ID_EDIT_TEXT: case ID_EXPORT_TEXT: case ID_EXPORT_CSV: case ID_WATERMARK:
     case ID_EXIT: case ID_ROTR: case ID_ROTL: case ID_DELETE: case ID_ADD:
     case ID_TOOL_SELECT: case ID_OBJ_EDIT: case ID_OBJ_DELETE:
     case ID_OBJ_RECOLOR: case ID_ZOOM_IN: case ID_ZOOM_OUT: case ID_ZOOM100:
@@ -7332,7 +7438,6 @@ static bool IsHandledCommand(int id)
     case ID_ANN_SHAPE: case ID_ANN_STAMP: case ID_ANN_LINK:
     case ID_PAGE_EXTRACT: case ID_PAGE_SPLIT: case ID_PAGE_CROP:
     case ID_SEL_ALL: case ID_ROT_ALL: case ID_PRINT: case ID_PRINT_PREVIEW:
-    case ID_MERGE_APPEND: case ID_COMBINE_NEW:
     case ID_UNDO: case ID_REDO:
     case ID_THEME: case ID_ABOUT:
       return true;
@@ -7369,9 +7474,6 @@ static void DoCommand(int id)
     case ID_REDO:    RedoEdit(); break;
     case ID_IMPORT: ImportPdf(); break;
   case ID_MERGE_APPEND: MergeAppend(); break;
-  case ID_COMBINE_NEW: CombineNew(); break;
-  case ID_COMPRESS_PDF: CompressPdf(); break;
-  case ID_EDIT_TEXT: EditText(); break;
   case ID_COMBINE_NEW: CombineNew(); break;
   case ID_COMPRESS_PDF: CompressPdf(); break;
   case ID_EDIT_TEXT: EditText(); break;
@@ -8141,6 +8243,39 @@ static LRESULT CALLBACK FrameProc(HWND hw, UINT msg, WPARAM wp, LPARAM lp)
       bool ctrl = (GetKeyState(VK_CONTROL) & 0x8000) != 0;
       bool shift = (GetKeyState(VK_SHIFT) & 0x8000) != 0;
       int vk = (int)wp;
+      if (g.sel.textEditing)
+      {
+        switch (vk)
+        {
+          case VK_ESCAPE: TextEditCancel(); return 0;
+          case VK_RETURN: TextEditCommit(); return 0;
+          case VK_BACK:
+            if (g.sel.textEditPos > 0 && !g.sel.textEditBuf.empty())
+            {
+              g.sel.textEditBuf.erase(g.sel.textEditPos - 1, 1);
+              g.sel.textEditPos--;
+            }
+            if (g.canvas) InvalidateRect(g.canvas, nullptr, FALSE);
+            return 0;
+          case VK_DELETE:
+            if (g.sel.textEditPos < (int)g.sel.textEditBuf.size())
+              g.sel.textEditBuf.erase(g.sel.textEditPos, 1);
+            if (g.canvas) InvalidateRect(g.canvas, nullptr, FALSE);
+            return 0;
+          case VK_LEFT:
+            if (g.sel.textEditPos > 0) g.sel.textEditPos--;
+            if (g.canvas) InvalidateRect(g.canvas, nullptr, FALSE);
+            return 0;
+          case VK_RIGHT:
+            if (g.sel.textEditPos < (int)g.sel.textEditBuf.size()) g.sel.textEditPos++;
+            if (g.canvas) InvalidateRect(g.canvas, nullptr, FALSE);
+            return 0;
+          case VK_HOME: g.sel.textEditPos = 0; if (g.canvas) InvalidateRect(g.canvas, nullptr, FALSE); return 0;
+          case VK_END: g.sel.textEditPos = (int)g.sel.textEditBuf.size(); if (g.canvas) InvalidateRect(g.canvas, nullptr, FALSE); return 0;
+          default: break;
+        }
+        if (!ctrl) return 0;
+      }
       if (ctrl)
       {
         switch (vk)
@@ -8179,6 +8314,22 @@ static LRESULT CALLBACK FrameProc(HWND hw, UINT msg, WPARAM wp, LPARAM lp)
         }
       }
       return 0;
+    }
+    case WM_CHAR:
+    {
+      // Live in-place text editing: printable characters append to the buffer.
+      if (g.sel.textEditing)
+      {
+        const wchar_t ch = (wchar_t)wp;
+        if (ch >= 0x20 || ch == L'\t')
+        {
+          g.sel.textEditBuf.insert(g.sel.textEditPos, 1, ch);
+          g.sel.textEditPos++;
+          if (g.canvas) InvalidateRect(g.canvas, nullptr, FALSE);
+        }
+        return 0;
+      }
+      break;
     }
     case WM_CLOSE:
     {
@@ -9040,6 +9191,230 @@ static void RedoEdit()
   UndoEntry from = std::move(g.redo.back());
   g.redo.pop_back();
   if (!SwapDocumentTo(from, g.undo)) g.redo.push_back(std::move(from));
+}
+
+// ---------------------------------------------------------------------------
+// Merge / Combine / Compress
+// ---------------------------------------------------------------------------
+
+// Multi-select PDF picker. Returns the chosen paths in selection order (empty
+// when cancelled). Explorer-style OFN packs <dir>\0<name>\0<name>\0\0 for
+// multi-selection and a single path for one file.
+static std::vector<std::wstring> PickPdfsMulti()
+{
+  std::vector<std::wstring> out;
+  std::vector<wchar_t> buf(1 << 16, 0);
+  OPENFILENAMEW ofn{};
+  ofn.lStructSize = sizeof(ofn);
+  ofn.hwndOwner = g.frame;
+  ofn.lpstrFilter = L"PDF Files (*.pdf)\0*.pdf\0All Files\0*.*\0\0";
+  ofn.lpstrFile = buf.data();
+  ofn.nMaxFile = (DWORD)buf.size();
+  ofn.lpstrDefExt = L"pdf";
+  ofn.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_HIDEREADONLY |
+              OFN_ALLOWMULTISELECT | OFN_EXPLORER;
+  if (!GetOpenFileNameW(&ofn)) return out;
+
+  const wchar_t* p = buf.data();
+  const std::wstring dir = p;
+  p += dir.size() + 1;
+  if (*p == 0)
+  {
+    out.push_back(dir);
+    return out;
+  }
+  while (*p)
+  {
+    const std::wstring f = p;
+    p += f.size() + 1;
+    out.push_back(dir + L"\\" + f);
+  }
+  return out;
+}
+
+// File > Merge PDFs... appends every page of each selected PDF to the current
+// document, in selection order, as one undo step. With no document open the
+// first selected file is opened instead.
+static void MergeAppend()
+{
+  if (!g.doc || g.pageCount == 0)
+  {
+    DoCommand(ID_OPEN);
+    return;
+  }
+  const std::vector<std::wstring> files = PickPdfsMulti();
+  if (files.empty()) return;
+
+  const int firstNew = g.pageCount;
+  bool armed = false;
+  int imported = 0, failed = 0;
+  std::wstring errName;
+  for (const std::wstring& f : files)
+  {
+    FPDF_DOCUMENT src = FPDF_LoadDocument(Utf8(f).c_str(), nullptr);
+    if (!src) { failed++; if (errName.empty()) errName = f; continue; }
+    if (!armed) { BeginEdit(); armed = true; }
+    const int destIndex = FPDF_GetPageCount(g.doc);
+    if (FPDF_ImportPagesByIndex(g.doc, src, nullptr, 0, destIndex))
+      imported++;
+    else
+    {
+      failed++;
+      if (errName.empty()) errName = f;
+    }
+    FPDF_CloseDocument(src);
+  }
+
+  if (imported == 0)
+  {
+    if (armed) CancelEdit();
+    wchar_t msg[256];
+    if (errName.empty())
+      swprintf(msg, 256, L"No pages were merged.");
+    else
+      swprintf(msg, 256, L"No pages were merged.\nCould not read: %ls", errName.c_str());
+    MessageBoxW(g.frame, msg, L"Stitchup", MB_OK | MB_ICONWARNING);
+    return;
+  }
+
+  CheckLib();
+  g.dirty = true;
+  RefreshState();
+  g.bmDirty = true;
+  GotoPageIndex(firstNew);
+  InvalidateRect(g.canvas, nullptr, TRUE);
+  InvalidateRect(g.thumbs, nullptr, TRUE);
+  if (g.status) InvalidateRect(g.status, nullptr, TRUE);
+  if (failed)
+  {
+    wchar_t msg[256];
+    swprintf(msg, 256, L"Merged %d file(s); %d could not be read.", imported, failed);
+    MessageBoxW(g.frame, msg, L"Stitchup", MB_OK | MB_ICONWARNING);
+  }
+}
+
+// File > Combine into New... builds a fresh document from the selected PDFs and
+// replaces the current document with it.
+static void CombineNew()
+{
+  const std::vector<std::wstring> files = PickPdfsMulti();
+  if (files.empty()) return;
+
+  FPDF_DOCUMENT nd = FPDF_CreateNewDocument();
+  if (!nd)
+  {
+    MessageBoxW(g.frame, L"Could not create the combined document.",
+                L"Stitchup", MB_OK | MB_ICONWARNING);
+    return;
+  }
+  int imported = 0, failed = 0;
+  for (const std::wstring& f : files)
+  {
+    FPDF_DOCUMENT src = FPDF_LoadDocument(Utf8(f).c_str(), nullptr);
+    if (!src) { failed++; continue; }
+    const int destIndex = FPDF_GetPageCount(nd);
+    if (FPDF_ImportPagesByIndex(nd, src, nullptr, 0, destIndex)) imported++;
+    else failed++;
+    FPDF_CloseDocument(src);
+  }
+  if (imported == 0)
+  {
+    FPDF_CloseDocument(nd);
+    MessageBoxW(g.frame, L"No pages were combined.", L"Stitchup",
+                MB_OK | MB_ICONWARNING);
+    return;
+  }
+
+  std::vector<unsigned char> bytes;
+  if (!SaveAsString(nd, bytes) || bytes.empty())
+  {
+    FPDF_CloseDocument(nd);
+    MessageBoxW(g.frame, L"Failed to build the combined document.",
+                L"Stitchup", MB_OK | MB_ICONWARNING);
+    return;
+  }
+  FPDF_CloseDocument(nd);
+  FPDF_DOCUMENT loaded =
+      FPDF_LoadMemDocument(bytes.data(), (int)bytes.size(), nullptr);
+  if (!loaded)
+  {
+    MessageBoxW(g.frame, L"Failed to reload the combined document.",
+                L"Stitchup", MB_OK | MB_ICONWARNING);
+    return;
+  }
+
+  if (g.annDrag || g.selDrag) ReleaseCapture();
+  g.annTool = 0;
+  g.annDrag = false;
+  g.annPage = -1;
+  g.sel.active = false;
+  g.selDrag = false;
+  g.editPage = nullptr;
+  g.editObj = nullptr;
+  CloseDoc();
+  g.doc = loaded;
+  g.path.clear();
+  g.name = L"Combined.pdf";
+  g.undo.clear();
+  g.redo.clear();
+  g.dirty = true;
+  g.selected = 0;
+  const int pc = FPDF_GetPageCount(g.doc);
+  g.pageCount = pc > 0 ? pc : 0;
+  RefreshState();
+  g.bmDirty = true;
+  GotoPageIndex(0);
+  InvalidateRect(g.canvas, nullptr, TRUE);
+  InvalidateRect(g.thumbs, nullptr, TRUE);
+  if (g.status) InvalidateRect(g.status, nullptr, TRUE);
+  CheckLib();
+  if (failed)
+  {
+    wchar_t msg[256];
+    swprintf(msg, 256, L"Combined %d file(s); %d could not be read.",
+             imported, failed);
+    MessageBoxW(g.frame, msg, L"Stitchup", MB_OK | MB_ICONWARNING);
+  }
+}
+
+// File > Compress PDF... reduces the on-disk size of the current document by
+// rewriting it non-incrementally (dropping any orphaned objects accumulated by
+// edits). Size before/after is reported in the status bar.
+static void CompressPdf()
+{
+  if (!g.doc || g.pageCount == 0) return;
+  if (g.path.empty()) { DoCommand(ID_SAVEAS); return; }
+  std::vector<unsigned char> before;
+  if (!SaveAsString(g.doc, before) || before.empty()) return;
+  const size_t beforeSize = before.size();
+
+  BeginEdit();
+  const bool ok = DocToFile(g.doc, g.path);
+  if (ok)
+  {
+    std::vector<unsigned char> after;
+    if (SaveAsString(g.doc, after))
+    {
+      const size_t afterSize = after.size();
+      const double pct = beforeSize ? (double)afterSize / beforeSize : 1.0;
+      wchar_t msg[128];
+      swprintf(msg, 128, L"Compressed: %.1f kB -> %.1f kB (%.0f%%)",
+               beforeSize / 1024.0, afterSize / 1024.0, pct * 100.0);
+      if (g.status) SetWindowTextW(g.status, msg);
+      if (afterSize >= beforeSize)
+        MessageBoxW(g.frame, L"The document is already well optimised "
+                             L"(no size reduction).", L"Stitchup", MB_OK);
+    }
+    RefreshState();
+    InvalidateRect(g.canvas, nullptr, TRUE);
+    InvalidateRect(g.thumbs, nullptr, TRUE);
+  }
+  else
+  {
+    CancelEdit();
+    MessageBoxW(g.frame, L"Could not write the compressed document.",
+                L"Stitchup", MB_OK | MB_ICONWARNING);
+  }
 }
 
 // Runs the headless checks, writing test_result.txt next to the exe. Returns

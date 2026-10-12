@@ -781,11 +781,17 @@ Self-test: 465 passed, 0 failed (UI and logic added; no new automated checks).
 
 
 
-## v0.12.11 - compression / live text editing groundwork (2026-10-07)
-
-- Added menu items for 'Compress PDF...' and 'Edit Text...' (UI scaffolding).
-- Compression integrates effective-resolution-aware resizing and selective recompression to reduce file size.
-- Live text editing adds cursor/selection and run-aware edits with undo integration.
+## v0.12.11 - merge/combine, text editing, compression (2026-10-12)
+- File >> Merge PDFs... appends all pages of multi-selected PDFs to the current
+  document as one undo step; File >> Combine into New... builds a fresh document
+  from multi-selected PDFs and swaps it in.
+- Text editing is now live and in-place: double-click a run of text to edit it on
+  the canvas (box outline + caret), Enter commits, Escape cancels, Delete/Backspace
+  and cursor keys work; the legacy prompt dialog is kept for the Edit Text menu item.
+- File >> Compress PDF... rewrites the document non-incrementally to drop orphaned
+  objects and reports the size delta.
+- Fixed the build that had regressed after v0.12.9 (duplicate case labels, missing
+  handlers for the new menu ids); every release since v0.12.9 had shipped a stale exe.
 
 Self-test: 465 passed, 0 failed.
 
