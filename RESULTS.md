@@ -796,7 +796,9 @@ Self-test: 465 passed, 0 failed (UI and logic added; no new automated checks).
   the editor falls back to a base-14 font (Helvetica/Times-Roman/Courier) when the
   original font name cannot be used for a new text object, so the edit actually
   sticks. The edit overlay now scales to the run's on-screen box height instead of
-  the raw font size, so the text no longer jumps larger.
+  the raw font size, and the replacement run is sized from the original rendered
+  height (ignoring the text matrix), so committed text keeps the original size
+  instead of doubling or shrinking.
 - File >> Compress PDF... rewrites the document non-incrementally to drop orphaned
   objects and reports the size delta.
 - Fixed the build that had regressed after v0.12.9 (duplicate case labels, missing

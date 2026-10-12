@@ -5460,9 +5460,18 @@ static void EditTextObject(int pi, int index, const std::wstring& newText)
   const unsigned short* u16t = reinterpret_cast<const unsigned short*>(newText.c_str());
   if (!FPDFText_SetText(no, u16t)) { FPDFPageObj_Destroy(no); FPDF_ClosePage(page); return; }
   FS_MATRIX m{};
-  m.a = 1; m.d = 1;
-  FPDFPageObj_SetMatrix(no, &m);
   float nl = 0, nb = 0, nr = 0, nt = 0;
+  FPDFPageObj_GetBounds(no, &nl, &nb, &nr, &nt);
+  // The raw font size from GetFontSize ignores the text matrix, so a run scaled
+  // by Tm (e.g. size 24 drawn with a 0.5x matrix) would be committed at the raw
+  // size and double up. Scale uniformly so the new run's height matches the
+  // original's rendered height, then anchor bottom-left.
+  const float oh = ot - ob;
+  const float nh = nt - nb;
+  float k = (nh > 0.001f) ? (oh / nh) : 1.0f;
+  if (k <= 0.001f || k > 50.0f) k = 1.0f;
+  m.a = k; m.d = k;
+  FPDFPageObj_SetMatrix(no, &m);
   FPDFPageObj_GetBounds(no, &nl, &nb, &nr, &nt);
   m.e = ol - nl;   // anchor bottom-left of the original run
   m.f = ob - nb;
