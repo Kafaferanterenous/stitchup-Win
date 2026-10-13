@@ -812,6 +812,9 @@ Self-test: 465 passed, 0 failed.
   run being edited in place (the choice previews live and is applied on commit) or
   a selected text object (restyled immediately). The dialog opens pre-filled with
   the current family and effective size.
+- The **Content** ribbon tab also carries inline **Font family** and **size**
+  controls that follow the selected (or edited) text and apply the change
+  immediately; the family/size dialog is still available for more detail.
 - In-place text editor now supports text selection: Ctrl+A selects all,
   Shift+arrows / Shift+Home / Shift+End extend the selection, and typing,
   Backspace or Delete replaces it. The selection is drawn as an accent-filled band
@@ -822,7 +825,11 @@ Self-test: 465 passed, 0 failed.
 - Committing an edited run preserves the original font's weight/slant by mapping
   embedded/subset names to their base-14 equivalent (Arial -> Helvetica,
   Arial-Bold -> Helvetica-Bold, Courier*, Times*, Symbol, ZapfDingbats) instead of
-  always collapsing to plain Helvetica.
+  always collapsing to plain Helvetica. The replacement run is placed with the
+  same matrix scale and effective size, so its bounding box (width and height)
+  matches the original run (verified against runs that store 1pt under a 36x
+  matrix); the in-place overlay previews with the mapped face and weight too, so
+  what you see while editing is what gets committed.
 - Editing or moving a text object no longer opens a spurious extra "Untitled" tab:
   the post-save reload now refreshes the current tab in place (keeping undo/redo,
   zoom and scroll) instead of calling the tab-creating `LoadDoc`.

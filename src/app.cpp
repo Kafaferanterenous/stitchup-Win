@@ -124,6 +124,9 @@ ID_ANN_LINK,
   // contiguous theme block above is untouched.
   ID_BM_PAGE,
   ID_BM_VIEW,
+  // Ribbon font controls (Content tab): a family dropdown and a size box.
+  ID_RIBFONT,
+  ID_RIBSIZE,
 };
 
 enum
@@ -350,6 +353,7 @@ static void BeginEdit();
 static void CancelEdit();
 static void UndoEdit();
 static void RedoEdit();
+static void UpdateFontControls();
 
 // ---------------------------------------------------------------------------
 // Themes - named colour schemes (light / dark / dark blue / pastel /
@@ -5253,17 +5257,19 @@ static bool HitTestObject(int pi, double px, double py, PageObject& best)
 
 static void RefreshSelBounds()
 {
-  if (!g.sel.active) return;
+  if (!g.sel.active) { UpdateFontControls(); return; }
   for (const PageObject& po : ListPageObjects(g.sel.page))
   {
     if (po.index == g.sel.index)
     {
       g.sel.type = po.type;
       g.sel.l = po.l; g.sel.b = po.b; g.sel.r = po.r; g.sel.t = po.t;
+      UpdateFontControls();
       return;
     }
   }
   g.sel.active = false;  // stale selection (page changed or object gone)
+  UpdateFontControls();
 }
 
 static void SetToolSelect(bool on)
@@ -5718,6 +5724,7 @@ static void EditText()
         g.sel.editFont.clear();
         g.sel.editFontSize = 0.0f;
         ClearCanvasCache();
+        UpdateFontControls();
         if (g.canvas) InvalidateRect(g.canvas, nullptr, TRUE);
         if (g.status) InvalidateRect(g.status, nullptr, TRUE);
         return;
@@ -5740,6 +5747,7 @@ static void TextEditCommit()
   ClearCanvasCache();
   if (g.canvas) InvalidateRect(g.canvas, nullptr, TRUE);
   if (g.status) InvalidateRect(g.status, nullptr, TRUE);
+  UpdateFontControls();
 }
 
 static void TextEditCancel()
@@ -5752,6 +5760,7 @@ static void TextEditCancel()
   ClearCanvasCache();
   if (g.canvas) InvalidateRect(g.canvas, nullptr, TRUE);
   if (g.status) InvalidateRect(g.status, nullptr, TRUE);
+  UpdateFontControls();
 }
 
 // The selection anchor is g.sel.textEditSel (== g.sel.textEditPos means no
@@ -5812,6 +5821,11 @@ static bool g_fontOk = false;
 static std::string g_fontChosenFam;
 static float g_fontChosenSize = 0.0f;
 
+// Ribbon font controls (Content tab).
+static HWND g_fontCombo = nullptr;   // CB_ family dropdown
+static HWND g_sizeCombo = nullptr;   // editable size box
+static bool g_fontCtlGuard = false;  // suppress re-entrant CBN_* handling
+
 static int FontFamilyIndex(const std::string& fam)
 {
   const std::string b = MapToBase14(fam);
@@ -5853,6 +5867,32 @@ static bool SelectionTextStyle(std::string& fam, float& size)
       }
   }
   return false;
+}
+
+// Sync the ribbon font/size controls to the current text target. Called whenever
+// the selection or the active tab changes, and after an edit starts or commits.
+static void UpdateFontControls()
+{
+  if (!g_fontCombo || !g_sizeCombo) return;
+  std::string fam;
+  float size = 0.0f;
+  const bool has = SelectionTextStyle(fam, size);
+  g_fontCtlGuard = true;
+  EnableWindow(g_fontCombo, has ? TRUE : FALSE);
+  EnableWindow(g_sizeCombo, has ? TRUE : FALSE);
+  if (has)
+  {
+    SendMessageW(g_fontCombo, CB_SETCURSEL, FontFamilyIndex(fam), 0);
+    wchar_t buf[32];
+    swprintf_s(buf, L"%g", (double)size);
+    SetWindowTextW(g_sizeCombo, buf);
+  }
+  else
+  {
+    SendMessageW(g_fontCombo, CB_SETCURSEL, (WPARAM)-1, 0);
+    SetWindowTextW(g_sizeCombo, L"");
+  }
+  g_fontCtlGuard = false;
 }
 
 static LRESULT CALLBACK FontProc(HWND h, UINT m, WPARAM w, LPARAM l)
@@ -6218,10 +6258,22 @@ static void CanvasPaint(HDC dc, int cw, int ch)
           if (g.sel.editFontSize > 0.0f)
             fh = (int)std::lround(g.sel.editFontSize * s);
           if (fh < 6) fh = 6;
-          const wchar_t* face = g.sel.editFont.empty()
-                                    ? L"Segoe UI"
-                                    : FontFaceForFamily(g.sel.editFont);
-          HFONT fnt = CreateFontW(-fh, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+          // Preview with the face the commit will actually use (the mapped
+          // base-14 family, with its weight and slant) so the live buffer and
+          // the committed PDF text look the same.
+          std::string fam;
+          if (!g.sel.editFont.empty())
+            fam = g.sel.editFont;
+          else
+            for (const PageObject& po : ListPageObjects(g.sel.page))
+              if (po.index == g.sel.index) { fam = MapToBase14(po.fontName); break; }
+          const std::string famB = MapToBase14(fam);
+          const wchar_t* face = FontFaceForFamily(fam);
+          const bool italic = famB.find("Italic") != std::string::npos ||
+                              famB.find("Oblique") != std::string::npos;
+          const int weight = famB.find("Bold") != std::string::npos ? FW_BOLD
+                                                                     : FW_NORMAL;
+          HFONT fnt = CreateFontW(-fh, 0, 0, 0, weight, italic, FALSE, FALSE,
                                   DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
                                   CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, face);
           HFONT of = (HFONT)SelectObject(dc, fnt);
@@ -6599,6 +6651,7 @@ static LRESULT CALLBACK CanvasProc(HWND hw, UINT msg, WPARAM wp, LPARAM lp)
           InvalidateRect(hw, nullptr, FALSE);
           InvalidateRect(g.thumbs, nullptr, FALSE);
           InvalidateRect(g.status, nullptr, TRUE);
+          UpdateFontControls();
           return 0;
         }
         FPDF_PAGE page = FPDF_LoadPage(g.doc, hi.page);
@@ -6655,6 +6708,7 @@ static LRESULT CALLBACK CanvasProc(HWND hw, UINT msg, WPARAM wp, LPARAM lp)
         g.sel.editFont.clear();
         g.sel.editFontSize = 0.0f;
         SetFocus(g.frame);   // keystrokes for the live buffer go to FrameProc
+        UpdateFontControls();
         RefreshSelBounds();
         ClearCanvasCache();
         InvalidateRect(hw, nullptr, TRUE);
@@ -7202,6 +7256,28 @@ static void BuildToolbar(HWND)
     AddTip(hw, s.tip);
     g.ribbonBtns.push_back(hw);
   }
+
+  // Font family + size controls for the Content tab.
+  g_fontCombo = CreateWindowExW(0, L"COMBOBOX", L"",
+      WS_CHILD | WS_TABSTOP | CBS_DROPDOWNLIST | WS_VSCROLL, 0, 0, 160, 240,
+      g.toolbar, (HMENU)(INT_PTR)ID_RIBFONT, g.inst, nullptr);
+  for (int i = 0; i < kFontFamilyCount; ++i)
+    SendMessageW(g_fontCombo, CB_ADDSTRING, 0, (LPARAM)kFontFamilyLabels[i]);
+  SendMessageW(g_fontCombo, WM_SETFONT, (WPARAM)g.font, TRUE);
+
+  g_sizeCombo = CreateWindowExW(0, L"COMBOBOX", L"",
+      WS_CHILD | WS_TABSTOP | CBS_DROPDOWN | CBS_AUTOHSCROLL, 0, 0, 70, 240,
+      g.toolbar, (HMENU)(INT_PTR)ID_RIBSIZE, g.inst, nullptr);
+  static const int kSizes[] = {8, 9, 10, 11, 12, 14, 16, 18, 20, 24, 28, 32, 36, 48, 72};
+  for (int z : kSizes)
+  {
+    wchar_t sb[16];
+    swprintf_s(sb, L"%d", z);
+    SendMessageW(g_sizeCombo, CB_ADDSTRING, 0, (LPARAM)sb);
+  }
+  SendMessageW(g_sizeCombo, WM_SETFONT, (WPARAM)g.font, TRUE);
+  ShowWindow(g_fontCombo, SW_HIDE);
+  ShowWindow(g_sizeCombo, SW_HIDE);
 }
 
 static const wchar_t* RibbonTabName(int tab)
@@ -7277,12 +7353,32 @@ static void LayoutRibbon()
     ShowWindow(hw, SW_SHOW);
     x += w + 6;
   }
+  int xEnd = x - 6;
+  if (g_fontCombo && g_sizeCombo)
+  {
+    const bool show = (g.ribbonTab == 3);   // Content tab
+    if (show)
+    {
+      const int cx = x + 12;
+      SetWindowPos(g_fontCombo, nullptr, cx, RIB_BTN_Y + 10, 160, 220, SWP_NOZORDER);
+      SetWindowPos(g_sizeCombo, nullptr, cx + 166, RIB_BTN_Y + 10, 70, 220, SWP_NOZORDER);
+      ShowWindow(g_fontCombo, SW_SHOW);
+      ShowWindow(g_sizeCombo, SW_SHOW);
+      UpdateFontControls();
+      xEnd = cx + 166 + 70 + 6;
+    }
+    else
+    {
+      ShowWindow(g_fontCombo, SW_HIDE);
+      ShowWindow(g_sizeCombo, SW_HIDE);
+    }
+  }
   if (x > gx)
   {
     App::GroupBox gb;
     gb.tab = g.ribbonTab;
     gb.name = RibbonTabName(g.ribbonTab);
-    gb.rc = {gx - 4, RIB_TAB_H + 2, x - 6, RIB_H - 2};
+    gb.rc = {gx - 4, RIB_TAB_H + 2, xEnd, RIB_H - 2};
     g.groups.push_back(gb);
   }
 
@@ -12956,91 +13052,6 @@ static bool DemoMode(const std::wstring& outPath, int pages)
   return true;
 }
 
-// Diagnostic: dump every content object's type, bounds, font size, matrix and
-// extracted text for the given file (used to debug text editing of real PDFs).
-static int DumpTextObjs(const std::wstring& inPath, int maxPages)
-{
-  FPDF_InitLibrary();
-  FPDF_DOCUMENT d = FPDF_LoadDocument(Utf8(inPath).c_str(), nullptr);
-  if (!d) { FPDF_DestroyLibrary(); return 1; }
-  FILE* f = nullptr;
-  _wfopen_s(&f, L"dump_result.txt", L"wb");
-  auto line = [&](const std::string& s)
-  {
-    if (f) fwrite(s.data(), 1, s.size(), f);
-    printf("%s", s.c_str());
-  };
-  const int pc = FPDF_GetPageCount(d);
-  char head[64];
-  sprintf_s(head, "pages %d\n", pc);
-  line(head);
-  const int lim = maxPages > 0 && pc > maxPages ? maxPages : pc;
-  for (int pi = 0; pi < lim; ++pi)
-  {
-    FPDF_PAGE page = FPDF_LoadPage(d, pi);
-    FPDF_TEXTPAGE tp = page ? FPDFText_LoadPage(page) : nullptr;
-    const int n = page ? FPDFPage_CountObjects(page) : 0;
-    char hb[96];
-    sprintf_s(hb, "== page %d objects %d\n", pi, n);
-    line(hb);
-    for (int i = 0; i < n; ++i)
-    {
-      FPDF_PAGEOBJECT o = FPDFPage_GetObject(page, i);
-      if (!o) continue;
-      const int type = FPDFPageObj_GetType(o);
-      float l = 0, b = 0, r = 0, t = 0;
-      FPDFPageObj_GetBounds(o, &l, &b, &r, &t);
-      float sz = 0;
-      FPDFTextObj_GetFontSize(o, &sz);
-      FS_MATRIX m{};
-      FPDFPageObj_GetMatrix(o, &m);
-      char b1[384];
-      sprintf_s(b1, "  obj %d type %d b=(%.2f %.2f %.2f %.2f) fs=%.2f m=(%.3f,%.3f,%.3f,%.3f)",
-                i, type, l, b, r, t, sz, m.a, m.b, m.c, m.d);
-      line(b1);
-      if (type == FPDF_PAGEOBJ_TEXT)
-      {
-        FPDF_FONT font = FPDFTextObj_GetFont(o);
-        if (font)
-        {
-          size_t fn = FPDFFont_GetBaseFontName(font, nullptr, 0);
-          std::vector<char> nb(fn > 1 ? fn : 1, 0);
-          if (fn > 1)
-          {
-            FPDFFont_GetBaseFontName(font, nb.data(), nb.size());
-            line(" font='" + std::string(nb.data(), fn - 1) + "'");
-          }
-        }
-        if (tp)
-        {
-          unsigned long len = FPDFTextObj_GetText(o, tp, nullptr, 0);
-          if (len > 1)
-          {
-            std::vector<unsigned short> buf(len, 0);
-            if (len <= 4096 && FPDFTextObj_GetText(o, tp, buf.data(), len) >= 2)
-            {
-              std::wstring wt(reinterpret_cast<wchar_t*>(buf.data()), len);
-              while (!wt.empty() && wt.back() == L'\0') wt.pop_back();
-              line(" text=[" + Utf8(wt) + "]");
-            }
-          }
-          else
-          {
-            line(" text=<empty>");
-          }
-        }
-      }
-      line("\n");
-    }
-    if (tp) FPDFText_ClosePage(tp);
-    if (page) FPDF_ClosePage(page);
-  }
-  FPDF_CloseDocument(d);
-  FPDF_DestroyLibrary();
-  if (f) fclose(f);
-  return 0;
-}
-
 static std::vector<std::wstring> GetArgs()
 {
   int n = 0;
@@ -13292,6 +13303,41 @@ static LRESULT CALLBACK ToolbarProc(HWND hw, UINT msg, WPARAM wp, LPARAM lp)
         if (PtInRect(&g.ribbonTabRects[i], pt)) { SwitchRibbonTab(i); break; }
       return 0;
     }
+    case WM_COMMAND:
+    {
+      const int id = LOWORD(wp);
+      const int code = HIWORD(wp);
+      if (g_fontCtlGuard) break;
+      if (id == ID_RIBFONT && code == CBN_SELCHANGE)
+      {
+        const int i = (int)SendMessageW(g_fontCombo, CB_GETCURSEL, 0, 0);
+        if (i >= 0 && i < kFontFamilyCount)
+        {
+          std::string cur;
+          float sz = 0.0f;
+          SelectionTextStyle(cur, sz);
+          ApplyFontChoice(kFontFamilies[i], sz);
+          UpdateFontControls();
+        }
+        return 0;
+      }
+      if (id == ID_RIBSIZE && (code == CBN_SELCHANGE || code == CBN_EDITCHANGE))
+      {
+        wchar_t buf[32] = L"";
+        GetWindowTextW(g_sizeCombo, buf, 32);
+        const float sz = (float)_wtof(buf);
+        if (sz >= 1.0f && sz <= 500.0f)
+        {
+          std::string fam;
+          float cur = 0.0f;
+          SelectionTextStyle(fam, cur);
+          ApplyFontChoice(fam, sz);
+          UpdateFontControls();
+        }
+        return 0;
+      }
+      break;
+    }
   }
   return DefWindowProcW(hw, msg, wp, lp);
 }
@@ -13307,12 +13353,6 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int)
     int pages = (args.size() >= 4) ? _wtoi(args[3].c_str()) : 4;
     bool ok = DemoMode(args[2], pages);
     return ok ? 0 : 1;
-  }
-  if (args.size() >= 2 && args[1] == L"--dump")
-  {
-    if (args.size() < 3) return 2;
-    int pages = (args.size() >= 4) ? _wtoi(args[3].c_str()) : 999;
-    return DumpTextObjs(args[2], pages);
   }
   if (HasArg("--self-test"))
   {
