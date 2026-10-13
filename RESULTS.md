@@ -812,9 +812,11 @@ Self-test: 465 passed, 0 failed.
   run being edited in place (the choice previews live and is applied on commit) or
   a selected text object (restyled immediately). The dialog opens pre-filled with
   the current family and effective size.
-- The **Content** ribbon tab also carries inline **Font family** and **size**
-  controls that follow the selected (or edited) text and apply the change
-  immediately; the family/size dialog is still available for more detail.
+- A floating **font bar** (a family dropdown + a size box) appears over the page
+  whenever a text object is selected or is being edited in place, positioned just
+  above the run's box. Changing it there restyles the selection immediately, or
+  sets the font/size for the live in-place edit; the Font... dialog is still
+  available for keyboard-only or precise entry.
 - In-place text editor now supports text selection: Ctrl+A selects all,
   Shift+arrows / Shift+Home / Shift+End extend the selection, and typing,
   Backspace or Delete replaces it. The selection is drawn as an accent-filled band

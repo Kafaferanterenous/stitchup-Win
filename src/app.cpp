@@ -5821,10 +5821,14 @@ static bool g_fontOk = false;
 static std::string g_fontChosenFam;
 static float g_fontChosenSize = 0.0f;
 
-// Ribbon font controls (Content tab).
-static HWND g_fontCombo = nullptr;   // CB_ family dropdown
+// Floating font bar: a small family dropdown + size box shown over the canvas
+// while editing text or with a text object selected.
+static HWND g_fontCombo = nullptr;   // family dropdown
 static HWND g_sizeCombo = nullptr;   // editable size box
 static bool g_fontCtlGuard = false;  // suppress re-entrant CBN_* handling
+
+static const int kFontSizes[] = {8, 9, 10, 11, 12, 14, 16, 18, 20, 24, 28, 32,
+                                 36, 48, 72};
 
 static int FontFamilyIndex(const std::string& fam)
 {
@@ -5869,10 +5873,61 @@ static bool SelectionTextStyle(std::string& fam, float& size)
   return false;
 }
 
-// Sync the ribbon font/size controls to the current text target. Called whenever
-// the selection or the active tab changes, and after an edit starts or commits.
+// Lazily create the two combos as children of the canvas; they float over the
+// page whenever there is a text target and are hidden otherwise.
+static void EnsureFontBar()
+{
+  if (g_fontCombo || !g.canvas) return;
+  g_fontCombo = CreateWindowExW(0, L"COMBOBOX", L"",
+      WS_CHILD | WS_TABSTOP | CBS_DROPDOWNLIST | WS_VSCROLL, 0, 0, 150, 240,
+      g.canvas, (HMENU)(INT_PTR)ID_RIBFONT, g.inst, nullptr);
+  for (int i = 0; i < kFontFamilyCount; ++i)
+    SendMessageW(g_fontCombo, CB_ADDSTRING, 0, (LPARAM)kFontFamilyLabels[i]);
+  SendMessageW(g_fontCombo, WM_SETFONT, (WPARAM)g.font, TRUE);
+
+  g_sizeCombo = CreateWindowExW(0, L"COMBOBOX", L"",
+      WS_CHILD | WS_TABSTOP | CBS_DROPDOWN | CBS_AUTOHSCROLL, 0, 0, 64, 240,
+      g.canvas, (HMENU)(INT_PTR)ID_RIBSIZE, g.inst, nullptr);
+  for (int z : kFontSizes)
+  {
+    wchar_t sb[16];
+    swprintf_s(sb, L"%d", z);
+    SendMessageW(g_sizeCombo, CB_ADDSTRING, 0, (LPARAM)sb);
+  }
+  SendMessageW(g_sizeCombo, WM_SETFONT, (WPARAM)g.font, TRUE);
+}
+
+// Place the bar just above the run/selection box (below it when the box is at
+// the very top of the view), clamped to the canvas client area.
+static void LayoutFontBar(bool show, int boxL, int boxT, int boxB)
+{
+  if (!g_fontCombo || !g_sizeCombo) return;
+  if (!show)
+  {
+    ShowWindow(g_fontCombo, SW_HIDE);
+    ShowWindow(g_sizeCombo, SW_HIDE);
+    return;
+  }
+  RECT cr{};
+  GetClientRect(g.canvas, &cr);
+  const int bw = 150 + 4 + 64;
+  const int bh = 24;
+  const int maxX = std::max(2, (int)cr.right - bw - 2);
+  const int maxY = std::max(2, (int)cr.bottom - bh - 2);
+  int x = std::max(2, std::min(boxL, maxX));
+  int y = boxT - bh - 6;
+  if (y < 2 || boxT < bh + 8) y = boxB + 6;     // not enough room above: below
+  if (y > maxY) y = maxY;
+  SetWindowPos(g_fontCombo, nullptr, x, y, 150, 240, SWP_NOZORDER);
+  SetWindowPos(g_sizeCombo, nullptr, x + 154, y, 64, 240, SWP_NOZORDER);
+  ShowWindow(g_fontCombo, SW_SHOW);
+  ShowWindow(g_sizeCombo, SW_SHOW);
+}
+
+// Sync the font bar to the current text target and place it over the run.
 static void UpdateFontControls()
 {
+  EnsureFontBar();
   if (!g_fontCombo || !g_sizeCombo) return;
   std::string fam;
   float size = 0.0f;
@@ -5893,6 +5948,33 @@ static void UpdateFontControls()
     SetWindowTextW(g_sizeCombo, L"");
   }
   g_fontCtlGuard = false;
+  if (!has)
+  {
+    LayoutFontBar(false, 0, 0, 0);
+    return;
+  }
+  int boxL = 0, boxT = 0, boxB = 0;
+  if (g.sel.page >= 0 && g.sel.page < g.pageCount)
+  {
+    RECT cr2{};
+    GetClientRect(g.canvas, &cr2);
+    std::vector<RECT> rects;
+    int contentW = 0, contentH = 0;
+    LayoutPages(std::max(1, (int)(cr2.right - cr2.left)), rects, contentW, contentH);
+    const POINT org = PageOrigin((int)std::lround(g.scrollX),
+                                 (int)std::lround(g.scrollY));
+    const double s = g.zoom;
+    const float phh = PageH(g.sel.page);
+    if (g.sel.page < (int)rects.size())
+    {
+      const RECT& pr = rects[g.sel.page];
+      const int px = pr.left + org.x, py = pr.top + org.y;
+      boxL = px + (int)std::lround(g.sel.l * s);
+      boxT = py + (int)std::lround((phh - g.sel.t) * s);
+      boxB = py + (int)std::lround((phh - g.sel.b) * s);
+    }
+  }
+  LayoutFontBar(true, boxL, boxT, boxB);
 }
 
 static LRESULT CALLBACK FontProc(HWND h, UINT m, WPARAM w, LPARAM l)
@@ -6486,6 +6568,7 @@ static LRESULT CALLBACK CanvasProc(HWND hw, UINT msg, WPARAM wp, LPARAM lp)
     }
     case WM_SIZE:
       UpdateScrollbars();
+      UpdateFontControls();
       return 0;
     case WM_VSCROLL:
     case WM_HSCROLL:
@@ -6513,6 +6596,7 @@ static LRESULT CALLBACK CanvasProc(HWND hw, UINT msg, WPARAM wp, LPARAM lp)
       if (bar == SB_VERT) g.scrollY = pos;
       else g.scrollX = pos;
       InvalidateRect(hw, nullptr, FALSE);
+      UpdateFontControls();
       return 0;
     }
     case WM_MOUSEWHEEL:
@@ -6520,6 +6604,41 @@ static LRESULT CALLBACK CanvasProc(HWND hw, UINT msg, WPARAM wp, LPARAM lp)
       // over the page list it scrolls the page list instead.
       HandleWheel(wp, lp);
       return 0;
+    case WM_COMMAND:
+    {
+      const int id = LOWORD(wp);
+      const int code = HIWORD(wp);
+      if (g_fontCtlGuard) break;
+      if (id == ID_RIBFONT && code == CBN_SELCHANGE)
+      {
+        const int i = (int)SendMessageW(g_fontCombo, CB_GETCURSEL, 0, 0);
+        if (i >= 0 && i < kFontFamilyCount)
+        {
+          std::string cur;
+          float sz = 0.0f;
+          SelectionTextStyle(cur, sz);
+          ApplyFontChoice(kFontFamilies[i], sz);
+          UpdateFontControls();
+        }
+        return 0;
+      }
+      if (id == ID_RIBSIZE && (code == CBN_SELCHANGE || code == CBN_EDITCHANGE))
+      {
+        wchar_t buf[32] = L"";
+        GetWindowTextW(g_sizeCombo, buf, 32);
+        const float sz = (float)_wtof(buf);
+        if (sz >= 1.0f && sz <= 500.0f)
+        {
+          std::string fam;
+          float cur = 0.0f;
+          SelectionTextStyle(fam, cur);
+          ApplyFontChoice(fam, sz);
+          UpdateFontControls();
+        }
+        return 0;
+      }
+      break;
+    }
     case WM_SETCURSOR:
     {
       POINT cur;
@@ -7256,28 +7375,6 @@ static void BuildToolbar(HWND)
     AddTip(hw, s.tip);
     g.ribbonBtns.push_back(hw);
   }
-
-  // Font family + size controls for the Content tab.
-  g_fontCombo = CreateWindowExW(0, L"COMBOBOX", L"",
-      WS_CHILD | WS_TABSTOP | CBS_DROPDOWNLIST | WS_VSCROLL, 0, 0, 160, 240,
-      g.toolbar, (HMENU)(INT_PTR)ID_RIBFONT, g.inst, nullptr);
-  for (int i = 0; i < kFontFamilyCount; ++i)
-    SendMessageW(g_fontCombo, CB_ADDSTRING, 0, (LPARAM)kFontFamilyLabels[i]);
-  SendMessageW(g_fontCombo, WM_SETFONT, (WPARAM)g.font, TRUE);
-
-  g_sizeCombo = CreateWindowExW(0, L"COMBOBOX", L"",
-      WS_CHILD | WS_TABSTOP | CBS_DROPDOWN | CBS_AUTOHSCROLL, 0, 0, 70, 240,
-      g.toolbar, (HMENU)(INT_PTR)ID_RIBSIZE, g.inst, nullptr);
-  static const int kSizes[] = {8, 9, 10, 11, 12, 14, 16, 18, 20, 24, 28, 32, 36, 48, 72};
-  for (int z : kSizes)
-  {
-    wchar_t sb[16];
-    swprintf_s(sb, L"%d", z);
-    SendMessageW(g_sizeCombo, CB_ADDSTRING, 0, (LPARAM)sb);
-  }
-  SendMessageW(g_sizeCombo, WM_SETFONT, (WPARAM)g.font, TRUE);
-  ShowWindow(g_fontCombo, SW_HIDE);
-  ShowWindow(g_sizeCombo, SW_HIDE);
 }
 
 static const wchar_t* RibbonTabName(int tab)
@@ -7354,25 +7451,6 @@ static void LayoutRibbon()
     x += w + 6;
   }
   int xEnd = x - 6;
-  if (g_fontCombo && g_sizeCombo)
-  {
-    const bool show = (g.ribbonTab == 3);   // Content tab
-    if (show)
-    {
-      const int cx = x + 12;
-      SetWindowPos(g_fontCombo, nullptr, cx, RIB_BTN_Y + 10, 160, 220, SWP_NOZORDER);
-      SetWindowPos(g_sizeCombo, nullptr, cx + 166, RIB_BTN_Y + 10, 70, 220, SWP_NOZORDER);
-      ShowWindow(g_fontCombo, SW_SHOW);
-      ShowWindow(g_sizeCombo, SW_SHOW);
-      UpdateFontControls();
-      xEnd = cx + 166 + 70 + 6;
-    }
-    else
-    {
-      ShowWindow(g_fontCombo, SW_HIDE);
-      ShowWindow(g_sizeCombo, SW_HIDE);
-    }
-  }
   if (x > gx)
   {
     App::GroupBox gb;
@@ -7402,6 +7480,7 @@ static void ZoomTo(double z, bool)
   g.zoom = std::max(0.1, std::min(8.0, z));
   ClearCanvasCache();
   UpdateScrollbars();
+  UpdateFontControls();
   InvalidateRect(g.canvas, nullptr, TRUE);
   InvalidateRect(g.status, nullptr, TRUE);
 }
@@ -8801,7 +8880,8 @@ static LRESULT CALLBACK FrameProc(HWND hw, UINT msg, WPARAM wp, LPARAM lp)
                                 g.thumbsW, RIB_H, 6, 300, hw, nullptr, g.inst,
                                 nullptr);
       g.canvas = CreateWindowExW(0, L"SKCanvas", nullptr,
-                                 WS_CHILD | WS_VISIBLE | WS_VSCROLL | WS_HSCROLL,
+                                 WS_CHILD | WS_VISIBLE | WS_VSCROLL | WS_HSCROLL |
+                                     WS_CLIPCHILDREN,
                                  g.thumbsW + 6, RIB_H, 600, 300,
                                  hw, nullptr, g.inst, nullptr);
       g.status = CreateWindowExW(0, L"SKStatus", nullptr, WS_CHILD | WS_VISIBLE,
@@ -13302,41 +13382,6 @@ static LRESULT CALLBACK ToolbarProc(HWND hw, UINT msg, WPARAM wp, LPARAM lp)
       for (int i = 0; i < (int)g.ribbonTabRects.size(); ++i)
         if (PtInRect(&g.ribbonTabRects[i], pt)) { SwitchRibbonTab(i); break; }
       return 0;
-    }
-    case WM_COMMAND:
-    {
-      const int id = LOWORD(wp);
-      const int code = HIWORD(wp);
-      if (g_fontCtlGuard) break;
-      if (id == ID_RIBFONT && code == CBN_SELCHANGE)
-      {
-        const int i = (int)SendMessageW(g_fontCombo, CB_GETCURSEL, 0, 0);
-        if (i >= 0 && i < kFontFamilyCount)
-        {
-          std::string cur;
-          float sz = 0.0f;
-          SelectionTextStyle(cur, sz);
-          ApplyFontChoice(kFontFamilies[i], sz);
-          UpdateFontControls();
-        }
-        return 0;
-      }
-      if (id == ID_RIBSIZE && (code == CBN_SELCHANGE || code == CBN_EDITCHANGE))
-      {
-        wchar_t buf[32] = L"";
-        GetWindowTextW(g_sizeCombo, buf, 32);
-        const float sz = (float)_wtof(buf);
-        if (sz >= 1.0f && sz <= 500.0f)
-        {
-          std::string fam;
-          float cur = 0.0f;
-          SelectionTextStyle(fam, cur);
-          ApplyFontChoice(fam, sz);
-          UpdateFontControls();
-        }
-        return 0;
-      }
-      break;
     }
   }
   return DefWindowProcW(hw, msg, wp, lp);
