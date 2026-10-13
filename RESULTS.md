@@ -806,3 +806,29 @@ Self-test: 465 passed, 0 failed (UI and logic added; no new automated checks).
 
 Self-test: 465 passed, 0 failed.
 
+## v0.12.12 - font family/size control, editor selection, extra themes (2026-10-13)
+- New **Font and Size...** dialog (Edit menu, Ctrl+Shift+F, Content-tab ribbon
+  button) picks any of the 14 base-14 families and a point size. It targets the
+  run being edited in place (the choice previews live and is applied on commit) or
+  a selected text object (restyled immediately). The dialog opens pre-filled with
+  the current family and effective size.
+- In-place text editor now supports text selection: Ctrl+A selects all,
+  Shift+arrows / Shift+Home / Shift+End extend the selection, and typing,
+  Backspace or Delete replaces it. The selection is drawn as an accent-filled band
+  with contrasting glyphs so it stays legible on every theme.
+- Object font size is reported as the *effective* (text-matrix-scaled) size, so
+  runs that store a 1pt `Tf` size under a 36x matrix (e.g. `test2.pdf`) now show
+  and default to their true rendered size instead of 1pt.
+- Committing an edited run preserves the original font's weight/slant by mapping
+  embedded/subset names to their base-14 equivalent (Arial -> Helvetica,
+  Arial-Bold -> Helvetica-Bold, Courier*, Times*, Symbol, ZapfDingbats) instead of
+  always collapsing to plain Helvetica.
+- Editing or moving a text object no longer opens a spurious extra "Untitled" tab:
+  the post-save reload now refreshes the current tab in place (keeping undo/redo,
+  zoom and scroll) instead of calling the tab-creating `LoadDoc`.
+- Two new themes: **Darker Navy** and **Blue** (alongside the existing Light Grey,
+  Dark and Dark Blue).
+
+Self-test: 465 passed, 0 failed.
+
+

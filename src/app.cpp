@@ -92,6 +92,7 @@ ID_ANN_LINK,
   ID_OBJ_EDIT,
   ID_OBJ_DELETE,
   ID_OBJ_RECOLOR,
+  ID_OBJ_FONT,
   ID_SIDEBAR,
   ID_SPREAD,
   ID_NEW_TAB,
@@ -112,6 +113,8 @@ ID_ANN_LINK,
   ID_THEME_LIGHT = ID_THEME_FIRST,
   ID_THEME_DARK,
   ID_THEME_DARKBLUE,
+  ID_THEME_NAVY,
+  ID_THEME_BLUE,
   ID_THEME_PASTEL,
   ID_THEME_HC_DARK,
   ID_THEME_HC_LIGHT,
@@ -287,9 +290,11 @@ struct App
     float l = 0, b = 0, r = 0, t = 0;
     bool textEditing = false;
     std::wstring textEditBuf;
-    int textEditPos = 0;
-    int textEditSel = 0;
+    int textEditPos = 0;   // caret (character offset into textEditBuf)
+    int textEditSel = 0;   // selection anchor (== textEditPos when none)
     float fontSize = 12.0f;
+    std::string editFont;      // font family chosen for the live edit (base-14)
+    float editFontSize = 0.0f; // requested commit size (0 = keep the run's size)
   } sel;
   // Text search (Ctrl+F). findHits holds every match in page order; findCur
   // indexes it (-1 = no active search). findQuery is kept so F3 / Shift+F3 can
@@ -355,6 +360,8 @@ enum ThemeId
   THEME_LIGHT = 0,
   THEME_DARK,
   THEME_DARKBLUE,
+  THEME_NAVY,
+  THEME_BLUE,
   THEME_PASTEL,
   THEME_HC_DARK,
   THEME_HC_LIGHT,
@@ -537,6 +544,76 @@ static const UiTheme kThemes[THEME_COUNT] = {
     /* capStyle   */ CAP_SYS,
     /* dark       */ true
     },
+    // ---- Darker navy: near-black blue with bright accents ---
+    {
+    /* ribbonBg   */ RGB(0x0C, 0x14, 0x24),
+    /* card       */ RGB(0x12, 0x1C, 0x30),
+    /* cardBorder */ RGB(0x22, 0x31, 0x4C),
+    /* accent     */ RGB(0x5A, 0xA5, 0xFF),
+    /* accentDeep */ RGB(0x2E, 0x6F, 0xC4),
+    /* text       */ RGB(0xDD, 0xE8, 0xF7),
+    /* textDim    */ RGB(0x93, 0xA9, 0xC8),
+    /* btnHover   */ RGB(0x18, 0x27, 0x41),
+    /* btnDown    */ RGB(0x1F, 0x33, 0x55),
+    /* btnBorder  */ RGB(0x22, 0x31, 0x4C),
+    /* thumbBg    */ RGB(0x0E, 0x18, 0x2A),
+    /* canvasBg   */ RGB(0x07, 0x0E, 0x1B),
+    /* pageFrame  */ RGB(0x4A, 0x63, 0x88),
+    /* split      */ RGB(0x1A, 0x28, 0x42),
+    /* statusBg   */ RGB(0x04, 0x09, 0x12),
+    /* statusTxt  */ RGB(0xC0, 0xD2, 0xEC),
+    /* treeBg     */ RGB(0x0E, 0x18, 0x2A),
+    /* treeTxt    */ RGB(0xD6, 0xE3, 0xF5),
+    /* emptyHint  */ RGB(0x74, 0x8C, 0xAC),
+    /* capTop     */ RGB(0x14, 0x23, 0x3E),
+    /* capBottom  */ RGB(0x0C, 0x14, 0x24),
+    /* capText    */ RGB(0xDD, 0xE8, 0xF7),
+    /* capLine    */ RGB(0x2A, 0x3E, 0x60),
+    /* capBtn     */ RGB(0x22, 0x31, 0x4C),
+    /* capBtnHover */ RGB(0x31, 0x47, 0x6A),
+    /* capGlyph   */ RGB(0xD2, 0xE0, 0xF2),
+    /* macRed     */ RGB(0xFF, 0x5F, 0x57),
+    /* macYellow  */ RGB(0xFE, 0xBC, 0x2E),
+    /* macGreen   */ RGB(0x28, 0xC8, 0x40),
+    /* macGlyph   */ RGB(0x00, 0x00, 0x00),
+    /* capStyle   */ CAP_SYS,
+    /* dark       */ true
+    },
+    // ---- Blue: soft blue-tinted light surfaces with a strong blue accent ---
+    {
+    /* ribbonBg   */ RGB(0xE8, 0xF0, 0xFB),
+    /* card       */ RGB(0xFF, 0xFF, 0xFF),
+    /* cardBorder */ RGB(0xC9, 0xDA, 0xF0),
+    /* accent     */ RGB(0x15, 0x6A, 0xD6),
+    /* accentDeep */ RGB(0x0D, 0x4C, 0xA6),
+    /* text       */ RGB(0x12, 0x22, 0x38),
+    /* textDim    */ RGB(0x46, 0x5A, 0x76),
+    /* btnHover   */ RGB(0xD6, 0xE6, 0xFA),
+    /* btnDown    */ RGB(0xBC, 0xD4, 0xF4),
+    /* btnBorder  */ RGB(0xC2, 0xD3, 0xE9),
+    /* thumbBg    */ RGB(0xDD, 0xE8, 0xF7),
+    /* canvasBg   */ RGB(0xC4, 0xD3, 0xE6),
+    /* pageFrame  */ RGB(0x74, 0x8C, 0xAC),
+    /* split      */ RGB(0xC9, 0xDA, 0xF0),
+    /* statusBg   */ RGB(0x10, 0x2A, 0x4E),
+    /* statusTxt  */ RGB(0xE6, 0xF0, 0xFC),
+    /* treeBg     */ RGB(0xFF, 0xFF, 0xFF),
+    /* treeTxt    */ RGB(0x12, 0x22, 0x38),
+    /* emptyHint  */ RGB(0x5A, 0x70, 0x8E),
+    /* capTop     */ RGB(0xF4, 0xF9, 0xFF),
+    /* capBottom  */ RGB(0xE3, 0xEE, 0xFC),
+    /* capText    */ RGB(0x12, 0x22, 0x38),
+    /* capLine    */ RGB(0xCB, 0xDC, 0xF0),
+    /* capBtn     */ RGB(0xEE, 0xF5, 0xFE),
+    /* capBtnHover */ RGB(0xDD, 0xEA, 0xFB),
+    /* capGlyph   */ RGB(0x2A, 0x40, 0x5C),
+    /* macRed     */ RGB(0xFF, 0x5F, 0x57),
+    /* macYellow  */ RGB(0xFE, 0xBC, 0x2E),
+    /* macGreen   */ RGB(0x28, 0xC8, 0x40),
+    /* macGlyph   */ RGB(0x00, 0x00, 0x00),
+    /* capStyle   */ CAP_SYS,
+    /* dark       */ false
+    },
     // ---- Pastel: soft lavender, light surfaces ---
     {
     /* ribbonBg   */ RGB(0xF6, 0xF1, 0xFA),
@@ -715,7 +792,7 @@ static const UiTheme kThemes[THEME_COUNT] = {
 };
 
 static const wchar_t* kThemeNames[THEME_COUNT] = {
-    L"Light Grey", L"Dark", L"Dark Blue", L"Pastel",
+    L"Light Grey", L"Dark", L"Dark Blue", L"Darker Navy", L"Blue", L"Pastel",
     L"High Contrast (Dark)", L"High Contrast (Light)",
     L"Windows XP", L"macOS"};
 
@@ -2855,6 +2932,34 @@ static void SaveAs()
   }
 }
 
+// Reload the current document from disk after an in-place save. Unlike
+// LoadDoc() this keeps the same tab (no extra tab is created) and preserves the
+// undo/redo history, zoom and scroll position.
+static void ReloadCurrentInPlace(const std::wstring& target)
+{
+  FPDF_DOCUMENT d = LoadWithPassword(target, nullptr);
+  if (!d) return;
+  if (g.doc) FPDF_CloseDocument(g.doc);
+  g.doc = d;
+  g.path = target;
+  size_t p = target.find_last_of(L"\\/");
+  g.name = (p == std::wstring::npos) ? target : target.substr(p + 1);
+  g.pageCount = FPDF_GetPageCount(d);
+  if (g.selected >= g.pageCount) g.selected = g.pageCount > 0 ? g.pageCount - 1 : 0;
+  if (g_curTab >= 0 && g_curTab < (int)g_tabs.size())
+  {
+    TabDoc& t = g_tabs[g_curTab];
+    t.doc = d;
+    t.path = g.path;
+    t.name = g.name;
+    t.pageCount = g.pageCount;
+    t.selected = g.selected;
+    t.dirty = false;
+  }
+  ClearCanvasCache();
+  ClearThumbCache();
+}
+
 static void SaveInPlace()
 {
   if (g.path.empty()) { SaveAs(); return; }
@@ -2876,13 +2981,17 @@ static void SaveInPlace()
     std::wstring msg = L"Save failed: could not finalize the file.\n"
                        L"A recovery copy was kept at:\n" + tmp;
     MessageBoxW(g.frame, msg.c_str(), L"Stitchup", MB_OK | MB_ICONWARNING);
-    LoadDoc(target);  // restore the pre-save file (unsaved edits are lost)
+    ReloadCurrentInPlace(target);  // restore the pre-save file
     return;
   }
   g.dirty = false;
-  LoadDoc(target);
+  ReloadCurrentInPlace(target);
   g.marks.clear();   // they are in the file now, and the reload reads them back
   g.bmDirty = true;
+  RefreshState();
+  RefreshTabBar();
+  if (g.canvas) InvalidateRect(g.canvas, nullptr, TRUE);
+  if (g.thumbs) InvalidateRect(g.thumbs, nullptr, TRUE);
   InvalidateRect(g.status, nullptr, TRUE);
 }
 
@@ -5103,6 +5212,15 @@ static std::vector<PageObject> ListPageObjects(int pi)
         }
       }
       FPDFTextObj_GetFontSize(o, &po.fontSize);
+      // The Tf size ignores the text matrix, so a run can report 1pt while the
+      // matrix scales it up to e.g. 36pt. Use the effective (rendered) size so
+      // the selection box and the in-place caret are drawn at the right scale.
+      FS_MATRIX om{};
+      if (FPDFPageObj_GetMatrix(o, &om))
+      {
+        float sc = std::sqrt(om.a * om.a + om.b * om.b);
+        if (sc > 0.0f) po.fontSize *= sc;
+      }
       FPDF_FONT font = FPDFTextObj_GetFont(o);
       if (font)
       {
@@ -5417,7 +5535,54 @@ static bool PromptEditText(const std::wstring& initial, std::wstring& out)
   return g_tedOk;
 }
 
-static void EditTextObject(int pi, int index, const std::wstring& newText)
+// Maps an arbitrary PDF font name to the closest of the base-14 families that a
+// newly created text object can actually use. Arial is metrically compatible
+// with Helvetica, so the common Word/Canva "ArialMT"/"Arial-BoldMT" names keep
+// their weight and slant instead of collapsing to plain Helvetica.
+static std::string MapToBase14(const std::string& name)
+{
+  std::string s;
+  s.reserve(name.size());
+  for (char c : name) s += (char)std::tolower((unsigned char)c);
+  auto has = [&](const char* k) { return s.find(k) != std::string::npos; };
+  const bool bold = has("bold") || has("black") || has("heavy") || has("semibold");
+  const bool ital = has("italic") || has("oblique");
+  if (has("courier") || has("mono"))
+  {
+    if (bold && ital) return "Courier-BoldOblique";
+    if (bold) return "Courier-Bold";
+    if (ital) return "Courier-Oblique";
+    return "Courier";
+  }
+  if (has("times") || has("serif") || has("georgia") || has("garamond"))
+  {
+    if (bold && ital) return "Times-BoldItalic";
+    if (bold) return "Times-Bold";
+    if (ital) return "Times-Italic";
+    return "Times-Roman";
+  }
+  if (has("symbol")) return "Symbol";
+  if (has("zapf") || has("dingbat")) return "ZapfDingbats";
+  if (bold && ital) return "Helvetica-BoldOblique";
+  if (bold) return "Helvetica-Bold";
+  if (ital) return "Helvetica-Oblique";
+  return "Helvetica";
+}
+
+// The Windows face used to preview a base-14 family on the canvas overlay.
+static const wchar_t* FontFaceForFamily(const std::string& fam)
+{
+  const std::string b = MapToBase14(fam);
+  if (b.rfind("Courier", 0) == 0) return L"Courier New";
+  if (b.rfind("Times", 0) == 0) return L"Times New Roman";
+  if (b == "Symbol") return L"Symbol";
+  if (b == "ZapfDingbats") return L"ZapfDingbats";
+  return L"Arial";
+}
+
+static void EditTextObject(int pi, int index, const std::wstring& newText,
+                           const std::string& reqFont = std::string(),
+                           float reqSize = 0.0f)
 {
   if (pi < 0 || pi >= g.pageCount) return;
   FPDF_PAGE page = FPDF_LoadPage(g.doc, pi);
@@ -5425,8 +5590,21 @@ static void EditTextObject(int pi, int index, const std::wstring& newText)
   if (!oldObj || !page) { if (page) FPDF_ClosePage(page); return; }
   float ol = 0, ob = 0, or_ = 0, ot = 0;
   FPDFPageObj_GetBounds(oldObj, &ol, &ob, &or_, &ot);
-  float size = 12.0f;
-  if (FPDFTextObj_GetFontSize(oldObj, &size) == 0) size = 12.0f;
+  float rawSize = 12.0f;
+  if (FPDFTextObj_GetFontSize(oldObj, &rawSize) == 0) rawSize = 12.0f;
+
+  // The object's own matrix carries the rendered scale. GetFontSize returns the
+  // raw Tf size and ignores it, so a run drawn as size 1 under a 36x matrix must
+  // be recreated at 1*36 to keep the same visual size; scaling by the bounds
+  // ratio instead changed the glyphs because it mixed in font metrics. Recover
+  // the scale (and rotation) from the matrix, falling back to the raw size.
+  FS_MATRIX om{};
+  om.a = 1; om.d = 1;
+  if (!FPDFPageObj_GetMatrix(oldObj, &om))
+  { om.a = 1; om.b = 0; om.c = 0; om.d = 1; om.e = 0; om.f = 0; }
+  float s = std::sqrt(om.a * om.a + om.b * om.b);
+  if (!(s > 0.0001f) || s > 1000.0f || !std::isfinite(s)) s = 1.0f;
+  const float effSize = (reqSize > 0.0f) ? reqSize : rawSize * s;
 
   // Build the replacement first so a failure never destroys the original.
   const PageObject foundHere = [&]() {
@@ -5435,8 +5613,11 @@ static void EditTextObject(int pi, int index, const std::wstring& newText)
       if (po.index == index) return po;
     return PageObject{};
   }();
-  std::string fn = foundHere.fontName.empty() ? "Helvetica" : foundHere.fontName;
-  FPDF_PAGEOBJECT no = FPDFPageObj_NewTextObj(g.doc, fn.c_str(), size);
+  std::string fn = reqFont.empty()
+                       ? MapToBase14(foundHere.fontName.empty() ? "Helvetica"
+                                                               : foundHere.fontName)
+                       : reqFont;
+  FPDF_PAGEOBJECT no = FPDFPageObj_NewTextObj(g.doc, fn.c_str(), effSize);
   if (!no)
   {
     // Only the base-14 fonts are available to a newly created text object;
@@ -5444,38 +5625,36 @@ static void EditTextObject(int pi, int index, const std::wstring& newText)
     // would silently drop the edit, so fall back to a built-in family and use
     // its (slightly different) metrics for the new run.
     fn = "Helvetica";
-    no = FPDFPageObj_NewTextObj(g.doc, fn.c_str(), size);
+    no = FPDFPageObj_NewTextObj(g.doc, fn.c_str(), effSize);
     if (!no)
     {
       fn = "Times-Roman";
-      no = FPDFPageObj_NewTextObj(g.doc, fn.c_str(), size);
+      no = FPDFPageObj_NewTextObj(g.doc, fn.c_str(), effSize);
     }
     if (!no)
     {
       fn = "Courier";
-      no = FPDFPageObj_NewTextObj(g.doc, fn.c_str(), size);
+      no = FPDFPageObj_NewTextObj(g.doc, fn.c_str(), effSize);
     }
   }
   if (!no) { FPDF_ClosePage(page); return; }
   const unsigned short* u16t = reinterpret_cast<const unsigned short*>(newText.c_str());
   if (!FPDFText_SetText(no, u16t)) { FPDFPageObj_Destroy(no); FPDF_ClosePage(page); return; }
-  FS_MATRIX m{};
-  float nl = 0, nb = 0, nr = 0, nt = 0;
-  FPDFPageObj_GetBounds(no, &nl, &nb, &nr, &nt);
-  // The raw font size from GetFontSize ignores the text matrix, so a run scaled
-  // by Tm (e.g. size 24 drawn with a 0.5x matrix) would be committed at the raw
-  // size and double up. Scale uniformly so the new run's height matches the
-  // original's rendered height, then anchor bottom-left.
-  const float oh = ot - ob;
-  const float nh = nt - nb;
-  float k = (nh > 0.001f) ? (oh / nh) : 1.0f;
-  if (k <= 0.001f || k > 50.0f) k = 1.0f;
-  m.a = k; m.d = k;
-  FPDFPageObj_SetMatrix(no, &m);
-  FPDFPageObj_GetBounds(no, &nl, &nb, &nr, &nt);
-  m.e = ol - nl;   // anchor bottom-left of the original run
-  m.f = ob - nb;
-  FPDFPageObj_SetMatrix(no, &m);
+  FS_MATRIX nm{};
+  if (reqFont.empty() && reqSize <= 0.0f)
+  {
+    // Same run: keep the original orientation and position with a unit-scale
+    // matrix, so the rendered size equals the original (effSize * om/s).
+    nm.a = om.a / s; nm.b = om.b / s;
+    nm.c = om.c / s; nm.d = om.d / s;
+    nm.e = om.e;     nm.f = om.f;
+  }
+  else
+  {
+    // Explicit font/size change: upright, anchored at the original bottom-left.
+    nm.a = 1; nm.d = 1; nm.e = ol; nm.f = ob;
+  }
+  FPDFPageObj_SetMatrix(no, &nm);
   BeginEdit();   // everything above can still fail without touching the doc
   FPDFPage_RemoveObject(page, oldObj);
   FPDFPage_InsertObjectAtIndex(page, no, index);
@@ -5534,8 +5713,10 @@ static void EditText()
         g.sel.textEditing = true;
         g.sel.textEditBuf = po.text;
         g.sel.textEditPos = (int)g.sel.textEditBuf.size();
-        g.sel.textEditSel = 0;
+        g.sel.textEditSel = g.sel.textEditPos;
         g.sel.fontSize = po.fontSize;
+        g.sel.editFont.clear();
+        g.sel.editFontSize = 0.0f;
         ClearCanvasCache();
         if (g.canvas) InvalidateRect(g.canvas, nullptr, TRUE);
         if (g.status) InvalidateRect(g.status, nullptr, TRUE);
@@ -5552,9 +5733,10 @@ static void TextEditCommit()
 {
   if (!g.sel.textEditing) return;
   g.sel.textEditing = false;
-  EditTextObject(g.sel.page, g.sel.index, g.sel.textEditBuf);
+  EditTextObject(g.sel.page, g.sel.index, g.sel.textEditBuf, g.sel.editFont, g.sel.editFontSize);
   g.sel.textEditBuf.clear();
   g.sel.textEditPos = 0;
+  g.sel.textEditSel = 0;
   ClearCanvasCache();
   if (g.canvas) InvalidateRect(g.canvas, nullptr, TRUE);
   if (g.status) InvalidateRect(g.status, nullptr, TRUE);
@@ -5566,9 +5748,269 @@ static void TextEditCancel()
   g.sel.textEditing = false;
   g.sel.textEditBuf.clear();
   g.sel.textEditPos = 0;
+  g.sel.textEditSel = 0;
   ClearCanvasCache();
   if (g.canvas) InvalidateRect(g.canvas, nullptr, TRUE);
   if (g.status) InvalidateRect(g.status, nullptr, TRUE);
+}
+
+// The selection anchor is g.sel.textEditSel (== g.sel.textEditPos means no
+// selection); the caret is g.sel.textEditPos. TextEditSelRange returns the two
+// clamped in order.
+static void TextEditSelRange(int& a, int& b)
+{
+  const int n = (int)g.sel.textEditBuf.size();
+  a = g.sel.textEditPos; b = g.sel.textEditSel;
+  if (a < 0) a = 0; if (a > n) a = n;
+  if (b < 0) b = 0; if (b > n) b = n;
+  if (a > b) { const int t = a; a = b; b = t; }
+}
+
+static bool TextEditHasSel()
+{
+  int a, b;
+  TextEditSelRange(a, b);
+  return a != b;
+}
+
+static void TextEditDeleteSel()
+{
+  int a, b;
+  TextEditSelRange(a, b);
+  if (a == b) return;
+  g.sel.textEditBuf.erase(a, b - a);
+  g.sel.textEditPos = a;
+  g.sel.textEditSel = a;
+}
+
+// ---------------------------------------------------------------------------
+// Font dialog (SKFontWnd): choose a base-14 family and a point size for the
+// selected text object, or for the run currently being edited in place.
+// ---------------------------------------------------------------------------
+static const char* kFontFamilies[] = {
+    "Helvetica",         "Helvetica-Bold",     "Helvetica-Oblique",
+    "Helvetica-BoldOblique", "Times-Roman",    "Times-Bold",
+    "Times-Italic",      "Times-BoldItalic",   "Courier",
+    "Courier-Bold",      "Courier-Oblique",    "Courier-BoldOblique",
+    "Symbol",            "ZapfDingbats",
+};
+static const wchar_t* kFontFamilyLabels[] = {
+    L"Helvetica",          L"Helvetica Bold",      L"Helvetica Oblique",
+    L"Helvetica Bold Obl.", L"Times Roman",         L"Times Bold",
+    L"Times Italic",       L"Times Bold Italic",    L"Courier",
+    L"Courier Bold",       L"Courier Oblique",      L"Courier Bold Obl.",
+    L"Symbol",             L"ZapfDingbats",
+};
+static const int kFontFamilyCount =
+    (int)(sizeof(kFontFamilies) / sizeof(kFontFamilies[0]));
+
+static HWND g_fontList = nullptr;
+static HWND g_fontSizeEdit = nullptr;
+static std::string g_fontInitFam;
+static float g_fontInitSize = 0.0f;
+static bool g_fontOk = false;
+static std::string g_fontChosenFam;
+static float g_fontChosenSize = 0.0f;
+
+static int FontFamilyIndex(const std::string& fam)
+{
+  const std::string b = MapToBase14(fam);
+  for (int i = 0; i < kFontFamilyCount; ++i)
+    if (b == kFontFamilies[i]) return i;
+  return 0;
+}
+
+// The current text target's family and (effective) size, if there is one.
+static bool SelectionTextStyle(std::string& fam, float& size)
+{
+  fam.clear();
+  size = 0.0f;
+  if (g.sel.textEditing)
+  {
+    fam = g.sel.editFont;
+    size = g.sel.editFontSize;
+    if (fam.empty() || size <= 0.0f)
+    {
+      for (const PageObject& po : ListPageObjects(g.sel.page))
+        if (po.index == g.sel.index)
+        {
+          if (fam.empty()) fam = MapToBase14(po.fontName);
+          if (size <= 0.0f) size = po.fontSize > 0 ? po.fontSize : 12.0f;
+          break;
+        }
+    }
+    return true;
+  }
+  if (g.sel.active && g.sel.type == FPDF_PAGEOBJ_TEXT)
+  {
+    for (const PageObject& po : ListPageObjects(g.sel.page))
+      if (po.index == g.sel.index)
+      {
+        // po.fontSize is already the effective (matrix-scaled) size.
+        fam = MapToBase14(po.fontName);
+        size = po.fontSize > 0 ? po.fontSize : 12.0f;
+        return true;
+      }
+  }
+  return false;
+}
+
+static LRESULT CALLBACK FontProc(HWND h, UINT m, WPARAM w, LPARAM l)
+{
+  switch (m)
+  {
+    case WM_CREATE:
+    {
+      CreateWindowExW(0, L"STATIC", L"Font family:", WS_CHILD | WS_VISIBLE,
+                      16, 14, 160, 16, h, nullptr, g.inst, nullptr);
+      g_fontList = CreateWindowExW(WS_EX_CLIENTEDGE, L"LISTBOX", L"",
+                                   WS_CHILD | WS_VISIBLE | WS_TABSTOP |
+                                       WS_VSCROLL | LBS_NOTIFY,
+                                   16, 34, 200, 190, h, (HMENU)50, g.inst,
+                                   nullptr);
+      for (int i = 0; i < kFontFamilyCount; ++i)
+        SendMessageW(g_fontList, LB_ADDSTRING, 0,
+                     (LPARAM)kFontFamilyLabels[i]);
+      SendMessageW(g_fontList, LB_SETCURSEL, FontFamilyIndex(g_fontInitFam), 0);
+
+      CreateWindowExW(0, L"STATIC", L"Size (pt):", WS_CHILD | WS_VISIBLE,
+                      236, 14, 96, 16, h, nullptr, g.inst, nullptr);
+      g_fontSizeEdit = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
+                                       WS_CHILD | WS_VISIBLE | WS_TABSTOP |
+                                           ES_AUTOHSCROLL,
+                                       236, 34, 96, 24, h, (HMENU)51, g.inst,
+                                       nullptr);
+      {
+        wchar_t buf[32];
+        if (g_fontInitSize > 0.0f)
+          swprintf_s(buf, L"%.1f", g_fontInitSize);
+        else
+          swprintf_s(buf, L"12");
+        SetWindowTextW(g_fontSizeEdit, buf);
+      }
+      CreateWindowExW(0, L"BUTTON", L"Ok",
+                      WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_DEFPUSHBUTTON,
+                      236, 70, 96, 28, h, (HMENU)1, g.inst, nullptr);
+      CreateWindowExW(0, L"BUTTON", L"Cancel", WS_CHILD | WS_VISIBLE | WS_TABSTOP,
+                      236, 104, 96, 28, h, (HMENU)2, g.inst, nullptr);
+      SetFocus(g_fontList);
+      return 0;
+    }
+    case WM_COMMAND:
+    {
+      const int id = LOWORD(w);
+      const int code = HIWORD(w);
+      if (id == 1 || (id == 50 && code == LBN_DBLCLK))
+      {
+        const int sel = (int)SendMessageW(g_fontList, LB_GETCURSEL, 0, 0);
+        if (sel >= 0 && sel < kFontFamilyCount) g_fontChosenFam = kFontFamilies[sel];
+        wchar_t buf[32] = L"";
+        if (g_fontSizeEdit) GetWindowTextW(g_fontSizeEdit, buf, 32);
+        float sz = (float)_wtof(buf);
+        if (!(sz >= 1.0f && sz <= 500.0f)) sz = 12.0f;
+        g_fontChosenSize = sz;
+        g_fontOk = true;
+        DestroyWindow(h);
+        return 0;
+      }
+      if (id == 2) { g_fontOk = false; DestroyWindow(h); return 0; }
+      break;
+    }
+    case WM_CLOSE:
+      g_fontOk = false;
+      DestroyWindow(h);
+      return 0;
+  }
+  return DefWindowProcW(h, m, w, l);
+}
+
+static void ApplyFontChoice(const std::string& fam, float size);
+
+static void ShowFontDialog()
+{
+  std::string fam;
+  float size = 0.0f;
+  if (!SelectionTextStyle(fam, size))
+  {
+    MessageBoxW(g.frame,
+                L"Select a text object (or start editing one) to change its font.",
+                L"Stitchup", MB_OK | MB_ICONINFORMATION);
+    return;
+  }
+  g_fontInitFam = fam;
+  g_fontInitSize = size;
+  g_fontChosenFam.clear();
+  g_fontChosenSize = 0.0f;
+  g_fontOk = false;
+
+  const wchar_t cls[] = L"SKFontWnd";
+  static bool reg = false;
+  if (!reg)
+  {
+    WNDCLASSEXW wc{};
+    wc.cbSize = sizeof(wc);
+    wc.lpfnWndProc = FontProc;
+    wc.hInstance = g.inst;
+    wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+    wc.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
+    wc.lpszClassName = cls;
+    RegisterClassExW(&wc);
+    reg = true;
+  }
+  HWND hw = CreateWindowExW(WS_EX_DLGMODALFRAME, cls, L"Font",
+                            WS_POPUP | WS_CAPTION | WS_SYSMENU,
+                            CW_USEDEFAULT, CW_USEDEFAULT, 360, 270, g.frame,
+                            nullptr, g.inst, nullptr);
+  if (!hw) return;
+  RECT fr, rc;
+  GetWindowRect(g.frame, &fr);
+  GetWindowRect(hw, &rc);
+  SetWindowPos(hw, nullptr,
+               fr.left + (fr.right - fr.left - (rc.right - rc.left)) / 2,
+               fr.top + (fr.bottom - fr.top - (rc.bottom - rc.top)) / 2, 0, 0,
+               SWP_NOSIZE | SWP_NOZORDER);
+  EnableWindow(g.frame, FALSE);
+  ShowWindow(hw, SW_SHOW);
+  UpdateWindow(hw);
+  MSG msg;
+  while (IsWindow(hw))
+  {
+    const BOOL r = GetMessageW(&msg, nullptr, 0, 0);
+    if (r <= 0) break;
+    if (!IsDialogMessageW(hw, &msg)) { TranslateMessage(&msg); DispatchMessageW(&msg); }
+  }
+  EnableWindow(g.frame, TRUE);
+  SetActiveWindow(g.frame);
+  SetFocus(g.frame);
+  if (g_fontOk) ApplyFontChoice(g_fontChosenFam, g_fontChosenSize);
+}
+
+// ---------------------------------------------------------------------------
+// The rest of the font path lives after EditTextObject so it can reuse it.
+// ---------------------------------------------------------------------------
+
+// Rebuilds the targeted text run with the chosen family and/or size. While
+// editing in place it just records the choice (applied on commit); otherwise it
+// restyles the selected object straight away.
+static void ApplyFontChoice(const std::string& fam, float size)
+{
+  if (fam.empty() && !(size > 0.0f)) return;
+  if (g.sel.textEditing)
+  {
+    if (!fam.empty()) g.sel.editFont = fam;
+    if (size > 0.0f) g.sel.editFontSize = size;
+    ClearCanvasCache();
+    if (g.canvas) InvalidateRect(g.canvas, nullptr, TRUE);
+    if (g.status) InvalidateRect(g.status, nullptr, TRUE);
+    return;
+  }
+  if (g.sel.active && g.sel.type == FPDF_PAGEOBJ_TEXT)
+  {
+    std::wstring cur;
+    for (const PageObject& po : ListPageObjects(g.sel.page))
+      if (po.index == g.sel.index) { cur = po.text; break; }
+    EditTextObject(g.sel.page, g.sel.index, cur, fam, size);
+  }
 }
 
 static void CanvasPaint(HDC dc, int cw, int ch)
@@ -5770,12 +6212,18 @@ static void CanvasPaint(HDC dc, int cw, int ch)
           int boxB = y + (int)std::lround((phh - sbx) * s);
           // The box height is the run's true on-screen glyph size; the raw PDF
           // font size can be magnified by the text matrix, so deriving the font
-          // from it renders the overlay text larger than the original.
+          // from it renders the overlay text larger than the original. An
+          // explicit size chosen in the Font dialog previews at that size.
           int fh = boxB - boxT;
+          if (g.sel.editFontSize > 0.0f)
+            fh = (int)std::lround(g.sel.editFontSize * s);
           if (fh < 6) fh = 6;
+          const wchar_t* face = g.sel.editFont.empty()
+                                    ? L"Segoe UI"
+                                    : FontFaceForFamily(g.sel.editFont);
           HFONT fnt = CreateFontW(-fh, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
                                   DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
-                                  CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI");
+                                  CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, face);
           HFONT of = (HFONT)SelectObject(dc, fnt);
           int oldBk = SetBkMode(dc, TRANSPARENT);
           COLORREF oldTc = SetTextColor(dc, th.text);
@@ -5798,6 +6246,35 @@ static void CanvasPaint(HDC dc, int cw, int ch)
           FillRect(dc, &paperRect, paper);
           DeleteObject(paper);
 
+          // Highlight the selected characters (textEditSel anchor .. caret).
+          int selA = 0, selB = 0;
+          TextEditSelRange(selA, selB);
+          int selX0 = -1, selX1 = -1;
+          COLORREF selTxt = th.text;
+          if (selA != selB)
+          {
+            const std::wstring preA = g.sel.textEditBuf.substr(0, selA);
+            const std::wstring preB = g.sel.textEditBuf.substr(0, selB);
+            SIZE sA{}, sB{};
+            GetTextExtentPoint32W(dc, preA.c_str(), (int)preA.size(), &sA);
+            GetTextExtentPoint32W(dc, preB.c_str(), (int)preB.size(), &sB);
+            selX0 = boxL + 1 + sA.cx;
+            selX1 = boxL + 1 + sB.cx;
+            HBRUSH selBrush = CreateSolidBrush(th.accent);
+            RECT hr{selX0, boxT + 1, selX1, boxB - 1};
+            FillRect(dc, &hr, selBrush);
+            DeleteObject(selBrush);
+            auto lin = [](double v) {
+              v /= 255.0;
+              return v <= 0.04045 ? v / 12.92
+                                  : std::pow((v + 0.055) / 1.055, 2.4);
+            };
+            const double al = 0.2126 * lin((double)(th.accent & 0xFF)) +
+                              0.7152 * lin((double)((th.accent >> 8) & 0xFF)) +
+                              0.0722 * lin((double)((th.accent >> 16) & 0xFF));
+            selTxt = (al > 0.4) ? RGB(0, 0, 0) : RGB(255, 255, 255);
+          }
+
           HPEN dash = CreatePen(PS_DASH, 1, th.accent);
           HPEN oldp = (HPEN)SelectObject(dc, dash);
           HBRUSH oldbr = (HBRUSH)SelectObject(dc, GetStockObject(NULL_BRUSH));
@@ -5809,6 +6286,16 @@ static void CanvasPaint(HDC dc, int cw, int ch)
           RECT tr{boxL + 1, boxT, boxEnd + 200, boxB};
           DrawTextW(dc, g.sel.textEditBuf.c_str(), -1, &tr,
                     DT_LEFT | DT_BOTTOM | DT_SINGLELINE | DT_NOPREFIX);
+          // Redraw the selected glyphs in a contrasting colour over the accent
+          // fill so the selection stays legible in every theme.
+          if (selX0 >= 0 && selX1 > selX0)
+          {
+            const std::wstring selTxtW = g.sel.textEditBuf.substr(selA, selB - selA);
+            SetTextColor(dc, selTxt);
+            RECT selRect{selX0, boxT, selX1 + 200, boxB};
+            DrawTextW(dc, selTxtW.c_str(), -1, &selRect,
+                      DT_LEFT | DT_BOTTOM | DT_SINGLELINE | DT_NOPREFIX);
+          }
           SetTextColor(dc, oldTc);
           SetBkMode(dc, oldBk);
 
@@ -6163,8 +6650,10 @@ static LRESULT CALLBACK CanvasProc(HWND hw, UINT msg, WPARAM wp, LPARAM lp)
         g.sel.textEditing = true;
         g.sel.textEditBuf = best.text;
         g.sel.textEditPos = (int)g.sel.textEditBuf.length();
-        g.sel.textEditSel = 0;
+        g.sel.textEditSel = g.sel.textEditPos;
         g.sel.fontSize = best.fontSize;
+        g.sel.editFont.clear();
+        g.sel.editFontSize = 0.0f;
         SetFocus(g.frame);   // keystrokes for the live buffer go to FrameProc
         RefreshSelBounds();
         ClearCanvasCache();
@@ -6698,6 +7187,8 @@ static void BuildToolbar(HWND)
      L"Remove the selected content object (Ctrl+Del)"},
     {ID_OBJ_RECOLOR,  L"Recolor",    66, 3, 0xE790, false,
      L"Change the fill or stroke colour of the selected object"},
+    {ID_OBJ_FONT,     L"Font",       62, 3, 0xE8D2, false,
+     L"Change the font family and size of the selected text"},
     {ID_WATERMARK,    L"Watermark",  76, 6, 0xE7C3, false,
      L"Stamp a diagonal text watermark across every page"},
     {ID_SAVEENC,      L"Encrypt",    66, 6, 0xE72E, false,
@@ -7483,7 +7974,7 @@ static bool IsHandledCommand(int id)
     case ID_IMPORT: case ID_MERGE_APPEND: case ID_COMBINE_NEW: case ID_COMPRESS_PDF: case ID_EDIT_TEXT: case ID_EXPORT_TEXT: case ID_EXPORT_CSV: case ID_WATERMARK:
     case ID_EXIT: case ID_ROTR: case ID_ROTL: case ID_DELETE: case ID_ADD:
     case ID_TOOL_SELECT: case ID_OBJ_EDIT: case ID_OBJ_DELETE:
-    case ID_OBJ_RECOLOR: case ID_ZOOM_IN: case ID_ZOOM_OUT: case ID_ZOOM100:
+    case ID_OBJ_RECOLOR: case ID_OBJ_FONT: case ID_ZOOM_IN: case ID_ZOOM_OUT: case ID_ZOOM100:
     case ID_FITW: case ID_FITP: case ID_PREV: case ID_NEXT: case ID_SPREAD:
     case ID_SIDEBAR: case ID_NEW_TAB: case ID_CLOSE_TAB: case ID_PREV_TAB:
     case ID_NEXT_TAB: case ID_FIND: case ID_FIND_NEXT: case ID_FIND_PREV:
@@ -7544,6 +8035,7 @@ static void DoCommand(int id)
     case ID_OBJ_EDIT:   EditSelectedText(); break;
     case ID_OBJ_DELETE: DeleteSelectedObject(); break;
     case ID_OBJ_RECOLOR: ApplyRecolorSelected(); break;
+    case ID_OBJ_FONT: ShowFontDialog(); break;
     case ID_ZOOM_OUT: ZoomTo(g.zoom / 1.25, false); break;
     case ID_ZOOM_IN:  ZoomTo(g.zoom * 1.25, false); break;
     case ID_ZOOM100:  ZoomTo(1.0, false); break;
@@ -7598,6 +8090,8 @@ static void DoCommand(int id)
     case ID_THEME_FIRST:
     case ID_THEME_DARK:
     case ID_THEME_DARKBLUE:
+    case ID_THEME_NAVY:
+    case ID_THEME_BLUE:
     case ID_THEME_PASTEL:
     case ID_THEME_HC_DARK:
     case ID_THEME_HC_LIGHT:
@@ -7667,6 +8161,7 @@ static HMENU BuildMenu()
   addItem(edit, ID_OBJ_EDIT, L"Edit Text...\tDouble-click");
   addItem(edit, ID_OBJ_DELETE, L"Delete Selected Object\tCtrl+Del");
   addItem(edit, ID_OBJ_RECOLOR, L"Recolor Selected Object...");
+  addItem(edit, ID_OBJ_FONT, L"Font and Size...\tCtrl+Shift+F");
   AppendMenuW(bar, MF_POPUP, (UINT_PTR)edit, L"&Edit");
 
   HMENU pages = CreatePopupMenu();
@@ -8299,33 +8794,61 @@ static LRESULT CALLBACK FrameProc(HWND hw, UINT msg, WPARAM wp, LPARAM lp)
       int vk = (int)wp;
       if (g.sel.textEditing)
       {
+        const int n = (int)g.sel.textEditBuf.size();
+        if (ctrl && vk == 'A')   // select all of the edited text
+        {
+          g.sel.textEditSel = 0;
+          g.sel.textEditPos = n;
+          if (g.canvas) InvalidateRect(g.canvas, nullptr, FALSE);
+          return 0;
+        }
         switch (vk)
         {
           case VK_ESCAPE: TextEditCancel(); return 0;
           case VK_RETURN: TextEditCommit(); return 0;
           case VK_BACK:
-            if (g.sel.textEditPos > 0 && !g.sel.textEditBuf.empty())
+            if (TextEditHasSel())
+              TextEditDeleteSel();
+            else if (g.sel.textEditPos > 0)
             {
               g.sel.textEditBuf.erase(g.sel.textEditPos - 1, 1);
               g.sel.textEditPos--;
+              g.sel.textEditSel = g.sel.textEditPos;
             }
             if (g.canvas) InvalidateRect(g.canvas, nullptr, FALSE);
             return 0;
           case VK_DELETE:
-            if (g.sel.textEditPos < (int)g.sel.textEditBuf.size())
+            if (TextEditHasSel())
+              TextEditDeleteSel();
+            else if (g.sel.textEditPos < n)
+            {
               g.sel.textEditBuf.erase(g.sel.textEditPos, 1);
+              g.sel.textEditSel = g.sel.textEditPos;
+            }
             if (g.canvas) InvalidateRect(g.canvas, nullptr, FALSE);
             return 0;
           case VK_LEFT:
-            if (g.sel.textEditPos > 0) g.sel.textEditPos--;
+            if (!shift && TextEditHasSel()) { int a, b; TextEditSelRange(a, b); g.sel.textEditPos = a; }
+            else if (g.sel.textEditPos > 0) g.sel.textEditPos--;
+            if (!shift) g.sel.textEditSel = g.sel.textEditPos;
             if (g.canvas) InvalidateRect(g.canvas, nullptr, FALSE);
             return 0;
           case VK_RIGHT:
-            if (g.sel.textEditPos < (int)g.sel.textEditBuf.size()) g.sel.textEditPos++;
+            if (!shift && TextEditHasSel()) { int a, b; TextEditSelRange(a, b); g.sel.textEditPos = b; }
+            else if (g.sel.textEditPos < n) g.sel.textEditPos++;
+            if (!shift) g.sel.textEditSel = g.sel.textEditPos;
             if (g.canvas) InvalidateRect(g.canvas, nullptr, FALSE);
             return 0;
-          case VK_HOME: g.sel.textEditPos = 0; if (g.canvas) InvalidateRect(g.canvas, nullptr, FALSE); return 0;
-          case VK_END: g.sel.textEditPos = (int)g.sel.textEditBuf.size(); if (g.canvas) InvalidateRect(g.canvas, nullptr, FALSE); return 0;
+          case VK_HOME:
+            g.sel.textEditPos = 0;
+            if (!shift) g.sel.textEditSel = g.sel.textEditPos;
+            if (g.canvas) InvalidateRect(g.canvas, nullptr, FALSE);
+            return 0;
+          case VK_END:
+            g.sel.textEditPos = n;
+            if (!shift) g.sel.textEditSel = g.sel.textEditPos;
+            if (g.canvas) InvalidateRect(g.canvas, nullptr, FALSE);
+            return 0;
           default: break;
         }
         if (!ctrl) return 0;
@@ -8335,7 +8858,7 @@ static LRESULT CALLBACK FrameProc(HWND hw, UINT msg, WPARAM wp, LPARAM lp)
         switch (vk)
         {
           case 'N': DoCommand(ID_NEW); return 0;
-          case 'F': DoCommand(ID_FIND); return 0;
+          case 'F': DoCommand(shift ? ID_OBJ_FONT : ID_FIND); return 0;
           case 'O': DoCommand(ID_OPEN); return 0;
           case 'T': DoCommand(ID_NEW_TAB); return 0;
           case VK_TAB: DoCommand(shift ? ID_PREV_TAB : ID_NEXT_TAB); return 0;
@@ -8377,8 +8900,10 @@ static LRESULT CALLBACK FrameProc(HWND hw, UINT msg, WPARAM wp, LPARAM lp)
         const wchar_t ch = (wchar_t)wp;
         if (ch >= 0x20 || ch == L'\t')
         {
+          TextEditDeleteSel();   // typing replaces the selection
           g.sel.textEditBuf.insert(g.sel.textEditPos, 1, ch);
           g.sel.textEditPos++;
+          g.sel.textEditSel = g.sel.textEditPos;
           if (g.canvas) InvalidateRect(g.canvas, nullptr, FALSE);
         }
         return 0;
@@ -12431,6 +12956,91 @@ static bool DemoMode(const std::wstring& outPath, int pages)
   return true;
 }
 
+// Diagnostic: dump every content object's type, bounds, font size, matrix and
+// extracted text for the given file (used to debug text editing of real PDFs).
+static int DumpTextObjs(const std::wstring& inPath, int maxPages)
+{
+  FPDF_InitLibrary();
+  FPDF_DOCUMENT d = FPDF_LoadDocument(Utf8(inPath).c_str(), nullptr);
+  if (!d) { FPDF_DestroyLibrary(); return 1; }
+  FILE* f = nullptr;
+  _wfopen_s(&f, L"dump_result.txt", L"wb");
+  auto line = [&](const std::string& s)
+  {
+    if (f) fwrite(s.data(), 1, s.size(), f);
+    printf("%s", s.c_str());
+  };
+  const int pc = FPDF_GetPageCount(d);
+  char head[64];
+  sprintf_s(head, "pages %d\n", pc);
+  line(head);
+  const int lim = maxPages > 0 && pc > maxPages ? maxPages : pc;
+  for (int pi = 0; pi < lim; ++pi)
+  {
+    FPDF_PAGE page = FPDF_LoadPage(d, pi);
+    FPDF_TEXTPAGE tp = page ? FPDFText_LoadPage(page) : nullptr;
+    const int n = page ? FPDFPage_CountObjects(page) : 0;
+    char hb[96];
+    sprintf_s(hb, "== page %d objects %d\n", pi, n);
+    line(hb);
+    for (int i = 0; i < n; ++i)
+    {
+      FPDF_PAGEOBJECT o = FPDFPage_GetObject(page, i);
+      if (!o) continue;
+      const int type = FPDFPageObj_GetType(o);
+      float l = 0, b = 0, r = 0, t = 0;
+      FPDFPageObj_GetBounds(o, &l, &b, &r, &t);
+      float sz = 0;
+      FPDFTextObj_GetFontSize(o, &sz);
+      FS_MATRIX m{};
+      FPDFPageObj_GetMatrix(o, &m);
+      char b1[384];
+      sprintf_s(b1, "  obj %d type %d b=(%.2f %.2f %.2f %.2f) fs=%.2f m=(%.3f,%.3f,%.3f,%.3f)",
+                i, type, l, b, r, t, sz, m.a, m.b, m.c, m.d);
+      line(b1);
+      if (type == FPDF_PAGEOBJ_TEXT)
+      {
+        FPDF_FONT font = FPDFTextObj_GetFont(o);
+        if (font)
+        {
+          size_t fn = FPDFFont_GetBaseFontName(font, nullptr, 0);
+          std::vector<char> nb(fn > 1 ? fn : 1, 0);
+          if (fn > 1)
+          {
+            FPDFFont_GetBaseFontName(font, nb.data(), nb.size());
+            line(" font='" + std::string(nb.data(), fn - 1) + "'");
+          }
+        }
+        if (tp)
+        {
+          unsigned long len = FPDFTextObj_GetText(o, tp, nullptr, 0);
+          if (len > 1)
+          {
+            std::vector<unsigned short> buf(len, 0);
+            if (len <= 4096 && FPDFTextObj_GetText(o, tp, buf.data(), len) >= 2)
+            {
+              std::wstring wt(reinterpret_cast<wchar_t*>(buf.data()), len);
+              while (!wt.empty() && wt.back() == L'\0') wt.pop_back();
+              line(" text=[" + Utf8(wt) + "]");
+            }
+          }
+          else
+          {
+            line(" text=<empty>");
+          }
+        }
+      }
+      line("\n");
+    }
+    if (tp) FPDFText_ClosePage(tp);
+    if (page) FPDF_ClosePage(page);
+  }
+  FPDF_CloseDocument(d);
+  FPDF_DestroyLibrary();
+  if (f) fclose(f);
+  return 0;
+}
+
 static std::vector<std::wstring> GetArgs()
 {
   int n = 0;
@@ -12697,6 +13307,12 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int)
     int pages = (args.size() >= 4) ? _wtoi(args[3].c_str()) : 4;
     bool ok = DemoMode(args[2], pages);
     return ok ? 0 : 1;
+  }
+  if (args.size() >= 2 && args[1] == L"--dump")
+  {
+    if (args.size() < 3) return 2;
+    int pages = (args.size() >= 4) ? _wtoi(args[3].c_str()) : 999;
+    return DumpTextObjs(args[2], pages);
   }
   if (HasArg("--self-test"))
   {
