@@ -127,7 +127,28 @@ ID_ANN_LINK,
   // Ribbon font controls (Content tab): a family dropdown and a size box.
   ID_RIBFONT,
   ID_RIBSIZE,
+  // Content tab: colour pickers (foreground/background) and the shape menu.
+  ID_FG_COLOR,
+  ID_BG_COLOR,
+  ID_SHAPE_MENU,
+  // Security tab: stamp menu.
+  ID_STAMP_MENU,
 };
+
+// Vector shape kinds offered by the Content tab's Shapes menu. Kept separate
+// from the command ids above because they are internal (armed, then drawn).
+enum ShapeKind
+{
+  SHAPE_NONE = 0,
+  SHAPE_RECT, SHAPE_ROUNDRECT, SHAPE_OVAL, SHAPE_TRIANGLE, SHAPE_DIAMOND,
+  SHAPE_STAR, SHAPE_HEXAGON, SHAPE_ARROW, SHAPE_LINE, SHAPE_CROSS,
+  SHAPE_KIND_COUNT
+};
+
+// Human names for the shape kinds, in SHAPE_* order (SHAPE_NONE excluded).
+static const wchar_t* kShapeNames[] = {
+    L"Rectangle", L"Rounded Rectangle", L"Oval", L"Triangle", L"Diamond",
+    L"Star",      L"Hexagon",           L"Arrow", L"Line",    L"Cross"};
 
 enum
 {
@@ -183,6 +204,8 @@ struct Btn
   int rtab = -1;         // owning ribbon tab index, -1 = not a ribbon btn
   wchar_t icon = 0;      // Segoe MDL2 Assets codepoint, 0 = no icon
   bool mirror = false;   // draw the glyph flipped (counter-clockwise arrows)
+  bool swatch = false;   // paint a colour chip instead of an icon glyph
+  COLORREF swColor = 0;  // chip colour when swatch is set
 };
 
 struct PageCache
@@ -321,6 +344,14 @@ struct App
   int annPage = -1;          // page under the drag start
   POINT annStart{};
   POINT annCur{};
+
+  // Vector shape insertion (Content tab). shapeTool is armed from the Shapes
+  // menu; the next left-click drops a default-size shape and a left-drag draws
+  // one at the dragged size. fgColor paints strokes/text, bgColor fills shapes.
+  ShapeKind shapeTool = SHAPE_NONE;
+  COLORREF fgColor = RGB(0x1F, 0x6F, 0xEB);
+  COLORREF bgColor = RGB(0xDC, 0xEB, 0xFF);
+  std::wstring stampText;    // stamp caption armed from the Security tab menu
 };
 
 // A document open in its own tab. The live App fields above always mirror the
@@ -354,6 +385,11 @@ static void CancelEdit();
 static void UndoEdit();
 static void RedoEdit();
 static void UpdateFontControls();
+static void LayoutRibbon();
+static void SwitchRibbonTab(int tab);
+static void SyncColorControls();
+static void UpdateColorSwatches();
+static void InsertShapeCurrent(ShapeKind kind, FS_RECTF rc);
 
 // ---------------------------------------------------------------------------
 // Themes - named colour schemes (light / dark / dark blue / pastel /
@@ -4592,7 +4628,7 @@ static LRESULT CALLBACK StatusProc(HWND hw, UINT msg, WPARAM wp, LPARAM lp)
   {
     case WM_ERASEBKGND:
       return 1;
-case WM_PAINT:
+    case WM_PAINT:
     {
       // A non-zero wParam is a device context to paint into - the WM_PAINT
       // convention used by the self-test to render the bar into a bitmap
@@ -4613,6 +4649,10 @@ DeleteObject(bg);
                                          : g.name + (g.dirty ? L"  *" : L"");
       if (g.annTool)
         left += L"      Draw the annotation on the page \x2013 Esc to cancel";
+      if (g.shapeTool != SHAPE_NONE)
+        left += std::wstring(L"      Click to drop a ") +
+                kShapeNames[g.shapeTool - 1] +
+                L" or drag to size it \x2013 Esc to cancel";
       if (!g.findHits.empty() && g.findCur >= 0)
         left += L"      Match " + std::to_wstring(g.findCur + 1) + L" of " +
                 std::to_wstring((int)g.findHits.size()) + L" for \"" +
@@ -5764,6 +5804,7 @@ static void EditText()
         g.sel.editFont.clear();
         g.sel.editFontSize = 0.0f;
         ClearCanvasCache();
+        SwitchRibbonTab(ID_TAB_CONTENT - ID_TAB_FIRST);
         UpdateFontControls();
         if (g.canvas) InvalidateRect(g.canvas, nullptr, TRUE);
         if (g.status) InvalidateRect(g.status, nullptr, TRUE);
@@ -5966,14 +6007,14 @@ static LRESULT CALLBACK SizeEditSub(HWND h, UINT m, WPARAM w, LPARAM l,
   return DefSubclassProc(h, m, w, l);
 }
 
-// Lazily create the two combos as children of the canvas; they float over the
-// page whenever there is a text target and are hidden otherwise.
+// Lazily create the two font controls as children of the ribbon, shown in the
+// Content tab (see LayoutRibbon) and greyed out when there is no text target.
 static void EnsureFontBar()
 {
-  if (g_fontCombo || !g.canvas) return;
+  if (g_fontCombo || !g.toolbar) return;
   g_fontCombo = CreateWindowExW(0, L"COMBOBOX", L"",
-      WS_CHILD | WS_TABSTOP | CBS_DROPDOWNLIST | WS_VSCROLL, 0, 0, 150, 240,
-      g.canvas, (HMENU)(INT_PTR)ID_RIBFONT, g.inst, nullptr);
+      WS_CHILD | WS_TABSTOP | CBS_DROPDOWNLIST | WS_VSCROLL, 0, 0, 170, 200,
+      g.toolbar, (HMENU)(INT_PTR)ID_RIBFONT, g.inst, nullptr);
   for (int i = 0; i < kFontFamilyCount; ++i)
     SendMessageW(g_fontCombo, CB_ADDSTRING, 0, (LPARAM)kFontFamilyLabels[i]);
   SendMessageW(g_fontCombo, WM_SETFONT, (WPARAM)g.font, TRUE);
@@ -5981,8 +6022,8 @@ static void EnsureFontBar()
   // Pick-only list (no editable box): typing a size used to append to the old
   // value ("16" + "10" -> "1610"), which never applied. A list can't misfire.
   g_sizeCombo = CreateWindowExW(0, L"COMBOBOX", L"",
-      WS_CHILD | WS_TABSTOP | CBS_DROPDOWNLIST | WS_VSCROLL, 0, 0, 64, 240,
-      g.canvas, (HMENU)(INT_PTR)ID_RIBSIZE, g.inst, nullptr);
+      WS_CHILD | WS_TABSTOP | CBS_DROPDOWNLIST | WS_VSCROLL, 0, 0, 70, 200,
+      g.toolbar, (HMENU)(INT_PTR)ID_RIBSIZE, g.inst, nullptr);
   for (int z : kFontSizes)
   {
     wchar_t sb[16];
@@ -5990,36 +6031,13 @@ static void EnsureFontBar()
     SendMessageW(g_sizeCombo, CB_ADDSTRING, 0, (LPARAM)sb);
   }
   SendMessageW(g_sizeCombo, WM_SETFONT, (WPARAM)g.font, TRUE);
+
+  LayoutRibbon();  // position the new controls in the Content tab's row
 }
 
-// Place the bar just above the run/selection box (below it when the box is at
-// the very top of the view), clamped to the canvas client area.
-static void LayoutFontBar(bool show, int boxL, int boxT, int boxB)
-{
-  if (!g_fontCombo || !g_sizeCombo) return;
-  if (!show)
-  {
-    ShowWindow(g_fontCombo, SW_HIDE);
-    ShowWindow(g_sizeCombo, SW_HIDE);
-    return;
-  }
-  RECT cr{};
-  GetClientRect(g.canvas, &cr);
-  const int bw = 150 + 4 + 64;
-  const int bh = 24;
-  const int maxX = std::max(2, (int)cr.right - bw - 2);
-  const int maxY = std::max(2, (int)cr.bottom - bh - 2);
-  int x = std::max(2, std::min(boxL, maxX));
-  int y = boxT - bh - 6;
-  if (y < 2 || boxT < bh + 8) y = boxB + 6;     // not enough room above: below
-  if (y > maxY) y = maxY;
-  SetWindowPos(g_fontCombo, nullptr, x, y, 150, 240, SWP_NOZORDER);
-  SetWindowPos(g_sizeCombo, nullptr, x + 154, y, 64, 240, SWP_NOZORDER);
-  ShowWindow(g_fontCombo, SW_SHOW);
-  ShowWindow(g_sizeCombo, SW_SHOW);
-}
-
-// Sync the font bar to the current text target and place it over the run.
+// Sync the Content tab's font controls to the current text target. The controls
+// live in the ribbon (see LayoutRibbon) and are disabled when there is no text
+// object selected or being edited.
 static void UpdateFontControls()
 {
   EnsureFontBar();
@@ -6074,33 +6092,6 @@ static void UpdateFontControls()
     SendMessageW(g_sizeCombo, CB_SETCURSEL, (WPARAM)-1, 0);
   }
   g_fontCtlGuard = false;
-  if (!has)
-  {
-    LayoutFontBar(false, 0, 0, 0);
-    return;
-  }
-  int boxL = 0, boxT = 0, boxB = 0;
-  if (g.sel.page >= 0 && g.sel.page < g.pageCount)
-  {
-    RECT cr2{};
-    GetClientRect(g.canvas, &cr2);
-    std::vector<RECT> rects;
-    int contentW = 0, contentH = 0;
-    LayoutPages(std::max(1, (int)(cr2.right - cr2.left)), rects, contentW, contentH);
-    const POINT org = PageOrigin((int)std::lround(g.scrollX),
-                                 (int)std::lround(g.scrollY));
-    const double s = g.zoom;
-    const float phh = PageH(g.sel.page);
-    if (g.sel.page < (int)rects.size())
-    {
-      const RECT& pr = rects[g.sel.page];
-      const int px = pr.left + org.x, py = pr.top + org.y;
-      boxL = px + (int)std::lround(g.sel.l * s);
-      boxT = py + (int)std::lround((phh - g.sel.t) * s);
-      boxB = py + (int)std::lround((phh - g.sel.b) * s);
-    }
-  }
-  LayoutFontBar(true, boxL, boxT, boxB);
 }
 
 static LRESULT CALLBACK FontProc(HWND h, UINT m, WPARAM w, LPARAM l)
@@ -6752,45 +6743,12 @@ static LRESULT CALLBACK CanvasProc(HWND hw, UINT msg, WPARAM wp, LPARAM lp)
       // over the page list it scrolls the page list instead.
       HandleWheel(wp, lp);
       return 0;
-    case WM_COMMAND:
-    {
-      const int id = LOWORD(wp);
-      const int code = HIWORD(wp);
-      if (g_fontCtlGuard) break;
-      if (id == ID_RIBFONT && code == CBN_SELCHANGE)
-      {
-        const int i = (int)SendMessageW(g_fontCombo, CB_GETCURSEL, 0, 0);
-        if (i >= 0 && i < kFontFamilyCount)
-        {
-          std::string cur;
-          float sz = 0.0f;
-          SelectionTextStyle(cur, sz);
-          ApplyFontChoice(kFontFamilies[i], sz);
-          UpdateFontControls();
-        }
-        return 0;
-      }
-      if (id == ID_RIBSIZE && (code == CBN_SELCHANGE || code == CBN_EDITCHANGE))
-      {
-        wchar_t buf[32] = L"";
-        GetWindowTextW(g_sizeCombo, buf, 32);
-        const float sz = (float)_wtof(buf);
-        if (sz >= 1.0f && sz <= 500.0f)
-        {
-          // Empty family = keep the run's current font; only the size changes.
-          ApplyFontChoice(std::string(), sz);
-          UpdateFontControls();
-        }
-        return 0;
-      }
-      break;
-    }
     case WM_SETCURSOR:
     {
       POINT cur;
       GetCursorPos(&cur);
       ScreenToClient(hw, &cur);
-      if (g.annTool)
+      if (g.annTool || g.shapeTool != SHAPE_NONE)
       {
         SetCursor(LoadCursorW(nullptr, IDC_CROSS));
         return TRUE;
@@ -6868,9 +6826,10 @@ static LRESULT CALLBACK CanvasProc(HWND hw, UINT msg, WPARAM wp, LPARAM lp)
       HitInfo hi;
       if (HitPage(pt, hi))
       {
-        if (g.annTool)
+        if (g.annTool || g.shapeTool != SHAPE_NONE)
         {
-          // Begin a drag-to-draw annotation on the page under the pointer.
+          // Begin a drag-to-draw annotation / shape on the page under the
+          // pointer. A click of a few pixels falls back to a default size.
           g.annDrag = true;
           g.annPage = hi.page;
           g.annStart = pt;
@@ -6917,6 +6876,7 @@ static LRESULT CALLBACK CanvasProc(HWND hw, UINT msg, WPARAM wp, LPARAM lp)
           InvalidateRect(g.thumbs, nullptr, FALSE);
           InvalidateRect(g.status, nullptr, TRUE);
           UpdateFontControls();
+          SyncColorControls();
           return 0;
         }
         FPDF_PAGE page = FPDF_LoadPage(g.doc, hi.page);
@@ -6973,7 +6933,11 @@ static LRESULT CALLBACK CanvasProc(HWND hw, UINT msg, WPARAM wp, LPARAM lp)
         g.sel.editFont.clear();
         g.sel.editFontSize = 0.0f;
         SetFocus(g.frame);   // keystrokes for the live buffer go to FrameProc
+        // Surface the font controls: switch to the Content tab, which hosts the
+        // family/size dropdowns, and enable them for this run.
+        SwitchRibbonTab(ID_TAB_CONTENT - ID_TAB_FIRST);
         UpdateFontControls();
+        SyncColorControls();
         RefreshSelBounds();
         ClearCanvasCache();
         InvalidateRect(hw, nullptr, TRUE);
@@ -7022,9 +6986,35 @@ static LRESULT CALLBACK CanvasProc(HWND hw, UINT msg, WPARAM wp, LPARAM lp)
       {
         ReleaseCapture();
         g.annCur = POINT{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
-        const int kind = g.annTool;
         const int page = g.annPage;
         const POINT a = g.annStart, b = g.annCur;
+        if (g.shapeTool != SHAPE_NONE)
+        {
+          const ShapeKind sk = g.shapeTool;
+          g.shapeTool = SHAPE_NONE;
+          g.annDrag = false;
+          g.annPage = -1;
+          if (page >= 0 && page < g.pageCount) g.selected = page;
+          const int sx = std::abs(b.x - a.x), sy = std::abs(b.y - a.y);
+          FS_RECTF rc{};
+          const bool drawn = (sx >= 4 || sy >= 4) && DragToPageRect(page, a, b, rc);
+          if (!drawn && DragToPageRect(page, a, a, rc))
+          {
+            // A click drops a default-size square centred on the point, clamped
+            // to the page.
+            const float pw = PageW(page), ph = PageH(page);
+            const float sz = std::max(24.0f, std::min(120.0f, std::min(pw, ph) * 0.5f));
+            const float oL = std::max(0.0f, std::min(rc.left - sz * 0.5f, pw - sz));
+            const float oB = std::max(0.0f, std::min(rc.top - sz * 0.5f, ph - sz));
+            rc = FS_RECTF{oL, oB + sz, oL + sz, oB};
+          }
+          InsertShapeCurrent(sk, rc);
+          SetCursor(LoadCursorW(nullptr, IDC_ARROW));
+          InvalidateRect(hw, nullptr, TRUE);
+          InvalidateRect(g.status, nullptr, TRUE);
+          return 0;
+        }
+        const int kind = g.annTool;
         g.annTool = 0;
         g.annDrag = false;
         g.annPage = -1;
@@ -7298,7 +7288,32 @@ static void BtnPaint(HWND hw)
     const COLORREF fg = b->down ? th.accent : th.text;
     const COLORREF back = active ? (b->down ? th.btnDown : th.btnHover) : th.card;
     HFONT wf = (HFONT)SelectObject(dc, g.font);
-    if (b->icon)
+    if (b->swatch)
+    {
+      const int iconPx = MulDiv(20, g.dpi, 72);
+      const int top = rc.top + MulDiv(1, g.dpi, 72);
+      RECT lbox{rc.left, top + iconPx, rc.right, rc.bottom};
+      RECT chip{rc.left, top, rc.right, top + iconPx};
+      const int side = std::min(iconPx - MulDiv(2, g.dpi, 72),
+                                (int)(chip.right - chip.left) - MulDiv(8, g.dpi, 72));
+      RECT sw{(chip.left + chip.right - side) / 2,
+              (chip.top + chip.bottom - side) / 2,
+              (chip.left + chip.right + side) / 2,
+              (chip.top + chip.bottom + side) / 2};
+      HBRUSH fillb = CreateSolidBrush(b->swColor);
+      HPEN penb = CreatePen(PS_SOLID, 1, th.cardBorder);
+      HBRUSH wb = (HBRUSH)SelectObject(dc, fillb);
+      HPEN wp = (HPEN)SelectObject(dc, penb);
+      Rectangle(dc, sw.left, sw.top, sw.right, sw.bottom);
+      SelectObject(dc, wb);
+      SelectObject(dc, wp);
+      DeleteObject(fillb);
+      DeleteObject(penb);
+      SetTextColor(dc, fg);
+      DrawTextW(dc, b->label.c_str(), -1, &lbox,
+                DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+    }
+    else if (b->icon)
     {
       int iconPx = MulDiv(20, g.dpi, 72);
       int top = rc.top + MulDiv(1, g.dpi, 72);
@@ -7508,8 +7523,16 @@ static void BuildToolbar(HWND)
      L"Change the fill or stroke colour of the selected object"},
     {ID_OBJ_FONT,     L"Font",       62, 3, 0xE8D2, false,
      L"Change the font family and size of the selected text"},
+    {ID_FG_COLOR,     L"Fore",       54, 3, 0,      false,
+     L"Foreground colour: text colour and shape outline"},
+    {ID_BG_COLOR,     L"Back",       54, 3, 0,      false,
+     L"Background colour: fill used by new shapes"},
+    {ID_SHAPE_MENU,   L"Shapes",     66, 3, 0xE8EC, false,
+     L"Insert a vector shape; click for a default size or drag to size it"},
     {ID_WATERMARK,    L"Watermark",  76, 6, 0xE7C3, false,
      L"Stamp a diagonal text watermark across every page"},
+    {ID_STAMP_MENU,   L"Stamp...",   70, 6, 0xE735, false,
+     L"Place a common status stamp (Draft, Approved, Sold, Paid, ...)"},
     {ID_SAVEENC,      L"Encrypt",    66, 6, 0xE72E, false,
      L"Save a copy protected by a 128-bit RC4 password"},
   };
@@ -7517,10 +7540,15 @@ static void BuildToolbar(HWND)
   {
     HWND hw = MakeBtn(s.id, s.label, 0, 0, s.w, RIB_BTN_H);
     Btn* b = reinterpret_cast<Btn*>(GetWindowLongPtrW(hw, GWLP_USERDATA));
-    if (b) { b->rtab = s.tab; b->icon = s.icon; b->mirror = s.mirror; }
+    if (b)
+    {
+      b->rtab = s.tab; b->icon = s.icon; b->mirror = s.mirror;
+      if (s.id == ID_FG_COLOR || s.id == ID_BG_COLOR) b->swatch = true;
+    }
     AddTip(hw, s.tip);
     g.ribbonBtns.push_back(hw);
   }
+  UpdateColorSwatches();  // paint the foreground/background chips
 }
 
 static const wchar_t* RibbonTabName(int tab)
@@ -7595,6 +7623,24 @@ static void LayoutRibbon()
     SetWindowPos(hw, nullptr, x, RIB_BTN_Y, w, RIB_BTN_H, SWP_NOZORDER);
     ShowWindow(hw, SW_SHOW);
     x += w + 6;
+  }
+  // The Content tab hosts the font controls inline in its button row.
+  if (g_fontCombo && g_sizeCombo)
+  {
+    if (g.ribbonTab == ID_TAB_CONTENT - ID_TAB_FIRST)
+    {
+      const int cy = RIB_BTN_Y + (RIB_BTN_H - 26) / 2;
+      SetWindowPos(g_fontCombo, nullptr, x, cy, 170, 200, SWP_NOZORDER);
+      SetWindowPos(g_sizeCombo, nullptr, x + 176, cy, 70, 200, SWP_NOZORDER);
+      ShowWindow(g_fontCombo, SW_SHOW);
+      ShowWindow(g_sizeCombo, SW_SHOW);
+      x += 176 + 70 + 6;
+    }
+    else
+    {
+      ShowWindow(g_fontCombo, SW_HIDE);
+      ShowWindow(g_sizeCombo, SW_HIDE);
+    }
   }
   int xEnd = x - 6;
   if (x > gx)
@@ -7930,8 +7976,13 @@ static bool InsertAnnot(FPDF_DOCUMENT doc, int pageIdx, int kind,
       FS_RECTF rc = rect ? *rect
                          : FS_RECTF{pw * 0.55f, ph * 0.18f, pw * 0.55f + 150.0f, ph * 0.18f - 52.0f};
       ok = FPDFAnnot_SetRect(a, &rc) != 0;
-      SetAnnotText(a, "Name", L"Draft");
-      SetAnnotText(a, "Contents", L"DRAFT");
+      // Use the caption chosen from the Security tab's stamp menu, defaulting to
+      // "Draft" when the stamp was placed by name alone.
+      std::wstring cap = g.stampText.empty() ? std::wstring(L"Draft") : g.stampText;
+      SetAnnotText(a, "Name", cap.c_str());
+      for (wchar_t& ch : cap)
+        if (ch >= L'a' && ch <= L'z') ch = (wchar_t)(ch - 32);
+      SetAnnotText(a, "Contents", cap.c_str());
     }
   }
   else if (kind == ID_ANN_LINK)
@@ -8024,9 +8075,10 @@ static void SetAnnotTool(int kind)
 
 static void CancelAnnotTool()
 {
-  if (!g.annTool && !g.annDrag) return;
+  if (!g.annTool && !g.annDrag && g.shapeTool == SHAPE_NONE) return;
   if (g.annDrag) ReleaseCapture();
   g.annTool = 0;
+  g.shapeTool = SHAPE_NONE;
   g.annDrag = false;
   g.annPage = -1;
   if (g.canvas)
@@ -8075,6 +8127,292 @@ static bool DragToPageRect(int page, POINT a, POINT b, FS_RECTF& out)
   const double bo = std::min(y1, y2), to = std::max(y1, y2);
   out = FS_RECTF{(float)l, (float)to, (float)r, (float)bo};
   return true;
+}
+
+// --- Vector shape insertion (Content tab) ----------------------------------
+
+// Paints the swatch buttons (foreground / background) with the current colours.
+static void UpdateColorSwatches()
+{
+  for (HWND hw : g.ribbonBtns)
+  {
+    Btn* b = reinterpret_cast<Btn*>(GetWindowLongPtrW(hw, GWLP_USERDATA));
+    if (!b || !b->swatch) continue;
+    const LONG_PTR id = GetWindowLongPtrW(hw, GWLP_ID);
+    if (id == ID_FG_COLOR) b->swColor = g.fgColor;
+    else if (id == ID_BG_COLOR) b->swColor = g.bgColor;
+    InvalidateRect(hw, nullptr, TRUE);
+  }
+}
+
+// Mirrors the selected text/vector object's colours back into the swatches so
+// the user can see what is already there before picking a new colour.
+static void SyncColorControls()
+{
+  if (g.sel.active && g.sel.page >= 0 && g.sel.page < g.pageCount &&
+      (g.sel.type == FPDF_PAGEOBJ_TEXT || g.sel.type == FPDF_PAGEOBJ_PATH))
+  {
+    FPDF_PAGE page = FPDF_LoadPage(g.doc, g.sel.page);
+    FPDF_PAGEOBJECT o = page ? FPDFPage_GetObject(page, g.sel.index) : nullptr;
+    if (o)
+    {
+      unsigned r = 0, gg = 0, b = 0, a = 0;
+      if (g.sel.type == FPDF_PAGEOBJ_TEXT)
+      {
+        if (FPDFPageObj_GetFillColor(o, &r, &gg, &b, &a)) g.fgColor = RGB(r, gg, b);
+      }
+      else
+      {
+        if (FPDFPageObj_GetStrokeColor(o, &r, &gg, &b, &a)) g.fgColor = RGB(r, gg, b);
+        if (FPDFPageObj_GetFillColor(o, &r, &gg, &b, &a)) g.bgColor = RGB(r, gg, b);
+      }
+    }
+    if (page) FPDF_ClosePage(page);
+  }
+  UpdateColorSwatches();
+}
+
+// Builds the outline of `kind` into `path`, spanning the PDF-space box
+// (x0,y0)-(x1,y1) with x1>x0 and y1>y0 (y is up). Polygons use straight edges;
+// the rounded rectangle and the oval use cubic beziers.
+static void BuildShapePath(FPDF_PAGEOBJECT path, ShapeKind kind,
+                           float x0, float y0, float x1, float y1)
+{
+  const float cx = (x0 + x1) * 0.5f, cy = (y0 + y1) * 0.5f;
+  const float w = x1 - x0, h = y1 - y0;
+  const float K = 0.5522847f;  // bezier constant for a quarter circle
+  auto move = [&](float x, float y) { FPDFPath_MoveTo(path, x, y); };
+  auto line = [&](float x, float y) { FPDFPath_LineTo(path, x, y); };
+  auto bez = [&](float a, float b, float c, float d, float e, float f) {
+    FPDFPath_BezierTo(path, a, b, c, d, e, f);
+  };
+
+  switch (kind)
+  {
+    case SHAPE_RECT:
+      move(x0, y0); line(x1, y0); line(x1, y1); line(x0, y1);
+      FPDFPath_Close(path);
+      break;
+    case SHAPE_ROUNDRECT:
+    {
+      const float r = std::min(w, h) * 0.18f, k = r * K;
+      move(x0, y0 + r);
+      line(x0, y1 - r); bez(x0, y1 - r + k, x0 + r - k, y1, x0 + r, y1);
+      line(x1 - r, y1); bez(x1 - r + k, y1, x1, y1 - r + k, x1, y1 - r);
+      line(x1, y0 + r); bez(x1, y0 + r - k, x1 - r + k, y0, x1 - r, y0);
+      line(x0 + r, y0); bez(x0 + r - k, y0, x0, y0 + r - k, x0, y0 + r);
+      FPDFPath_Close(path);
+      break;
+    }
+    case SHAPE_OVAL:
+    {
+      const float rx = w * 0.5f, ry = h * 0.5f, kx = rx * K, ky = ry * K;
+      move(x0, cy);
+      bez(x0, cy + ky, cx - kx, y1, cx, y1);
+      bez(cx + kx, y1, x1, cy + ky, x1, cy);
+      bez(x1, cy - ky, cx + kx, y0, cx, y0);
+      bez(cx - kx, y0, x0, cy - ky, x0, cy);
+      FPDFPath_Close(path);
+      break;
+    }
+    case SHAPE_TRIANGLE:
+      move(cx, y1); line(x1, y0); line(x0, y0);
+      FPDFPath_Close(path);
+      break;
+    case SHAPE_DIAMOND:
+      move(cx, y1); line(x1, cy); line(cx, y0); line(x0, cy);
+      FPDFPath_Close(path);
+      break;
+    case SHAPE_STAR:
+    {
+      const float ox = w * 0.5f, oy = h * 0.5f, ix = ox * 0.382f, iy = oy * 0.382f;
+      for (int i = 0; i < 10; ++i)
+      {
+        const double ang = (90.0 + i * 36.0) * 3.14159265358979 / 180.0;
+        const bool outer = (i % 2) == 0;
+        const float px = cx + (outer ? ox : ix) * (float)std::cos(ang);
+        const float py = cy + (outer ? oy : iy) * (float)std::sin(ang);
+        if (i == 0) move(px, py); else line(px, py);
+      }
+      FPDFPath_Close(path);
+      break;
+    }
+    case SHAPE_HEXAGON:
+    {
+      for (int i = 0; i < 6; ++i)
+      {
+        const double ang = i * 60.0 * 3.14159265358979 / 180.0;
+        const float px = cx + (w * 0.5f) * (float)std::cos(ang);
+        const float py = cy + (h * 0.5f) * (float)std::sin(ang);
+        if (i == 0) move(px, py); else line(px, py);
+      }
+      FPDFPath_Close(path);
+      break;
+    }
+    case SHAPE_ARROW:
+    {
+      const float xa = x1 - w * 0.38f;    // base of the arrow head
+      const float sh = h * 0.5f * 0.6f;   // half the shaft thickness
+      move(x0, cy - sh); line(xa, cy - sh); line(xa, y0); line(x1, cy);
+      line(xa, y1); line(xa, cy + sh); line(x0, cy + sh);
+      FPDFPath_Close(path);
+      break;
+    }
+    case SHAPE_LINE:
+      move(x0, y0); line(x1, y1);
+      break;
+    case SHAPE_CROSS:
+    {
+      const float t = std::min(w, h) * 0.32f;
+      const float ax = cx - t * 0.5f, bx = cx + t * 0.5f;
+      const float ay = cy - t * 0.5f, by = cy + t * 0.5f;
+      move(ax, y0); line(bx, y0); line(bx, ay); line(x1, ay); line(x1, by);
+      line(bx, by); line(bx, y1); line(ax, y1); line(ax, by); line(x0, by);
+      line(x0, ay); line(ax, ay);
+      FPDFPath_Close(path);
+      break;
+    }
+    default:
+      break;
+  }
+}
+
+// Inserts the armed shape into the selected page over PDF-space `rc`, stroking
+// with the foreground colour and filling with the background colour.
+static void InsertShapeCurrent(ShapeKind kind, FS_RECTF rc)
+{
+  if (kind == SHAPE_NONE || !g.doc || g.selected < 0 || g.selected >= g.pageCount)
+    return;
+  if (rc.right - rc.left < 2.0f || rc.top - rc.bottom < 2.0f) return;
+  FPDF_PAGE page = FPDF_LoadPage(g.doc, g.selected);
+  if (!page) return;
+  FPDF_PAGEOBJECT path = FPDFPageObj_CreateNewPath(rc.left, rc.bottom);
+  if (!path) { FPDF_ClosePage(page); return; }
+  BuildShapePath(path, kind, rc.left, rc.bottom, rc.right, rc.top);
+  FPDFPath_SetDrawMode(path,
+                       kind == SHAPE_LINE ? FPDF_FILLMODE_NONE
+                                          : FPDF_FILLMODE_ALTERNATE,
+                       TRUE);
+  FPDFPageObj_SetFillColor(path, GetRValue(g.bgColor), GetGValue(g.bgColor),
+                           GetBValue(g.bgColor), 255);
+  FPDFPageObj_SetStrokeColor(path, GetRValue(g.fgColor), GetGValue(g.fgColor),
+                             GetBValue(g.fgColor), 255);
+  FPDFPageObj_SetStrokeWidth(path, 1.5f);
+  BeginEdit();
+  const bool ok = FPDFPage_InsertObject(page, path) != 0;
+  if (ok) FPDFPage_GenerateContent(page);
+  FPDF_ClosePage(page);
+  if (!ok) { CancelEdit(); return; }
+  g.dirty = true;
+  CommitEdits();
+  DropPageBitmapCaches(g.selected);
+  g.bmDirty = true;
+  if (g.canvas) InvalidateRect(g.canvas, nullptr, TRUE);
+  if (g.thumbs) InvalidateRect(g.thumbs, nullptr, TRUE);
+  if (g.status) InvalidateRect(g.status, nullptr, TRUE);
+}
+
+// Arms shape drawing: the next left-click drops a default-size shape, a
+// left-drag draws one at the dragged size.
+static void ArmShape(ShapeKind kind)
+{
+  g.annTool = 0;
+  g.annDrag = false;
+  g.shapeTool = kind;
+  if (g.canvas)
+  {
+    SetCursor(LoadCursorW(nullptr, IDC_CROSS));
+    InvalidateRect(g.canvas, nullptr, FALSE);
+  }
+  if (g.status) InvalidateRect(g.status, nullptr, TRUE);
+}
+
+// Pops the shape picker at the cursor and arms the chosen shape.
+static void ShowShapeMenu(HWND owner)
+{
+  HMENU m = CreatePopupMenu();
+  for (int i = 0; i < SHAPE_KIND_COUNT - 1; ++i)
+    AppendMenuW(m, MF_STRING, (UINT_PTR)(i + 1), kShapeNames[i]);
+  POINT pt;
+  GetCursorPos(&pt);
+  const int cmd = (int)TrackPopupMenu(m, TPM_RETURNCMD | TPM_LEFTBUTTON, pt.x,
+                                      pt.y, 0, owner, nullptr);
+  DestroyMenu(m);
+  if (cmd >= 1 && cmd < SHAPE_KIND_COUNT) ArmShape((ShapeKind)cmd);
+}
+
+// Common status stamps offered from the Security tab.
+static const wchar_t* kStampNames[] = {
+    L"Draft",      L"Approved",  L"Final",     L"Confidential", L"For Comment",
+    L"Not Approved", L"Reviewed", L"Sold",     L"Paid",         L"Faxed",
+    L"Printed",    L"Received",  L"Void",      L"Expired",      L"Original",
+    L"Copy",       L"Top Secret", L"Sample"};
+
+// Pops the stamp picker and arms a stamp annotation with the chosen caption.
+static void ShowStampMenu(HWND owner)
+{
+  HMENU m = CreatePopupMenu();
+  const int n = (int)(sizeof(kStampNames) / sizeof(kStampNames[0]));
+  for (int i = 0; i < n; ++i)
+    AppendMenuW(m, MF_STRING, (UINT_PTR)(i + 1), kStampNames[i]);
+  POINT pt;
+  GetCursorPos(&pt);
+  const int cmd = (int)TrackPopupMenu(m, TPM_RETURNCMD | TPM_LEFTBUTTON, pt.x,
+                                      pt.y, 0, owner, nullptr);
+  DestroyMenu(m);
+  if (cmd >= 1 && cmd <= n)
+  {
+    g.stampText = kStampNames[cmd - 1];
+    SetAnnotTool(ID_ANN_STAMP);
+  }
+}
+
+// Applies the current foreground/background colour to the selected object.
+static void ApplyColorToSelection(bool foreground)
+{
+  if (!g.sel.active || g.sel.page < 0 || g.sel.page >= g.pageCount) return;
+  if (g.sel.type != FPDF_PAGEOBJ_TEXT && g.sel.type != FPDF_PAGEOBJ_PATH) return;
+  FPDF_PAGE page = FPDF_LoadPage(g.doc, g.sel.page);
+  FPDF_PAGEOBJECT o = page ? FPDFPage_GetObject(page, g.sel.index) : nullptr;
+  if (o)
+  {
+    const COLORREF c = foreground ? g.fgColor : g.bgColor;
+    unsigned r = GetRValue(c), gg = GetGValue(c), b = GetBValue(c);
+    BeginEdit();
+    if (foreground && g.sel.type == FPDF_PAGEOBJ_TEXT)
+      FPDFPageObj_SetFillColor(o, r, gg, b, 255);
+    else if (foreground)
+      FPDFPageObj_SetStrokeColor(o, r, gg, b, 255);
+    else
+      FPDFPageObj_SetFillColor(o, r, gg, b, 255);
+    FPDFPage_GenerateContent(page);
+    FPDF_ClosePage(page);
+    CommitEdits();
+    DropPageBitmapCaches(g.sel.page);
+    if (g.canvas) InvalidateRect(g.canvas, nullptr, TRUE);
+    if (g.thumbs) InvalidateRect(g.thumbs, nullptr, TRUE);
+  }
+  else if (page)
+  {
+    FPDF_ClosePage(page);
+  }
+}
+
+// Opens the system colour picker for the foreground or background colour and,
+// on OK, applies it to the current selection too.
+static void PickColor(bool foreground)
+{
+  static COLORREF custom[16] = {0};
+  CHOOSECOLORW cc{};
+  cc.lStructSize = sizeof(cc);
+  cc.hwndOwner = g.frame;
+  cc.rgbResult = foreground ? g.fgColor : g.bgColor;
+  cc.lpCustColors = custom;
+  cc.Flags = CC_FULLOPEN | CC_RGBINIT;
+  if (!ChooseColorW(&cc)) return;
+  if (foreground) g.fgColor = cc.rgbResult; else g.bgColor = cc.rgbResult;
+  UpdateColorSwatches();
+  ApplyColorToSelection(foreground);
 }
 
 // --- Text search (Ctrl+F / F3 / Shift+F3) ----------------------------------
@@ -8296,6 +8634,7 @@ static bool IsHandledCommand(int id)
     case ID_EXIT: case ID_ROTR: case ID_ROTL: case ID_DELETE: case ID_ADD:
     case ID_TOOL_SELECT: case ID_OBJ_EDIT: case ID_OBJ_DELETE:
     case ID_OBJ_RECOLOR: case ID_OBJ_FONT: case ID_ZOOM_IN: case ID_ZOOM_OUT: case ID_ZOOM100:
+    case ID_FG_COLOR: case ID_BG_COLOR: case ID_SHAPE_MENU: case ID_STAMP_MENU:
     case ID_FITW: case ID_FITP: case ID_PREV: case ID_NEXT: case ID_SPREAD:
     case ID_SIDEBAR: case ID_NEW_TAB: case ID_CLOSE_TAB: case ID_PREV_TAB:
     case ID_NEXT_TAB: case ID_FIND: case ID_FIND_NEXT: case ID_FIND_PREV:
@@ -8357,6 +8696,10 @@ static void DoCommand(int id)
     case ID_OBJ_DELETE: DeleteSelectedObject(); break;
     case ID_OBJ_RECOLOR: ApplyRecolorSelected(); break;
     case ID_OBJ_FONT: ShowFontDialog(); break;
+    case ID_FG_COLOR: PickColor(true); break;
+    case ID_BG_COLOR: PickColor(false); break;
+    case ID_SHAPE_MENU: ShowShapeMenu(g.frame); break;
+    case ID_STAMP_MENU: ShowStampMenu(g.frame); break;
     case ID_ZOOM_OUT: ZoomTo(g.zoom / 1.25, false); break;
     case ID_ZOOM_IN:  ZoomTo(g.zoom * 1.25, false); break;
     case ID_ZOOM100:  ZoomTo(1.0, false); break;
@@ -13410,6 +13753,41 @@ static LRESULT CALLBACK ToolbarProc(HWND hw, UINT msg, WPARAM wp, LPARAM lp)
   {
     case WM_ERASEBKGND:
       return 1;
+    case WM_COMMAND:
+    {
+      // Font family/size dropdowns are children of the ribbon (Content tab).
+      if (hw != g.toolbar) break;
+      const int id = LOWORD(wp);
+      const int code = HIWORD(wp);
+      if (g_fontCtlGuard) break;
+      if (id == ID_RIBFONT && code == CBN_SELCHANGE)
+      {
+        const int i = (int)SendMessageW(g_fontCombo, CB_GETCURSEL, 0, 0);
+        if (i >= 0 && i < kFontFamilyCount)
+        {
+          std::string cur;
+          float sz = 0.0f;
+          SelectionTextStyle(cur, sz);
+          ApplyFontChoice(kFontFamilies[i], sz);
+          UpdateFontControls();
+        }
+        return 0;
+      }
+      if (id == ID_RIBSIZE && (code == CBN_SELCHANGE || code == CBN_EDITCHANGE))
+      {
+        wchar_t buf[32] = L"";
+        GetWindowTextW(g_sizeCombo, buf, 32);
+        const float sz = (float)_wtof(buf);
+        if (sz >= 1.0f && sz <= 500.0f)
+        {
+          // Empty family = keep the run's current font; only the size changes.
+          ApplyFontChoice(std::string(), sz);
+          UpdateFontControls();
+        }
+        return 0;
+      }
+      break;
+    }
     case WM_PAINT:
     {
       PAINTSTRUCT ps;

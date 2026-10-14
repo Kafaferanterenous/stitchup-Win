@@ -21,7 +21,7 @@ user rejected as a product (no GUI).
 
 Command: `Stitchup.exe --self-test`
 
-Result: **302 passed, 0 failed** (exit code 0).
+Result: **465 passed, 0 failed** (exit code 0).
 
 Select / Move Content Object (`obj:` checks covering content-object editing):
 clicking a content object (text run or vector path) on the current page selects
@@ -870,6 +870,17 @@ Self-test: 465 passed, 0 failed.
   it gains focus, so typing a new size replaces it. Previously typing "8" into a
   field showing "16.0" appended to "16.08", which applied the wrong size (so the
   size appeared not to change, especially for the single-digit 8/9pt).
+- **UI redesign: Content tab hub.** The font family and size pickers have been
+  moved into the Content ribbon tab (greyed out when no text target) and the
+  floating font bar has been removed. Double-clicking a text run or pressing
+  Edit Text now switches to the Content tab and enables the controls. The
+  toolbar hosts both dropdowns inline.
+- **Vector shapes on content.** A new Shapes menu on the Content tab inserts
+  vector path objects (Rect, Rounded Rect, Oval, Triangle, Diamond, Star,
+  Hexagon, Arrow, Line, Cross). **Click = default size**, **drag = custom size**;
+  colours come from the new Fg/Bg swatches in the toolbar. Stamps (Draft,
+  Approved, Final, Confidential, Sold, Paid, Faxed, Printed, Void, etc.) are
+  available from the Security tab.
 - The size shown in the bar is rounded for display, so an effective size that
   computes to 16.0006 reads as "16" instead of a long float. A size that is not a
   preset is shown as a temporary list entry, so the bar always reflects the run.
