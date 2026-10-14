@@ -6024,7 +6024,9 @@ static void UpdateFontControls()
     }
     wchar_t buf[32];
     swprintf_s(buf, L"%g", (double)size);
-    SetWindowTextW(g_sizeCombo, buf);
+    // Don't clobber the box while the user is typing in it (a rewrite resets the
+    // caret, so multi-digit sizes like "10" could not be entered).
+    if (GetFocus() != g_sizeCombo) SetWindowTextW(g_sizeCombo, buf);
   }
   else
   {
@@ -6219,10 +6221,20 @@ static void ApplyFontChoice(const std::string& fam, float size)
   }
   if (g.sel.active && g.sel.type == FPDF_PAGEOBJ_TEXT)
   {
+    const int pi = g.sel.page;
+    const int oi = g.sel.index;
     std::wstring cur;
-    for (const PageObject& po : ListPageObjects(g.sel.page))
-      if (po.index == g.sel.index) { cur = po.text; break; }
-    EditTextObject(g.sel.page, g.sel.index, cur, fam, size);
+    for (const PageObject& po : ListPageObjects(pi))
+      if (po.index == oi) { cur = po.text; break; }
+    EditTextObject(pi, oi, cur, fam, size);
+    // Re-select the just-restyled object: changing the font reloads the page and
+    // drops the selection, which stopped the user setting the size after picking
+    // a family. Keeping it selected lets family and size both be adjusted.
+    g.sel.active = true;
+    g.sel.type = FPDF_PAGEOBJ_TEXT;
+    g.sel.page = pi;
+    g.sel.index = oi;
+    RefreshSelBounds();
   }
 }
 

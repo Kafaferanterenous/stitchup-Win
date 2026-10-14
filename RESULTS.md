@@ -840,6 +840,10 @@ Self-test: 465 passed, 0 failed.
 - The in-place overlay previews text at the run's true *em* size (effective point
   size x matrix scale) rather than the shorter ink-bounding-box height, so the
   live text no longer looks smaller than the committed text ("grows on commit").
+- Picking a font and then a size now works on the same run: restyling no longer
+  drops the selection (the page reload used to clear it, so a follow-up size
+  change had nothing selected and was ignored), and the size box is no longer
+  rewritten while it has focus, so multi-digit sizes like 10 can be typed.
 - Changing only the size (in the floating bar or the Font... dialog) now keeps the
   run's original font and matrix and just scales the size, instead of substituting
   a base-14 font; only picking a different family restyles it. The font bar also
