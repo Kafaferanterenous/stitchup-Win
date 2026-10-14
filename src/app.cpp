@@ -5949,6 +5949,23 @@ static void FormatSizeText(wchar_t* buf, size_t n, float size)
   else swprintf_s(buf, n, L"%.1f", v);
 }
 
+// Select the whole size field when it gains focus so typing a new value
+// replaces it. Without this, typing "8" into a field reading "16.0" appended to
+// "16.08" (or "816.0"), which applied the wrong size and looked like the size
+// "would not change" to 8/9pt. Posting EM_SETSEL runs after the click has placed
+// its caret, so the selection sticks.
+static LRESULT CALLBACK SizeEditSub(HWND h, UINT m, WPARAM w, LPARAM l,
+                                    UINT_PTR, DWORD_PTR)
+{
+  if (m == WM_SETFOCUS)
+  {
+    const LRESULT r = DefSubclassProc(h, m, w, l);
+    PostMessageW(h, EM_SETSEL, 0, -1);
+    return r;
+  }
+  return DefSubclassProc(h, m, w, l);
+}
+
 // Lazily create the two combos as children of the canvas; they float over the
 // page whenever there is a text target and are hidden otherwise.
 static void EnsureFontBar()
@@ -6119,6 +6136,7 @@ static LRESULT CALLBACK FontProc(HWND h, UINT m, WPARAM w, LPARAM l)
           swprintf_s(buf, L"12");
         SetWindowTextW(g_fontSizeEdit, buf);
       }
+      SetWindowSubclass(g_fontSizeEdit, SizeEditSub, 1, 0);
       CreateWindowExW(0, L"BUTTON", L"Ok",
                       WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_DEFPUSHBUTTON,
                       236, 70, 96, 28, h, (HMENU)1, g.inst, nullptr);

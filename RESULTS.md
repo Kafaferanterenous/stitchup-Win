@@ -866,6 +866,10 @@ Self-test: 465 passed, 0 failed.
   ignored. A list cannot misfire; picking a size always restyles the selected or
   in-place-edited run. Arbitrary sizes are still available via **Font and Size...**
   (Ctrl+Shift+F), which keeps its numeric size field.
+- The **Font and Size...** dialog's size field now selects its whole value when
+  it gains focus, so typing a new size replaces it. Previously typing "8" into a
+  field showing "16.0" appended to "16.08", which applied the wrong size (so the
+  size appeared not to change, especially for the single-digit 8/9pt).
 - The size shown in the bar is rounded for display, so an effective size that
   computes to 16.0006 reads as "16" instead of a long float. A size that is not a
   preset is shown as a temporary list entry, so the bar always reflects the run.
