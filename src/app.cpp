@@ -5869,6 +5869,8 @@ static bool g_fontCtlGuard = false;  // suppress re-entrant CBN_* handling
 
 static const int kFontSizes[] = {8, 9, 10, 11, 12, 14, 16, 18, 20, 24, 28, 32,
                                  36, 48, 72};
+static const int kFontSizeCount =
+    (int)(sizeof(kFontSizes) / sizeof(kFontSizes[0]));
 
 static int FontFamilyIndex(const std::string& fam)
 {
@@ -5937,6 +5939,16 @@ static std::string SelectionRawFontName()
   return std::string();
 }
 
+// Format a point size for the size box without floating-point noise, so an
+// effective size that comes out as 16.0006 is shown as "16".
+static void FormatSizeText(wchar_t* buf, size_t n, float size)
+{
+  const double v = (double)size;
+  const double r = std::floor(v + 0.5);
+  if (std::fabs(v - r) < 0.05) swprintf_s(buf, n, L"%.0f", r);
+  else swprintf_s(buf, n, L"%.1f", v);
+}
+
 // Lazily create the two combos as children of the canvas; they float over the
 // page whenever there is a text target and are hidden otherwise.
 static void EnsureFontBar()
@@ -5949,8 +5961,10 @@ static void EnsureFontBar()
     SendMessageW(g_fontCombo, CB_ADDSTRING, 0, (LPARAM)kFontFamilyLabels[i]);
   SendMessageW(g_fontCombo, WM_SETFONT, (WPARAM)g.font, TRUE);
 
+  // Pick-only list (no editable box): typing a size used to append to the old
+  // value ("16" + "10" -> "1610"), which never applied. A list can't misfire.
   g_sizeCombo = CreateWindowExW(0, L"COMBOBOX", L"",
-      WS_CHILD | WS_TABSTOP | CBS_DROPDOWN | CBS_AUTOHSCROLL, 0, 0, 64, 240,
+      WS_CHILD | WS_TABSTOP | CBS_DROPDOWNLIST | WS_VSCROLL, 0, 0, 64, 240,
       g.canvas, (HMENU)(INT_PTR)ID_RIBSIZE, g.inst, nullptr);
   for (int z : kFontSizes)
   {
@@ -6023,15 +6037,24 @@ static void UpdateFontControls()
       SendMessageW(g_fontCombo, CB_SETCURSEL, kFontFamilyCount, 0);
     }
     wchar_t buf[32];
-    swprintf_s(buf, L"%g", (double)size);
-    // Don't clobber the box while the user is typing in it (a rewrite resets the
-    // caret, so multi-digit sizes like "10" could not be entered).
-    if (GetFocus() != g_sizeCombo) SetWindowTextW(g_sizeCombo, buf);
+    FormatSizeText(buf, 32, size);
+    // Show the current size in the pick-only list: reuse the matching entry, or
+    // add a temporary one when the run's size is not a standard preset.
+    if ((int)SendMessageW(g_sizeCombo, CB_GETCOUNT, 0, 0) > kFontSizeCount)
+      SendMessageW(g_sizeCombo, CB_DELETESTRING, kFontSizeCount, 0);
+    int szIdx = (int)SendMessageW(g_sizeCombo, CB_FINDSTRINGEXACT,
+                                  (WPARAM)-1, (LPARAM)buf);
+    if (szIdx < 0)
+    {
+      SendMessageW(g_sizeCombo, CB_ADDSTRING, 0, (LPARAM)buf);
+      szIdx = kFontSizeCount;
+    }
+    SendMessageW(g_sizeCombo, CB_SETCURSEL, szIdx, 0);
   }
   else
   {
     SendMessageW(g_fontCombo, CB_SETCURSEL, (WPARAM)-1, 0);
-    SetWindowTextW(g_sizeCombo, L"");
+    SendMessageW(g_sizeCombo, CB_SETCURSEL, (WPARAM)-1, 0);
   }
   g_fontCtlGuard = false;
   if (!has)

@@ -858,4 +858,18 @@ Self-test: 465 passed, 0 failed.
 
 Self-test: 465 passed, 0 failed.
 
+## v0.12.13 - reliable font size from the floating bar (2026-10-14)
+- The floating font bar's size control is now a **pick-only preset list** (8, 9,
+  10, 11, 12, 14, 16, 18, 20, 24, 28, 32, 36, 48, 72) instead of an editable box.
+  Typing into the old box appended to the current value ("16" + "10" became
+  "1610", which never applied), which is why a size change could appear to be
+  ignored. A list cannot misfire; picking a size always restyles the selected or
+  in-place-edited run. Arbitrary sizes are still available via **Font and Size...**
+  (Ctrl+Shift+F), which keeps its numeric size field.
+- The size shown in the bar is rounded for display, so an effective size that
+  computes to 16.0006 reads as "16" instead of a long float. A size that is not a
+  preset is shown as a temporary list entry, so the bar always reflects the run.
+
+Self-test: 465 passed, 0 failed.
+
 
