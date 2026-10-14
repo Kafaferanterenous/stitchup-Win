@@ -840,6 +840,12 @@ Self-test: 465 passed, 0 failed.
 - The in-place overlay previews text at the run's true *em* size (effective point
   size x matrix scale) rather than the shorter ink-bounding-box height, so the
   live text no longer looks smaller than the committed text ("grows on commit").
+- Changing only the size (in the floating bar or the Font... dialog) now keeps the
+  run's original font and matrix and just scales the size, instead of substituting
+  a base-14 font; only picking a different family restyles it. The font bar also
+  shows the run's **real** font name (e.g. an embedded/CID name such as `F1`)
+  rather than a misleading `Helvetica`, so it is clear whether the font was
+  identified or is being preserved as-is.
 - Editing or moving a text object no longer opens a spurious extra "Untitled" tab:
   the post-save reload now refreshes the current tab in place (keeping undo/redo,
   zoom and scroll) instead of calling the tab-creating `LoadDoc`.

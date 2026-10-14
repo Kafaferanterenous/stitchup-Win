@@ -5612,18 +5612,20 @@ static void EditTextObject(int pi, int index, const std::wstring& newText,
   if (!(s > 0.0001f) || s > 1000.0f || !std::isfinite(s)) s = 1.0f;
   const float effSize = (reqSize > 0.0f) ? reqSize : rawSize * s;
 
-  // Same-style edit (no font/size change requested): reuse the run's own font
-  // object so the embedded font is preserved exactly, and keep its full matrix
-  // so size, position and rotation are unchanged. PDFium can create new text
-  // objects directly from an existing FPDF_FONT even when it is an embedded
-  // subset, which avoids substituting a base-14 font (the cause of the visible
-  // "font changes on commit" behaviour).
-  if (reqFont.empty() && reqSize <= 0.0f)
+  // No font-family change requested: reuse the run's own font object so the
+  // embedded/subset font is preserved exactly. This covers both a plain text
+  // edit (size unchanged, same full matrix) and a size-only change (keep the
+  // font and matrix, just scale the size), so changing the size no longer
+  // substitutes a base-14 font. PDFium can create new text objects directly from
+  // an existing FPDF_FONT even when it is an embedded subset, which avoids the
+  // "font changes on commit" behaviour.
+  if (reqFont.empty())
   {
     FPDF_FONT of = FPDFTextObj_GetFont(oldObj);
     if (of)
     {
-      FPDF_PAGEOBJECT no = FPDFPageObj_CreateTextObj(g.doc, of, rawSize);
+      const float newRaw = (reqSize > 0.0f) ? (reqSize / s) : rawSize;
+      FPDF_PAGEOBJECT no = FPDFPageObj_CreateTextObj(g.doc, of, newRaw);
       if (no)
       {
         const unsigned short* u16 =
@@ -5911,6 +5913,30 @@ static bool SelectionTextStyle(std::string& fam, float& size)
   return false;
 }
 
+// True if `name` is one of the 14 PDF base-14 font names (case-insensitive).
+static bool IsBase14Name(const std::string& name)
+{
+  std::string s;
+  s.reserve(name.size());
+  for (char c : name) s += (char)std::tolower((unsigned char)c);
+  for (int i = 0; i < kFontFamilyCount; ++i)
+  {
+    std::string b(kFontFamilies[i]);
+    for (char& c : b) c = (char)std::tolower((unsigned char)c);
+    if (s == b) return true;
+  }
+  return false;
+}
+
+// The run's own (unmapped) font name for the current text target, if any.
+static std::string SelectionRawFontName()
+{
+  if (g.sel.page < 0) return std::string();
+  for (const PageObject& po : ListPageObjects(g.sel.page))
+    if (po.index == g.sel.index) return po.fontName;
+  return std::string();
+}
+
 // Lazily create the two combos as children of the canvas; they float over the
 // page whenever there is a text target and are hidden otherwise.
 static void EnsureFontBar()
@@ -5975,7 +6001,27 @@ static void UpdateFontControls()
   EnableWindow(g_sizeCombo, has ? TRUE : FALSE);
   if (has)
   {
-    SendMessageW(g_fontCombo, CB_SETCURSEL, FontFamilyIndex(fam), 0);
+    const std::string raw = SelectionRawFontName();
+    if (IsBase14Name(raw))
+    {
+      // Drop any previously added custom item, then select the base-14 entry.
+      if ((int)SendMessageW(g_fontCombo, CB_GETCOUNT, 0, 0) > kFontFamilyCount)
+        SendMessageW(g_fontCombo, CB_DELETESTRING, kFontFamilyCount, 0);
+      SendMessageW(g_fontCombo, CB_SETCURSEL, FontFamilyIndex(raw), 0);
+    }
+    else
+    {
+      // The run's font is not one of the base-14 families (embedded, or a name
+      // PDFium cannot resolve). Show its real name instead of pretending it is
+      // "Helvetica"; leaving it untouched keeps the original font on commit.
+      if ((int)SendMessageW(g_fontCombo, CB_GETCOUNT, 0, 0) > kFontFamilyCount)
+        SendMessageW(g_fontCombo, CB_DELETESTRING, kFontFamilyCount, 0);
+      const std::wstring wr = raw.empty()
+                                  ? std::wstring(L"(embedded)")
+                                  : std::wstring(raw.begin(), raw.end());
+      SendMessageW(g_fontCombo, CB_ADDSTRING, 0, (LPARAM)wr.c_str());
+      SendMessageW(g_fontCombo, CB_SETCURSEL, kFontFamilyCount, 0);
+    }
     wchar_t buf[32];
     swprintf_s(buf, L"%g", (double)size);
     SetWindowTextW(g_sizeCombo, buf);
@@ -6142,7 +6188,14 @@ static void ShowFontDialog()
   EnableWindow(g.frame, TRUE);
   SetActiveWindow(g.frame);
   SetFocus(g.frame);
-  if (g_fontOk) ApplyFontChoice(g_fontChosenFam, g_fontChosenSize);
+  if (g_fontOk)
+  {
+    // If the family selection was left as-is, keep the run's own font and only
+    // apply the size (avoids substituting a base-14 font for a size tweak).
+    std::string chosenFam = g_fontChosenFam;
+    if (chosenFam == MapToBase14(g_fontInitFam)) chosenFam.clear();
+    ApplyFontChoice(chosenFam, g_fontChosenSize);
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -6671,10 +6724,8 @@ static LRESULT CALLBACK CanvasProc(HWND hw, UINT msg, WPARAM wp, LPARAM lp)
         const float sz = (float)_wtof(buf);
         if (sz >= 1.0f && sz <= 500.0f)
         {
-          std::string fam;
-          float cur = 0.0f;
-          SelectionTextStyle(fam, cur);
-          ApplyFontChoice(fam, sz);
+          // Empty family = keep the run's current font; only the size changes.
+          ApplyFontChoice(std::string(), sz);
           UpdateFontControls();
         }
         return 0;
