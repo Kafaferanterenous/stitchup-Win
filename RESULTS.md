@@ -832,6 +832,14 @@ Self-test: 465 passed, 0 failed.
   matches the original run (verified against runs that store 1pt under a 36x
   matrix); the in-place overlay previews with the mapped face and weight too, so
   what you see while editing is what gets committed.
+- Editing a run without changing its font/size now reuses the run's own font
+  object (`FPDFPageObj_CreateTextObj` from `FPDFTextObj_GetFont`) and keeps its
+  full matrix, so the embedded/subset font is preserved **exactly** and the text
+  no longer changes typeface (or appears to grow) when the edit is committed. If
+  the font cannot be reused, the edit falls back to the mapped base-14 family.
+- The in-place overlay previews text at the run's true *em* size (effective point
+  size x matrix scale) rather than the shorter ink-bounding-box height, so the
+  live text no longer looks smaller than the committed text ("grows on commit").
 - Editing or moving a text object no longer opens a spurious extra "Untitled" tab:
   the post-save reload now refreshes the current tab in place (keeping undo/redo,
   zoom and scroll) instead of calling the tab-creating `LoadDoc`.

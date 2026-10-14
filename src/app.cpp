@@ -5612,6 +5612,44 @@ static void EditTextObject(int pi, int index, const std::wstring& newText,
   if (!(s > 0.0001f) || s > 1000.0f || !std::isfinite(s)) s = 1.0f;
   const float effSize = (reqSize > 0.0f) ? reqSize : rawSize * s;
 
+  // Same-style edit (no font/size change requested): reuse the run's own font
+  // object so the embedded font is preserved exactly, and keep its full matrix
+  // so size, position and rotation are unchanged. PDFium can create new text
+  // objects directly from an existing FPDF_FONT even when it is an embedded
+  // subset, which avoids substituting a base-14 font (the cause of the visible
+  // "font changes on commit" behaviour).
+  if (reqFont.empty() && reqSize <= 0.0f)
+  {
+    FPDF_FONT of = FPDFTextObj_GetFont(oldObj);
+    if (of)
+    {
+      FPDF_PAGEOBJECT no = FPDFPageObj_CreateTextObj(g.doc, of, rawSize);
+      if (no)
+      {
+        const unsigned short* u16 =
+            reinterpret_cast<const unsigned short*>(newText.c_str());
+        if (FPDFText_SetText(no, u16))
+        {
+          unsigned int rr = 0, gg = 0, bb = 0, aa = 255;
+          if (FPDFPageObj_GetFillColor(oldObj, &rr, &gg, &bb, &aa))
+            FPDFPageObj_SetFillColor(no, rr, gg, bb, aa);
+          FPDFTextObj_SetTextRenderMode(no, FPDFTextObj_GetTextRenderMode(oldObj));
+          FPDFPageObj_SetMatrix(no, &om);
+          BeginEdit();
+          FPDFPage_RemoveObject(page, oldObj);
+          FPDFPage_InsertObjectAtIndex(page, no, index);
+          FPDFPage_GenerateContent(page);
+          FPDF_ClosePage(page);
+          CommitEdits();
+          return;
+        }
+        FPDFPageObj_Destroy(no);
+      }
+    }
+    // The font could not be reused (or setting the text failed): fall through to
+    // the base-14 replacement below so the edit still lands.
+  }
+
   // Build the replacement first so a failure never destroys the original.
   const PageObject foundHere = [&]() {
     const std::vector<PageObject> objs = ListPageObjects(pi);
@@ -6332,23 +6370,25 @@ static void CanvasPaint(HDC dc, int cw, int ch)
           int boxT = y + (int)std::lround((phh - stx) * s);
           int boxR = x + (int)std::lround(srx * s);
           int boxB = y + (int)std::lround((phh - sbx) * s);
-          // The box height is the run's true on-screen glyph size; the raw PDF
-          // font size can be magnified by the text matrix, so deriving the font
-          // from it renders the overlay text larger than the original. An
-          // explicit size chosen in the Font dialog previews at that size.
-          int fh = boxB - boxT;
-          if (g.sel.editFontSize > 0.0f)
-            fh = (int)std::lround(g.sel.editFontSize * s);
-          if (fh < 6) fh = 6;
-          // Preview with the face the commit will actually use (the mapped
-          // base-14 family, with its weight and slant) so the live buffer and
-          // the committed PDF text look the same.
+          // Preview at the run's true em size: the PDF font size times the
+          // object's matrix scale (or an explicit size chosen in the font bar).
+          // The ink bounding-box height is smaller than the em, so using it made
+          // the live text look smaller than the committed text ("grows on
+          // commit"). The face/weight below is the one the commit will use.
+          float effPt = g.sel.editFontSize;
           std::string fam;
           if (!g.sel.editFont.empty())
             fam = g.sel.editFont;
-          else
-            for (const PageObject& po : ListPageObjects(g.sel.page))
-              if (po.index == g.sel.index) { fam = MapToBase14(po.fontName); break; }
+          for (const PageObject& po : ListPageObjects(g.sel.page))
+            if (po.index == g.sel.index)
+            {
+              if (fam.empty()) fam = MapToBase14(po.fontName);
+              if (effPt <= 0.0f) effPt = po.fontSize;
+              break;
+            }
+          if (effPt <= 0.0f) effPt = (float)((boxB - boxT) / (s > 0 ? s : 1.0));
+          int fh = (int)std::lround(effPt * s);
+          if (fh < 6) fh = 6;
           const std::string famB = MapToBase14(fam);
           const wchar_t* face = FontFaceForFamily(fam);
           const bool italic = famB.find("Italic") != std::string::npos ||
@@ -6417,7 +6457,7 @@ static void CanvasPaint(HDC dc, int cw, int ch)
           SelectObject(dc, oldp);
           DeleteObject(dash);
 
-          RECT tr{boxL + 1, boxT, boxEnd + 200, boxB};
+          RECT tr{boxL + 1, boxT - fh, boxEnd + 200, boxB};
           DrawTextW(dc, g.sel.textEditBuf.c_str(), -1, &tr,
                     DT_LEFT | DT_BOTTOM | DT_SINGLELINE | DT_NOPREFIX);
           // Redraw the selected glyphs in a contrasting colour over the accent
@@ -6426,7 +6466,7 @@ static void CanvasPaint(HDC dc, int cw, int ch)
           {
             const std::wstring selTxtW = g.sel.textEditBuf.substr(selA, selB - selA);
             SetTextColor(dc, selTxt);
-            RECT selRect{selX0, boxT, selX1 + 200, boxB};
+            RECT selRect{selX0, boxT - fh, selX1 + 200, boxB};
             DrawTextW(dc, selTxtW.c_str(), -1, &selRect,
                       DT_LEFT | DT_BOTTOM | DT_SINGLELINE | DT_NOPREFIX);
           }
@@ -6435,9 +6475,11 @@ static void CanvasPaint(HDC dc, int cw, int ch)
 
           int caretX = boxL + preSz.cx + 1;
           if (caretX > boxEnd) caretX = boxEnd;
+          int caretTop = boxB - fh;
+          if (caretTop < 0) caretTop = 0;
           HPEN cp = CreatePen(PS_SOLID, 2, th.accent);
           HPEN ocp = (HPEN)SelectObject(dc, cp);
-          MoveToEx(dc, caretX, boxT + 1, nullptr);
+          MoveToEx(dc, caretX, caretTop, nullptr);
           LineTo(dc, caretX, boxB);
           SelectObject(dc, ocp);
           DeleteObject(cp);
