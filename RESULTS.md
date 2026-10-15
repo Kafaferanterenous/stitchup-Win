@@ -888,3 +888,24 @@ Self-test: 465 passed, 0 failed.
 Self-test: 465 passed, 0 failed.
 
 
+## v0.12.14 - selection-aware page ops, redaction (2026-10-15)
+- **Extract / Split / Auto-Crop now work on the page selection.** Each operates on
+  the current multi-page selection when more than one page is selected, and falls
+  back to the focus page (or the whole document, for Split) when it is not.
+  - `Extract Selected Page(s)...` imports every selected page into a new PDF in
+    ascending order (File dialog / one combined file).
+  - `Split Selected Pages` writes one PDF per selected page; with a single page
+    selected it splits the whole document as before.
+  - `Auto-Crop Selected Page(s)` trims the white margin around each selected page
+    in a single undo step (ink bounds are computed for every page first, then all
+    page boxes are applied together).
+- **Redaction (real content removal).** New **Redact** tool on the Annotate tab.
+  Drag a rectangle over content to *permanently remove* it from the page content
+  stream - not just cover it - and paint an opaque black box in its place. Text
+  objects that intersect the mark are removed whole (their bytes no longer exist
+  in the saved file); paths and images are removed only when fully inside the mark,
+  so a background graphic the mark merely overlaps is preserved. Redaction always
+  needs an explicit drag (a plain click does nothing) and is a single undo step.
+
+Self-test: 465 passed, 0 failed.
+

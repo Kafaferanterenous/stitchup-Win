@@ -80,6 +80,7 @@ enum
   ID_ANN_SHAPE,
 ID_ANN_STAMP,
 ID_ANN_LINK,
+  ID_ANN_REDACT,
   ID_PAGE_EXTRACT,
   ID_PAGE_SPLIT,
   ID_PAGE_CROP,
@@ -4278,9 +4279,14 @@ static void RotateSelectedPages(int turns)
 
 static void UpdateScrollbars();
 
-static void ExtractCurrentPage()
+// Extract the selected pages (the focused page when nothing else is selected)
+// into one new PDF, preserving their document order.
+static void ExtractSelectedPages()
 {
   if (!g.doc || g.pageCount == 0) return;
+  PrunePageSel();
+  std::vector<int> idxs = SelectedBlock();
+  if (idxs.empty()) idxs.push_back(g.selected);
   wchar_t file[MAX_PATH] = L"";
   std::wstring base = g.name.empty() ? L"extract" : (g.name.size() > 4 && _wcsicmp(g.name.c_str() + g.name.size() - 4, L".pdf") == 0
                                                       ? g.name.substr(0, g.name.size() - 4) : g.name);
@@ -4296,22 +4302,34 @@ static void ExtractCurrentPage()
   ofn.lpstrDefExt = L"pdf";
   ofn.Flags = OFN_OVERWRITEPROMPT | OFN_PATHMUSTEXIST | OFN_HIDEREADONLY;
   if (!GetSaveFileNameW(&ofn)) return;
-  int idx = g.selected;
   FPDF_DOCUMENT nd = FPDF_CreateNewDocument();
-  bool ok = nd && FPDF_ImportPagesByIndex(nd, g.doc, &idx, 1, 0) != 0;
+  bool ok = nd && FPDF_ImportPagesByIndex(nd, g.doc, idxs.data(), (int)idxs.size(), 0) != 0;
   if (ok) ok = DocToFile(nd, file);
   if (nd) FPDF_CloseDocument(nd);
   if (ok)
-    MessageBoxW(g.frame, (L"Extracted page " + std::to_wstring(idx + 1) + L" to:\n" +
-                          std::wstring(file)).c_str(),
+  {
+    std::wstring what = idxs.size() == 1
+                            ? (L"Extracted page " + std::to_wstring(idxs[0] + 1))
+                            : (L"Extracted " + std::to_wstring(idxs.size()) + L" pages");
+    MessageBoxW(g.frame, (what + L" to:\n" + std::wstring(file)).c_str(),
                 L"Stitchup", MB_OK | MB_ICONINFORMATION);
+  }
   else
     MessageBoxW(g.frame, L"Extract failed.", L"Stitchup", MB_OK | MB_ICONWARNING);
 }
 
-static void SplitAllPages()
+// Split into one file per page: the whole document normally, or just the
+// selected pages when more than one is multi-selected.
+static void SplitSelectedPages()
 {
   if (!g.doc || g.pageCount == 0) return;
+  PrunePageSel();
+  std::vector<int> idxs = SelectedBlock();
+  std::vector<int> list;
+  if (idxs.size() > 1)
+    list = idxs;                                   // explicit multi-select
+  else
+    for (int i = 0; i < g.pageCount; ++i) list.push_back(i);  // whole document
   std::wstring prefix;
   if (!g.path.empty() && g.path.size() > 4 &&
       _wcsicmp(g.path.c_str() + g.path.size() - 4, L".pdf") == 0)
@@ -4320,12 +4338,11 @@ static void SplitAllPages()
     prefix = L"Stitchup - split";
   std::wstring dir = prefix.substr(0, prefix.find_last_of(L"\\/") + 1);
   int done = 0, failed = 0;
-  for (int i = 0; i < g.pageCount; ++i)
+  for (int idx : list)
   {
-    int idx = i;
     FPDF_DOCUMENT nd = FPDF_CreateNewDocument();
     bool ok = nd && FPDF_ImportPagesByIndex(nd, g.doc, &idx, 1, 0) != 0;
-    if (ok) ok = DocToFile(nd, prefix + L" - page " + std::to_wstring(i + 1) + L".pdf");
+    if (ok) ok = DocToFile(nd, prefix + L" - page " + std::to_wstring(idx + 1) + L".pdf");
     if (nd) FPDF_CloseDocument(nd);
     ok ? ++done : ++failed;
   }
@@ -4372,38 +4389,60 @@ static bool InkBounds(FPDF_PAGE page, float& L, float& B, float& R, float& T)
   return true;
 }
 
-static void CropCurrentPageToContent()
+// Auto-crop every selected page (the focused page when nothing else is
+// selected) to its ink bounding box, as one undo step. Pages with no content
+// are left untouched.
+static void CropSelectedPagesToContent()
 {
   if (!g.doc || g.pageCount == 0) return;
   CheckLib();
-  FPDF_PAGE p = FPDF_LoadPage(g.doc, g.selected);
-  if (!p) return;
-  float L, B, R, T;
-  if (!InkBounds(p, L, B, R, T))
+  PrunePageSel();
+  std::vector<int> idxs = SelectedBlock();
+  if (idxs.empty()) idxs.push_back(g.selected);
+  struct CropJob { int idx; float L, B, R, T; };
+  std::vector<CropJob> jobs;
+  for (int idx : idxs)
   {
+    FPDF_PAGE p = FPDF_LoadPage(g.doc, idx);
+    if (!p) continue;
+    float L, B, R, T;
+    if (InkBounds(p, L, B, R, T))
+    {
+      // Never grow past the existing media box: trim only.
+      float mL, mB, mR, mT;
+      FPDFPage_GetMediaBox(p, &mL, &mB, &mR, &mT);
+      L = std::max(L, mL); T = std::min(T, mT);
+      R = std::min(R, mR); B = std::max(B, mB);
+      if (L < R && B < T) jobs.push_back(CropJob{idx, L, B, R, T});
+    }
     FPDF_ClosePage(p);
-    MessageBoxW(g.frame, L"This page has no content to trim to.",
+  }
+  if (jobs.empty())
+  {
+    MessageBoxW(g.frame,
+                (idxs.size() == 1 ? L"This page has no content to trim to."
+                                  : L"The selected pages have no content to trim to."),
                 L"Stitchup", MB_OK | MB_ICONINFORMATION);
     return;
   }
-  FPDF_ClosePage(p);
-  FPDF_PAGE pp = FPDF_LoadPage(g.doc, g.selected);
-  if (!pp) return;
-  float mL, mB, mR, mT;
-  FPDFPage_GetMediaBox(pp, &mL, &mB, &mR, &mT);
-  L = std::max(L, mL); T = std::min(T, mT);
-  R = std::min(R, mR); B = std::max(B, mB);
-  if (L < R && B < T)
+  BeginEdit();
+  for (const CropJob& j : jobs)
   {
-    BeginEdit();
-    FPDFPage_SetMediaBox(pp, L, B, R, T);
-    g.dirty = true;
+    FPDF_PAGE pp = FPDF_LoadPage(g.doc, j.idx);
+    if (pp)
+    {
+      FPDFPage_SetMediaBox(pp, j.L, j.B, j.R, j.T);
+      FPDF_ClosePage(pp);
+    }
   }
-  FPDF_ClosePage(pp);
-  auto c = g.canvasCache.find(g.selected);
-  if (c != g.canvasCache.end()) { DeleteObject(c->second.bmp); g.canvasCache.erase(c); }
-  auto t = g.thumbCache.find(g.selected);
-  if (t != g.thumbCache.end()) { DeleteObject(t->second); g.thumbCache.erase(t); }
+  g.dirty = true;
+  for (const CropJob& j : jobs)
+  {
+    auto c = g.canvasCache.find(j.idx);
+    if (c != g.canvasCache.end()) { DeleteObject(c->second.bmp); g.canvasCache.erase(c); }
+    auto t = g.thumbCache.find(j.idx);
+    if (t != g.thumbCache.end()) { DeleteObject(t->second); g.thumbCache.erase(t); }
+  }
   UpdateScrollbars();
   InvalidateRect(g.canvas, nullptr, TRUE);
   InvalidateRect(g.thumbs, nullptr, TRUE);
@@ -7478,11 +7517,11 @@ static void BuildToolbar(HWND)
     {ID_ADD,          L"Add Page",   80, 1, 0xE710, false,
      L"Append a blank page to the end of the document"},
     {ID_PAGE_EXTRACT, L"Extract",    70, 1, 0xE896, false,
-     L"Save the current page as its own PDF file"},
+     L"Save the selected page(s) as their own PDF file"},
     {ID_PAGE_SPLIT,   L"Split",      60, 1, 0xE8EE, false,
-     L"Split the document into one file per page"},
+     L"Split the document (or the selected pages) into one file per page"},
     {ID_PAGE_CROP,    L"Auto-Crop",  84, 1, 0xE7A8, false,
-     L"Trim the white margin around the current page"},
+     L"Trim the white margin around the selected page(s)"},
     {ID_ZOOM_OUT,     L"Zoom -",     62, 4, 0xE71F, false,
      L"Zoom out one step (Ctrl+-)"},
     {ID_ZOOM_IN,      L"Zoom +",     62, 4, 0xE8A3, false,
@@ -7513,6 +7552,8 @@ static void BuildToolbar(HWND)
      L"Stamp the page number or a custom mark"},
     {ID_ANN_LINK,     L"Link",       62, 2, 0xE71B, false,
      L"Place a clickable web link on the page"},
+    {ID_ANN_REDACT,   L"Redact",     62, 2, 0xE7BA, false,
+     L"Drag over content to permanently remove it and black it out"},
     {ID_TOOL_SELECT,  L"Select",     62, 3, 0xE8B0, false,
      L"Click a content object to select it, then drag to move it"},
     {ID_OBJ_EDIT,     L"Edit Text",  78, 3, 0xE70F, false,
@@ -8040,9 +8081,68 @@ static void DropPageBitmapCaches(int page)
   if (t != g.thumbCache.end()) { DeleteObject(t->second); g.thumbCache.erase(t); }
 }
 
+// Real redaction: permanently removes the page content under `rc` (not an
+// overlay) and paints an opaque black rectangle in its place. Text objects are
+// removed when they intersect the mark; paths and images only when they are
+// fully inside it, so a background graphic the mark merely overlaps survives.
+static bool RedactArea(FPDF_PAGE page, const FS_RECTF& rc)
+{
+  if (!page) return false;
+  const float rl = std::min(rc.left, rc.right), rr = std::max(rc.left, rc.right);
+  const float rb = std::min(rc.top, rc.bottom), rt = std::max(rc.top, rc.bottom);
+  if (rr - rl < 1.0f || rt - rb < 1.0f) return false;
+  const int n = FPDFPage_CountObjects(page);
+  // Walk back-to-front so removing an object does not shift the ones still to
+  // be visited.
+  for (int i = n - 1; i >= 0; --i)
+  {
+    FPDF_PAGEOBJECT o = FPDFPage_GetObject(page, i);
+    if (!o) continue;
+    float ol = 0, ob = 0, orr = 0, ot = 0;
+    if (!FPDFPageObj_GetBounds(o, &ol, &ob, &orr, &ot)) continue;
+    const bool intersects = !(orr < rl || ol > rr || ot < rb || ob > rt);
+    const bool contained = (ol >= rl && orr <= rr && ob >= rb && ot <= rt);
+    const int type = FPDFPageObj_GetType(o);
+    const bool removeMe = (type == FPDF_PAGEOBJ_TEXT) ? intersects : contained;
+    if (removeMe) FPDFPage_RemoveObject(page, o);
+  }
+  FPDF_PAGEOBJECT box = FPDFPageObj_CreateNewRect(rl, rb, rr - rl, rt - rb);
+  if (box)
+  {
+    FPDFPageObj_SetFillColor(box, 0, 0, 0, 255);
+    FPDFPath_SetDrawMode(box, FPDF_FILLMODE_WINDING, FALSE);
+    FPDFPage_InsertObject(page, box);
+  }
+  return FPDFPage_GenerateContent(page) != 0;
+}
+
 static void InsertAnnotCurrent(int kind, const FS_RECTF* rect = nullptr)
 {
   if (!g.doc || g.pageCount == 0) return;
+  if (kind == ID_ANN_REDACT)
+  {
+    // Redaction is destructive, so it always needs an explicit drawn rectangle
+    // (a plain click does nothing rather than blacking out a random spot).
+    if (!rect) return;
+    FPDF_PAGE page = FPDF_LoadPage(g.doc, g.selected);
+    if (!page) return;
+    BeginEdit();
+    if (RedactArea(page, *rect))
+    {
+      g.dirty = true;
+      DropPageBitmapCaches(g.selected);
+      g.bmDirty = true;
+      InvalidateRect(g.canvas, nullptr, TRUE);
+      InvalidateRect(g.thumbs, nullptr, TRUE);
+      InvalidateRect(g.status, nullptr, TRUE);
+    }
+    else
+    {
+      CancelEdit();
+    }
+    FPDF_ClosePage(page);
+    return;
+  }
   BeginEdit();
   if (InsertAnnot(g.doc, g.selected, kind, rect))
   {
@@ -8640,7 +8740,7 @@ static bool IsHandledCommand(int id)
     case ID_NEXT_TAB: case ID_FIND: case ID_FIND_NEXT: case ID_FIND_PREV:
     case ID_PANE_THUMBS: case ID_PANE_BOOKMARKS:
     case ID_ANN_HL: case ID_ANN_UL: case ID_ANN_NOTE: case ID_ANN_TEXT:
-    case ID_ANN_SHAPE: case ID_ANN_STAMP: case ID_ANN_LINK:
+    case ID_ANN_SHAPE: case ID_ANN_STAMP: case ID_ANN_LINK: case ID_ANN_REDACT:
     case ID_PAGE_EXTRACT: case ID_PAGE_SPLIT: case ID_PAGE_CROP:
     case ID_SEL_ALL: case ID_ROT_ALL: case ID_PRINT: case ID_PRINT_PREVIEW:
     case ID_UNDO: case ID_REDO:
@@ -8742,9 +8842,10 @@ static void DoCommand(int id)
       }
       break;
     }
-    case ID_PAGE_EXTRACT: ExtractCurrentPage(); break;
-    case ID_PAGE_SPLIT:   SplitAllPages(); break;
-    case ID_PAGE_CROP:    CropCurrentPageToContent(); break;
+    case ID_ANN_REDACT: SetAnnotTool(ID_ANN_REDACT); break;
+    case ID_PAGE_EXTRACT: ExtractSelectedPages(); break;
+    case ID_PAGE_SPLIT:   SplitSelectedPages(); break;
+    case ID_PAGE_CROP:    CropSelectedPagesToContent(); break;
     case ID_EXPORT_TEXT:  ExportTextAll(); break;
     case ID_EXPORT_CSV:   ExportCsvAll(); break;
     case ID_WATERMARK:    WatermarkCurrentDoc(); break;
@@ -8829,9 +8930,9 @@ static HMENU BuildMenu()
   AppendMenuW(bar, MF_POPUP, (UINT_PTR)edit, L"&Edit");
 
   HMENU pages = CreatePopupMenu();
-  addItem(pages, ID_PAGE_EXTRACT, L"Extract Current Page...");
-  addItem(pages, ID_PAGE_SPLIT, L"Split Document (one file per page)");
-  addItem(pages, ID_PAGE_CROP, L"Auto-Crop Current Page");
+  addItem(pages, ID_PAGE_EXTRACT, L"Extract Selected Page(s)...");
+  addItem(pages, ID_PAGE_SPLIT, L"Split Selected Pages (one file per page)");
+  addItem(pages, ID_PAGE_CROP, L"Auto-Crop Selected Page(s)");
   AppendMenuW(bar, MF_POPUP, (UINT_PTR)pages, L"Pa&ges");
 
   HMENU annotate = CreatePopupMenu();
@@ -8842,6 +8943,7 @@ static HMENU BuildMenu()
   addItem(annotate, ID_ANN_SHAPE, L"Shape");
   addItem(annotate, ID_ANN_STAMP, L"Stamp");
   addItem(annotate, ID_ANN_LINK, L"Link...");
+  addItem(annotate, ID_ANN_REDACT, L"Redact");
   AppendMenuW(bar, MF_POPUP, (UINT_PTR)annotate, L"Anno&tate");
 
   HMENU view = CreatePopupMenu();
