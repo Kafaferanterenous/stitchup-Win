@@ -952,3 +952,21 @@ Self-test: 465 passed, 0 failed.
 
 Self-test: 465 passed, 0 failed.
 
+
+## v0.12.17 - freehand / pen annotation (2026-10-15)
+- New **Pen** tool on the Annotate ribbon tab (and Annotate menu). Press and
+  draw freehand on a page: the pointer trace is captured live (drawn as a
+  preview in the current foreground colour) and released as a single ink
+  annotation. The stroke uses the foreground colour swatch from the Content tab.
+- Implemented with PDFium's ink API (`FPDFPage_CreateAnnot(FPDF_ANNOT_INK)` +
+  `FPDFAnnot_AddInkStroke`): the annotation stores an `/InkList` of the traced
+  points, a bounding `/Rect`, an RGB `/C` colour and a 1.5-unit `/Border`. It is
+  a normal, undoable, persisted annotation, so it survives save and reload.
+- Canvas pixels are mapped to PDF user space with the same geometry that
+  drag-to-draw placement uses, so the stroke lands under the cursor and scales
+  correctly with zoom. A drag of only a couple of pixels produces no annotation.
+- Verified with PDFium: after saving, the page reports one ink annotation whose
+  `/InkList` contains the traced path, with the expected colour.
+
+Self-test: 465 passed, 0 failed.
+

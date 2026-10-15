@@ -82,6 +82,7 @@ enum
 ID_ANN_STAMP,
 ID_ANN_LINK,
   ID_ANN_REDACT,
+  ID_ANN_INK,
   ID_PAGE_EXTRACT,
   ID_PAGE_SPLIT,
   ID_PAGE_CROP,
@@ -347,6 +348,9 @@ struct App
   int annPage = -1;          // page under the drag start
   POINT annStart{};
   POINT annCur{};
+  // Freehand (pen) capture: the pointer trace in canvas pixels while the ink
+  // tool is dragging. Converted to PDF space and turned into one ink annotation.
+  std::vector<POINT> inkPath;
 
   // Vector shape insertion (Content tab). shapeTool is armed from the Shapes
   // menu; the next left-click drops a default-size shape and a left-drag draws
@@ -7335,8 +7339,20 @@ static void CanvasPaint(HDC dc, int cw, int ch)
     }
   }
 
-  // Drag-to-draw rubber band for the armed annotation tool.
-  if (g.annDrag && g.annTool)
+  // Drag-to-draw rubber band for the armed annotation tool. The pen tool instead
+  // previews the freehand trace it is capturing.
+  if (g.annDrag && g.annTool == ID_ANN_INK)
+  {
+    if (g.inkPath.size() >= 2)
+    {
+      HPEN pen = CreatePen(PS_SOLID, 2, g.fgColor);
+      HGDIOBJ oldPen = SelectObject(dc, pen);
+      Polyline(dc, g.inkPath.data(), (int)g.inkPath.size());
+      SelectObject(dc, oldPen);
+      DeleteObject(pen);
+    }
+  }
+  else if (g.annDrag && g.annTool)
   {
     RECT br{std::min(g.annStart.x, g.annCur.x), std::min(g.annStart.y, g.annCur.y),
             std::max(g.annStart.x, g.annCur.x), std::max(g.annStart.y, g.annCur.y)};
@@ -7359,6 +7375,8 @@ static bool GetLinkAtDevice(FPDF_PAGE page, POINT pt, FPDF_LINK& link);
 static bool FollowLink(FPDF_PAGE page, POINT pt);
 static void InsertAnnotCurrent(int kind, const FS_RECTF* rect);
 static bool DragToPageRect(int page, POINT a, POINT b, FS_RECTF& out);
+static bool InsertFreehandAnnot(int pageIdx, const std::vector<POINT>& trace);
+static void DropPageBitmapCaches(int page);
 static void CancelAnnotTool();
 
 // Maps the canvas viewport onto a destination for a "bookmark this view" entry.
@@ -7582,6 +7600,8 @@ static LRESULT CALLBACK CanvasProc(HWND hw, UINT msg, WPARAM wp, LPARAM lp)
           g.annPage = hi.page;
           g.annStart = pt;
           g.annCur = pt;
+          g.inkPath.clear();
+          if (g.annTool == ID_ANN_INK) g.inkPath.push_back(pt);
           SetCapture(hw);
           return 0;
         }
@@ -7699,6 +7719,14 @@ static LRESULT CALLBACK CanvasProc(HWND hw, UINT msg, WPARAM wp, LPARAM lp)
       if (g.annDrag && GetCapture() == hw)
       {
         g.annCur = POINT{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
+        if (g.annTool == ID_ANN_INK)
+        {
+          // Record the trace, dropping sub-pixel jitter so the stroke stays
+          // compact.
+          const POINT last = g.inkPath.empty() ? g.annStart : g.inkPath.back();
+          if (std::abs(g.annCur.x - last.x) + std::abs(g.annCur.y - last.y) >= 2)
+            g.inkPath.push_back(g.annCur);
+        }
         InvalidateRect(hw, nullptr, FALSE);
         return 0;
       }
@@ -7769,6 +7797,29 @@ static LRESULT CALLBACK CanvasProc(HWND hw, UINT msg, WPARAM wp, LPARAM lp)
         // Arm the page that was drawn on, then place the annotation. A drag of
         // a few pixels or less falls back to the kind's default rectangle.
         if (page >= 0 && page < g.pageCount) g.selected = page;
+        if (kind == ID_ANN_INK)
+        {
+          // Freehand: the trace itself is the annotation, so straight to an ink
+          // annot with no default-shape fallback for a plain click.
+          BeginEdit();
+          if (page >= 0 && InsertFreehandAnnot(page, g.inkPath))
+          {
+            g.dirty = true;
+            DropPageBitmapCaches(page);
+            g.bmDirty = true;
+            InvalidateRect(hw, nullptr, TRUE);
+            InvalidateRect(g.thumbs, nullptr, TRUE);
+            InvalidateRect(g.status, nullptr, TRUE);
+          }
+          else
+          {
+            CancelEdit();
+          }
+          g.inkPath.clear();
+          SetCursor(LoadCursorW(nullptr, IDC_ARROW));
+          InvalidateRect(g.status, nullptr, TRUE);
+          return 0;
+        }
         const int dx = std::abs(b.x - a.x), dy = std::abs(b.y - a.y);
         FS_RECTF rc{};
         const bool drawn = (dx >= 4 || dy >= 4) &&
@@ -8263,6 +8314,8 @@ static void BuildToolbar(HWND)
      L"Place a clickable web link on the page"},
     {ID_ANN_REDACT,   L"Redact",     62, 2, 0xE7BA, false,
      L"Drag over content to permanently remove it and black it out"},
+    {ID_ANN_INK,      L"Pen",        56, 2, 0xE76D, false,
+     L"Draw freehand lines on the page"},
     {ID_TOOL_SELECT,  L"Select",     62, 3, 0xE8B0, false,
      L"Click a content object to select it, then drag to move it"},
     {ID_OBJ_EDIT,     L"Edit Text",  78, 3, 0xE70F, false,
@@ -8889,6 +8942,8 @@ static void SetAnnotTool(int kind)
 {
   g.annTool = kind;
   g.annDrag = false;
+  g.shapeTool = SHAPE_NONE;   // the pen/annotate tool takes precedence
+  g.inkPath.clear();
   if (g.canvas)
   {
     SetCursor(LoadCursorW(nullptr, IDC_CROSS));
@@ -8905,6 +8960,7 @@ static void CancelAnnotTool()
   g.shapeTool = SHAPE_NONE;
   g.annDrag = false;
   g.annPage = -1;
+  g.inkPath.clear();
   if (g.canvas)
   {
     SetCursor(LoadCursorW(nullptr, IDC_ARROW));
@@ -8951,6 +9007,80 @@ static bool DragToPageRect(int page, POINT a, POINT b, FS_RECTF& out)
   const double bo = std::min(y1, y2), to = std::max(y1, y2);
   out = FS_RECTF{(float)l, (float)to, (float)r, (float)bo};
   return true;
+}
+
+// Maps one canvas-client pixel on `page` to PDF user space, clamped to the page.
+// Same geometry as DragToPageRect, used to turn a freehand trace into points.
+static bool CanvasPointToPdf(int page, POINT p, float& ox, float& oy)
+{
+  if (!g.doc || page < 0 || page >= g.pageCount) return false;
+  int cw = 120;
+  if (g.canvas)
+  {
+    RECT cr{};
+    GetClientRect(g.canvas, &cr);
+    cw = cr.right - cr.left;
+  }
+  std::vector<RECT> rects;
+  int cwDummy = 0, chDummy = 0;
+  LayoutPages(cw, rects, cwDummy, chDummy);
+  if (page >= (int)rects.size()) return false;
+  const RECT& pr = rects[page];
+  if (pr.right - pr.left < 1 || pr.bottom - pr.top < 1) return false;
+  const POINT org = PageOrigin((int)std::lround(g.scrollX),
+                               (int)std::lround(g.scrollY));
+  const double s = g.zoom > 0 ? g.zoom : 1.0;
+  const double pw = PageW(page), ph = PageH(page);
+  double lx = (p.x - (pr.left + org.x)) / s;
+  double ly = ph - (p.y - (pr.top + org.y)) / s;
+  lx = lx < 0 ? 0 : (lx > pw ? pw : lx);
+  ly = ly < 0 ? 0 : (ly > ph ? ph : ly);
+  ox = (float)lx;
+  oy = (float)ly;
+  return true;
+}
+
+// Creates a freehand (ink) annotation from a traced path of canvas pixels,
+// stroked in the current foreground colour. Returns false when the trace is too
+// short to be a stroke. Pure FPDF work, mirroring InsertAnnot for the GUI path.
+static bool InsertFreehandAnnot(int pageIdx, const std::vector<POINT>& trace)
+{
+  if (!g.doc || pageIdx < 0 || pageIdx >= g.pageCount) return false;
+  std::vector<FS_POINTF> pts;
+  pts.reserve(trace.size());
+  for (POINT p : trace)
+  {
+    float x = 0, y = 0;
+    if (CanvasPointToPdf(pageIdx, p, x, y)) pts.push_back(FS_POINTF{x, y});
+  }
+  if (pts.size() < 2) return false;
+
+  FPDF_PAGE page = FPDF_LoadPage(g.doc, pageIdx);
+  if (!page) return false;
+  FPDF_ANNOTATION a = FPDFPage_CreateAnnot(page, FPDF_ANNOT_INK);
+  bool ok = false;
+  if (a)
+  {
+    float l = pts[0].x, r = pts[0].x, bo = pts[0].y, t = pts[0].y;
+    for (const FS_POINTF& q : pts)
+    {
+      l = std::min(l, q.x); r = std::max(r, q.x);
+      bo = std::min(bo, q.y); t = std::max(t, q.y);
+    }
+    FS_RECTF rc{l - 2.0f, t + 2.0f, r + 2.0f, bo - 2.0f};
+    ok = FPDFAnnot_SetRect(a, &rc) != 0;
+    ok = ok && (FPDFAnnot_AddInkStroke(a, pts.data(), pts.size()) >= 0);
+    const COLORREF c = g.fgColor;
+    ok = ok && (FPDFAnnot_SetColor(a, FPDFANNOT_COLORTYPE_Color,
+                                   GetRValue(c), GetGValue(c), GetBValue(c),
+                                   255) != 0);
+    FPDFAnnot_SetBorder(a, 0, 0, 1.5f);
+    SetAnnotText(a, "Contents", L"Freehand drawing added by Stitchup.");
+    if (ok) FPDFAnnot_SetFlags(a, FPDF_ANNOT_FLAG_PRINT);
+    FPDFPage_CloseAnnot(a);
+  }
+  FPDF_ClosePage(page);
+  return ok;
 }
 
 // --- Vector shape insertion (Content tab) ----------------------------------
@@ -9465,6 +9595,7 @@ static bool IsHandledCommand(int id)
     case ID_PANE_THUMBS: case ID_PANE_BOOKMARKS:
     case ID_ANN_HL: case ID_ANN_UL: case ID_ANN_NOTE: case ID_ANN_TEXT:
     case ID_ANN_SHAPE: case ID_ANN_STAMP: case ID_ANN_LINK: case ID_ANN_REDACT:
+    case ID_ANN_INK:
     case ID_PAGE_EXTRACT: case ID_PAGE_SPLIT: case ID_PAGE_CROP:
     case ID_SEL_ALL: case ID_ROT_ALL: case ID_PRINT: case ID_PRINT_PREVIEW:
     case ID_UNDO: case ID_REDO:
@@ -9590,6 +9721,7 @@ static void DoCommand(int id)
       break;
     }
     case ID_ANN_REDACT: SetAnnotTool(ID_ANN_REDACT); break;
+    case ID_ANN_INK:    SetAnnotTool(ID_ANN_INK); break;
     case ID_PAGE_EXTRACT: ExtractSelectedPages(); break;
     case ID_PAGE_SPLIT:   SplitSelectedPages(); break;
     case ID_PAGE_CROP:    CropSelectedPagesToContent(); break;
@@ -9693,6 +9825,7 @@ static HMENU BuildMenu()
   addItem(annotate, ID_ANN_STAMP, L"Stamp");
   addItem(annotate, ID_ANN_LINK, L"Link...");
   addItem(annotate, ID_ANN_REDACT, L"Redact");
+addItem(annotate, ID_ANN_INK, L"Pen");
   AppendMenuW(bar, MF_POPUP, (UINT_PTR)annotate, L"Anno&tate");
 
   HMENU view = CreatePopupMenu();

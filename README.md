@@ -224,6 +224,8 @@ project (github.com/bblanchon/pdfium-binaries). Non-GPL build.
 - Annotation placement is drag-to-draw: pick a tool, drag the rectangle on the
   page. A plain click still uses a sensible default rectangle, and Esc cancels
   the armed tool. (The earlier build placed every annotation at a fixed spot.)
+  The Pen tool is the exception: press and draw freehand, and the trace becomes
+  a single ink annotation stroked in the current foreground colour.
 - Tools menu/ribbon tab hosts the Security (Save As Encrypted) and Export
   (Export Text / Export CSV) groups.
 
@@ -237,7 +239,6 @@ Not yet implemented, roughly by how much a user notices them missing:
 ### Nice to have
 
 - OCR, so scanned pages become searchable
-- Freehand / pen annotation
 - Metadata editor (title, author, subject, keywords)
 - View embedded file attachments
 - Drag a page into another open document
