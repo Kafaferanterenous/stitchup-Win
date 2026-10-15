@@ -202,11 +202,16 @@ project (github.com/bblanchon/pdfium-binaries). Non-GPL build.
   single-exe build is planned but first requires building PDFium with the
   static CRT from source (the prebuilt import lib is not static).
 - Shell + annotations + link activation + page management (extract/split/
-  auto-crop) + text export + CSV export + password-unlock + watermarks +
-  encrypt-on-save are done. Rendering, page model,
-  editing operations, ribbon navigation, the bookmarks pane, annotation
-  creation/persistence, link navigation, link *creation* and page
-  extract/split/crop are functional.
+  auto-crop, now selection-aware) + text export + CSV export + password-unlock +
+  watermarks + encrypt-on-save + redaction + digital signatures are done.
+  Rendering, page model, editing operations, ribbon navigation, the bookmarks
+  pane, annotation creation/persistence, link navigation, link *creation* and
+  page extract/split/crop are functional.
+- Digital signatures are written as an incremental update with Windows
+  CryptoAPI only (no third-party crypto library): a throw-away self-signed
+  RSA-2048 certificate signs a detached PKCS#7 (CMS, SHA-256) over the file's
+  byte range. The signature covers the whole file and the signed copy is written
+  to a new file, leaving the original untouched.
 - Link *creation* works on the bundled PDFium: a hyperlink is a /Link
   annotation, and PDFium exposes `FPDFPage_CreateAnnot` plus
   `FPDFAnnot_SetURI` for writing the target. A newer `pdfium.dll` is therefore
@@ -221,10 +226,6 @@ project (github.com/bblanchon/pdfium-binaries). Non-GPL build.
 
 Not yet implemented, roughly by how much a user notices them missing:
 
-- File compression / reduce file size
-- Digital signatures (needs a crypto library beyond what is linked)
-- Redaction (needs real content removal, not an overlay)
-- Extract, Split and Auto-Crop still act on the focused page only
 - Internal page-destination link creation — blocked: PDFium reads destinations
   but exposes no API to write one
 - Static single-exe build — blocked: requires rebuilding PDFium from source with

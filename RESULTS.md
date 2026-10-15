@@ -909,3 +909,23 @@ Self-test: 465 passed, 0 failed.
 
 Self-test: 465 passed, 0 failed.
 
+
+## v0.12.15 - digital signatures (2026-10-15)
+- **Sign Document...** (File menu, or the Sign button on the Security ribbon
+  tab) asks for a signer name, then writes a signed copy to a file you choose.
+  The original is never modified.
+- The signature is added as a PDF **incremental update** and uses only Windows
+  CryptoAPI (no third-party crypto library): a throw-away RSA-2048 self-signed
+  certificate signs a **detached PKCS#7 (CMS) signature using SHA-256** over the
+  file's `/ByteRange`. The byte range spans the whole file (from byte 0 to EOF,
+  excluding only the `/Contents` placeholder), the signature covers the new
+  xref/trailer, and the temporary key container is deleted afterwards.
+- The signed file gains a `/Sig` field widget on the current page, an
+  `/AcroForm` entry with `/SigFlags 3`, and a `/Sig` dictionary
+  (`/Filter /Adobe.PPKLite`, `/SubFilter /adbe.pkcs7.detached`).
+- Verified by re-opening the signed output with PDFium (page count preserved,
+  signature annotation present) and by validating the CMS signature against the
+  byte range with an independent RSA/SHA-256 check.
+
+Self-test: 465 passed, 0 failed.
+

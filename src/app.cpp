@@ -11,6 +11,7 @@
 #include <uxtheme.h>
 #include <dwmapi.h>
 #include <winver.h>
+#include <wincrypt.h>
 
 #pragma warning(push, 0)
 #include <fpdfview.h>
@@ -89,6 +90,7 @@ ID_ANN_LINK,
   ID_THEME,
   ID_WATERMARK,
   ID_SAVEENC,
+  ID_SIGN,
   ID_TOOL_SELECT,
   ID_OBJ_EDIT,
   ID_OBJ_DELETE,
@@ -2500,6 +2502,19 @@ bool ObjBody(const std::string& s, const std::map<int, size_t>& offs, int num,
   return out.dict;
 }
 
+// Like ObjBody but accepts any object (e.g. a bare array), not only a dict.
+bool ObjBodyAny(const std::string& s, const std::map<int, size_t>& offs,
+                int num, Obj& out)
+{
+  const auto it = offs.find(num);
+  if (it == offs.end()) return false;
+  if (!ReadObjHeader(s, it->second, out)) return false;
+  out.end = s.find("endobj", out.body);
+  if (out.end == std::string::npos) return false;
+  while (out.end > out.body && IsWs(s[out.end - 1])) --out.end;
+  return true;
+}
+
 // PDF text string as a literal string holding UTF-16BE with a BOM, which pdfium
 // decodes on read-back. The delimiters and backslash are escaped.
 std::string TextString(const std::wstring& s)
@@ -2870,6 +2885,433 @@ static bool AppendOutlines(std::string& pdf, const std::vector<UserBookmark>& bm
   return true;
 }
 
+// --- Digital signatures (Windows CryptoAPI) --------------------------------
+namespace sigout {
+
+// Inserts " N 0 R" just before the closing ']' of the array string `arr`.
+std::string AppendRefToArray(const std::string& arr, int num)
+{
+  const size_t close = arr.rfind(']');
+  if (close == std::string::npos) return arr;
+  return arr.substr(0, close) + " " + std::to_string(num) + " 0 R " +
+         arr.substr(close);
+}
+
+// Adds `fieldNum` to a signature AcroForm dictionary and forces /SigFlags 3 so
+// viewers treat the file as signature-bearing.
+std::string AddFieldToAcroForm(const std::string& af, int fieldNum)
+{
+  using namespace pdfout;
+  std::string d = af;
+  if (d.size() < 2 || d.compare(d.size() - 2, 2, ">>") != 0) return d;
+  size_t vs, ve;
+  if (FindKey(d, 0, d.size(), "Fields", vs, ve) && vs < d.size() && d[vs] == '[')
+  {
+    const size_t close = ve - 1;   // position of ']'
+    d = d.substr(0, close) + " " + std::to_string(fieldNum) + " 0 R " +
+        d.substr(close);
+  }
+  else
+  {
+    d = d.substr(0, d.size() - 2) + " /Fields [ " + std::to_string(fieldNum) +
+        " 0 R ] " + d.substr(d.size() - 2);
+  }
+  size_t svs, sve;
+  if (FindKey(d, 0, d.size(), "SigFlags", svs, sve))
+    d = d.substr(0, svs) + "3" + d.substr(sve);
+  else
+    d = d.substr(0, d.size() - 2) + " /SigFlags 3 " + d.substr(d.size() - 2);
+  return d;
+}
+
+std::string HexLower(const std::vector<unsigned char>& b)
+{
+  static const char* d = "0123456789abcdef";
+  std::string s;
+  s.reserve(b.size() * 2);
+  for (unsigned char c : b)
+  {
+    s += d[(c >> 4) & 0xF];
+    s += d[c & 0xF];
+  }
+  return s;
+}
+
+// "D:YYYYMMDDHHmmSSZ" (UTC), the PDF date format used by /M.
+std::string PdfDateUtcNow()
+{
+  SYSTEMTIME st;
+  GetSystemTime(&st);
+  char buf[40];
+  _snprintf_s(buf, _TRUNCATE, "D:%04d%02d%02d%02d%02d%02dZ", st.wYear,
+              st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond);
+  return buf;
+}
+
+// Creates a throw-away RSA-2048 self-signed certificate for `commonName` and
+// returns a detached PKCS#7 (CMS) signature of `data` using SHA-256. The key
+// container is deleted before returning, so nothing is left on the machine.
+bool MakeDetachedPkcs7(const std::vector<unsigned char>& data,
+                       const std::wstring& commonName,
+                       std::vector<unsigned char>& out, std::wstring& err)
+{
+  out.clear();
+  HCRYPTPROV hProv = 0;
+  HCRYPTKEY hKey = 0;
+  PCCERT_CONTEXT cert = nullptr;
+  bool ok = false;
+  const std::wstring container =
+      L"StitchupSign_" + std::to_wstring(GetTickCount64());
+  do
+  {
+    if (!CryptAcquireContextW(&hProv, container.c_str(), MS_ENH_RSA_AES_PROV_W,
+                              PROV_RSA_AES, CRYPT_NEWKEYSET))
+    {
+      err = L"Could not create a signing key container.";
+      break;
+    }
+    if (!CryptGenKey(hProv, AT_SIGNATURE, 2048u << 16, &hKey))
+    {
+      err = L"Could not generate a 2048-bit RSA key.";
+      break;
+    }
+    CRYPT_KEY_PROV_INFO kv{};
+    kv.pwszContainerName = const_cast<LPWSTR>(container.c_str());
+    kv.pwszProvName = const_cast<LPWSTR>(MS_ENH_RSA_AES_PROV_W);
+    kv.dwProvType = PROV_RSA_AES;
+    kv.dwKeySpec = AT_SIGNATURE;
+
+    const std::wstring dn = L"CN=" + commonName;
+    BYTE nameBuf[512];
+    DWORD nameLen = sizeof(nameBuf);
+    if (!CertStrToNameW(X509_ASN_ENCODING, dn.c_str(), CERT_X500_NAME_STR,
+                        nullptr, nameBuf, &nameLen, nullptr))
+    {
+      err = L"Could not encode the signer name.";
+      break;
+    }
+    CERT_NAME_BLOB subject{nameLen, nameBuf};
+
+    CRYPT_ALGORITHM_IDENTIFIER sigAlg{};
+    sigAlg.pszObjId = const_cast<LPSTR>("1.2.840.113549.1.1.11");  // SHA256-RSA
+    cert = CertCreateSelfSignCertificate(0, &subject, 0, &kv, &sigAlg, nullptr,
+                                         nullptr, nullptr);
+    if (!cert)
+    {
+      err = L"Could not create a self-signed certificate.";
+      break;
+    }
+
+    CRYPT_SIGN_MESSAGE_PARA sp{};
+    sp.cbSize = sizeof(sp);
+    sp.dwMsgEncodingType = X509_ASN_ENCODING | PKCS_7_ASN_ENCODING;
+    sp.pSigningCert = cert;
+    sp.HashAlgorithm.pszObjId =
+        const_cast<LPSTR>("2.16.840.1.101.3.4.2.1");  // SHA-256
+    sp.cMsgCert = 1;
+    sp.rgpMsgCert = &cert;
+
+    const BYTE* p = data.empty() ? reinterpret_cast<const BYTE*>("") : data.data();
+    DWORD cb = (DWORD)data.size();
+    DWORD cbBlob = 0;
+    if (!CryptSignMessage(&sp, TRUE, 1, &p, &cb, nullptr, &cbBlob))
+    {
+      err = L"Could not size the PKCS#7 signature.";
+      break;
+    }
+    out.resize(cbBlob);
+    if (!CryptSignMessage(&sp, TRUE, 1, &p, &cb, out.data(), &cbBlob))
+    {
+      err = L"Could not create the PKCS#7 signature.";
+      break;
+    }
+    out.resize(cbBlob);
+    ok = true;
+  } while (false);
+
+  if (cert) CertFreeCertificateContext(cert);
+  if (hKey) CryptDestroyKey(hKey);
+  if (hProv) CryptReleaseContext(hProv, 0);
+  HCRYPTPROV del = 0;
+  CryptAcquireContextW(&del, container.c_str(), MS_ENH_RSA_AES_PROV_W,
+                       PROV_RSA_AES, CRYPT_DELETEKEYSET);
+  return ok;
+}
+
+}  // namespace sigout
+
+// Appends a digital signature to an already-serialized PDF as an incremental
+// update: a widget/field annotation is added to `signPage`, the catalog gains
+// an /AcroForm holding it, and a /Sig dictionary carries a detached PKCS#7
+// signature over the file's byte range. The digest and /Contents blob are
+// produced last, over the exact bytes that are written.
+static bool AppendSignature(std::string& pdf, int signPage, int expectPages,
+                            const std::wstring& signerName,
+                            const std::wstring& reason,
+                            const std::wstring& location, std::wstring* err)
+{
+  using namespace pdfout;
+  using namespace sigout;
+  auto fail = [&](const wchar_t* m) {
+    if (err) *err = m;
+    return false;
+  };
+
+  const size_t sx = pdf.rfind("startxref");
+  if (sx == std::string::npos) return fail(L"The saved file has no startxref.");
+  size_t sp = sx + 9;
+  const long long baseXref = ReadInt(pdf, sp);
+  if (baseXref <= 0 || baseXref >= (long long)pdf.size())
+    return fail(L"The saved file has a broken startxref.");
+
+  XrefBase base;
+  if (!ParseBase(pdf, (size_t)baseXref, base))
+    return fail(L"The saved file's cross-reference section is unreadable.");
+  std::map<int, size_t> offs = base.offs;
+  if (offs.find(base.rootObj) == offs.end() && !ScanObjects(pdf, offs))
+    return fail(L"No objects found in the saved file.");
+  const int rootObj = base.rootObj;
+  const bool isTable = base.table;
+
+  Obj cat;
+  if (!ObjBody(pdf, offs, rootObj, cat)) return fail(L"Catalog object not found.");
+  int pagesObj = 0;
+  if (!GetRefEntry(pdf, cat.body, cat.end, "Pages", pagesObj))
+    return fail(L"Catalog has no /Pages reference.");
+  std::vector<int> pageObjs;
+  if (!CollectPages(pdf, offs, pagesObj, pageObjs))
+    return fail(L"Could not walk the page tree.");
+  if (expectPages > 0 && (int)pageObjs.size() != expectPages)
+    return fail(L"Page tree does not match the open document.");
+  if (signPage < 0 || signPage >= (int)pageObjs.size())
+    return fail(L"The signature page is out of range.");
+  const int pageObj = pageObjs[signPage];
+
+  long long next = base.size;
+  if (next < 1) next = 1;
+  const int widgetNum = (int)next++;
+  const int sigNum = (int)next++;
+  const long long newSize = next;
+
+  const size_t contentHex = 16384;   // hex chars: 8192 bytes of CMS capacity
+
+  std::string sigDict =
+      "<< /Type /Sig /Filter /Adobe.PPKLite /SubFilter /adbe.pkcs7.detached"
+      " /ByteRange [0000000000 0000000000 0000000000 0000000000]"
+      " /Contents <" + std::string(contentHex, '0') + ">" +
+      " /M " + PdfDateUtcNow() + " /Name " + TextString(signerName);
+  if (!reason.empty()) sigDict += " /Reason " + TextString(reason);
+  if (!location.empty()) sigDict += " /Location " + TextString(location);
+  sigDict += " >>";
+
+  const std::string widgetDict =
+      "<< /Type /Annot /Subtype /Widget /FT /Sig /T (Signature1)"
+      " /V " + std::to_string(sigNum) + " 0 R" +
+      " /Rect [36 36 300 120] /P " + std::to_string(pageObj) + " 0 R /F 4 >>";
+
+  // Extra existing objects (indirect /Annots array, indirect /AcroForm) that
+  // must be re-emitted with the field added.
+  std::vector<std::pair<int, std::string>> pendingExtra;
+
+  // --- page: add the widget to /Annots --------------------------------------
+  std::string pageDict;
+  {
+    Obj pg;
+    if (!ObjBody(pdf, offs, pageObj, pg)) return fail(L"Page object not found.");
+    std::string pd = pdf.substr(pg.body, pg.end - pg.body);
+    if (pd.size() < 2 || pd.compare(pd.size() - 2, 2, ">>") != 0)
+      return fail(L"Page dictionary is malformed.");
+    size_t vs, ve;
+    if (FindKey(pd, 0, pd.size(), "Annots", vs, ve) && vs < pd.size())
+    {
+      if (pd[vs] == '[')
+      {
+        const size_t close = ve - 1;
+        pd = pd.substr(0, close) + " " + std::to_string(widgetNum) + " 0 R " +
+             pd.substr(close);
+      }
+      else
+      {
+        int arrNum = 0;
+        if (!GetRefEntry(pdf, pg.body, pg.end, "Annots", arrNum))
+          return fail(L"Unsupported /Annots reference.");
+        Obj ar;
+        if (!ObjBodyAny(pdf, offs, arrNum, ar) ||
+            pdf.compare(ar.body, 1, "[") != 0)
+          return fail(L"Unsupported /Annots array.");
+        // Re-emit the referenced array object with the widget appended.
+        std::string arr = pdf.substr(ar.body, ar.end - ar.body);
+        arr = AppendRefToArray(arr, widgetNum);
+        pendingExtra.push_back({arrNum, arr});
+      }
+    }
+    else
+    {
+      pd = pd.substr(0, pd.size() - 2) + " /Annots [ " +
+           std::to_string(widgetNum) + " 0 R ] " + pd.substr(pd.size() - 2);
+    }
+    pageDict = pd;
+  }
+
+  // --- catalog: ensure /AcroForm holds the field ----------------------------
+  std::string catDict;
+  {
+    std::string cd = pdf.substr(cat.body, cat.end - cat.body);
+    if (cd.size() < 2 || cd.compare(cd.size() - 2, 2, ">>") != 0)
+      return fail(L"Catalog dictionary is malformed.");
+    size_t vs, ve;
+    if (FindKey(cd, 0, cd.size(), "AcroForm", vs, ve) && vs < cd.size())
+    {
+      if (cd[vs] == '<' && cd[vs + 1] == '<')
+      {
+        const std::string af = AddFieldToAcroForm(cd.substr(vs, ve - vs), widgetNum);
+        cd = cd.substr(0, vs) + af + cd.substr(ve);
+      }
+      else
+      {
+        int afNum = 0;
+        if (!GetRefEntry(pdf, cat.body, cat.end, "AcroForm", afNum))
+          return fail(L"Unsupported /AcroForm reference.");
+        Obj ao;
+        if (!ObjBodyAny(pdf, offs, afNum, ao) || !ao.dict)
+          return fail(L"Unsupported /AcroForm object.");
+        std::string af =
+            AddFieldToAcroForm(pdf.substr(ao.body, ao.end - ao.body), widgetNum);
+        pendingExtra.push_back({afNum, af});
+      }
+    }
+    else
+    {
+      cd = cd.substr(0, cd.size() - 2) + " /AcroForm << /Fields [ " +
+           std::to_string(widgetNum) + " 0 R ] /SigFlags 3 >> " +
+           cd.substr(cd.size() - 2);
+    }
+    catDict = cd;
+  }
+
+  // --- emit the new/updated objects -----------------------------------------
+  std::string add = "\n";
+  auto emitObj = [&](int num, const std::string& body) {
+    add += std::to_string(num) + " 0 obj\n" + body + "\nendobj\n";
+  };
+  emitObj(widgetNum, widgetDict);
+  emitObj(sigNum, sigDict);
+  emitObj(pageObj, pageDict);
+  emitObj(rootObj, catDict);
+  for (const auto& e : pendingExtra) emitObj(e.first, e.second);
+
+  std::vector<int> nums{widgetNum, sigNum, pageObj, rootObj};
+  for (const auto& e : pendingExtra) nums.push_back(e.first);
+  std::sort(nums.begin(), nums.end());
+  nums.erase(std::unique(nums.begin(), nums.end()), nums.end());
+
+  // --- cross-reference section, appended into `add` (not yet committed) ------
+  std::map<int, size_t> newOffs;
+  for (int n : nums)
+  {
+    const std::string pat = "\n" + std::to_string(n) + " 0 obj\n";
+    const size_t at = add.find(pat);
+    if (at == std::string::npos) return fail(L"Internal: lost an object.");
+    newOffs[n] = pdf.size() + at + 1;
+  }
+
+  if (isTable)
+  {
+    const size_t tableAt = pdf.size() + add.size();
+    add += "xref\n";
+    for (size_t i = 0; i < nums.size();)
+    {
+      size_t j = i;
+      while (j + 1 < nums.size() && nums[j + 1] == nums[j] + 1) ++j;
+      add += std::to_string(nums[i]) + " " + std::to_string(j - i + 1) + "\n";
+      for (size_t k = i; k <= j; ++k)
+      {
+        char row[32];
+        _snprintf_s(row, _TRUNCATE, "%010llu 00000 n \n",
+                    (unsigned long long)newOffs[nums[k]]);
+        add += row;
+      }
+      i = j + 1;
+    }
+    add += "trailer\n<< /Size " + std::to_string(newSize) + " /Root " +
+           std::to_string(rootObj) + " 0 R /Prev " + std::to_string(baseXref) +
+           " >>\nstartxref\n" + std::to_string(tableAt) + "\n%%EOF\n";
+  }
+  else
+  {
+    const int xrefNum = (int)newSize;
+    std::string index, rows;
+    for (size_t i = 0; i < nums.size(); ++i)
+    {
+      if (i) index += " ";
+      index += std::to_string(nums[i]) + " 1";
+      const unsigned use = (unsigned)newOffs[nums[i]];
+      rows += (char)1;
+      rows += (char)((use >> 24) & 0xFF);
+      rows += (char)((use >> 16) & 0xFF);
+      rows += (char)((use >> 8) & 0xFF);
+      rows += (char)(use & 0xFF);
+      rows += (char)0;
+      rows += (char)0;
+    }
+    const size_t xrefObjOffset = pdf.size() + add.size();
+    add += std::to_string(xrefNum) + " 0 obj\n<< /Type /XRef /Size " +
+           std::to_string(newSize + 1) + " /Root " + std::to_string(rootObj) +
+           " 0 R /Prev " + std::to_string(baseXref) + " /W [1 4 2] /Index [" +
+           index + "] /Length " + std::to_string(rows.size()) +
+           " >>\nstream\n" + rows + "\nendstream\nendobj\nstartxref\n" +
+           std::to_string(xrefObjOffset) + "\n%%EOF\n";
+  }
+
+  // --- byte range + signature over the entire file ---------------------------
+  // `add` now holds every appended byte including the xref/trailer, so the
+  // second byte range runs to the true end of the file (required for a
+  // whole-file signature). Filling the fixed-width placeholder and the reserved
+  // /Contents hex does not move any offsets.
+  const size_t prefix = pdf.size();
+  const std::string kBr = "[0000000000 0000000000 0000000000 0000000000]";
+  const size_t br = add.find(kBr);
+  const std::string kCt = "/Contents <";
+  const size_t ct = add.find(kCt);
+  if (br == std::string::npos || ct == std::string::npos)
+    return fail(L"Internal: signature placeholders were lost.");
+  const size_t ltAbs = prefix + ct + kCt.size();          // offset of '<'
+  const size_t gapEnd = ltAbs + 1 + contentHex + 1;        // just past '>'
+  const size_t total = prefix + add.size();
+
+  char brBuf[64];
+  _snprintf_s(brBuf, _TRUNCATE, "[%010llu %010llu %010llu %010llu]",
+              (unsigned long long)0, (unsigned long long)ltAbs,
+              (unsigned long long)gapEnd, (unsigned long long)(total - gapEnd));
+  add.replace(br, kBr.size(), brBuf);
+
+  std::vector<unsigned char> digest;
+  digest.reserve(pdf.size() + add.size());
+  digest.insert(digest.end(), (const unsigned char*)pdf.data(),
+                (const unsigned char*)pdf.data() + pdf.size());
+  digest.insert(digest.end(), (const unsigned char*)add.data(),
+                (const unsigned char*)add.data() + (ltAbs - prefix));
+  digest.insert(digest.end(),
+                (const unsigned char*)add.data() + (gapEnd - prefix),
+                (const unsigned char*)add.data() + add.size());
+
+  std::vector<unsigned char> pkcs7;
+  std::wstring cerr;
+  if (!MakeDetachedPkcs7(digest, signerName, pkcs7, cerr))
+  {
+    if (err) *err = cerr;
+    return false;
+  }
+  std::string hex = HexLower(pkcs7);
+  if (hex.size() > contentHex)
+    return fail(L"The signature is larger than the reserved space.");
+  hex.resize(contentHex, '0');
+  std::copy(hex.begin(), hex.end(), add.begin() + (ct + kCt.size()));
+
+  pdf += add;
+  return true;
+}
+
 // Serializes the open document to memory, folding in any user bookmarks that
 // have been added but not yet written to disk. Returns false (with a message
 // when interactive) if serialization or the outline write failed, so a bookmark
@@ -3034,6 +3476,69 @@ static void SaveInPlace()
   if (g.canvas) InvalidateRect(g.canvas, nullptr, TRUE);
   if (g.thumbs) InvalidateRect(g.thumbs, nullptr, TRUE);
   InvalidateRect(g.status, nullptr, TRUE);
+}
+
+// Signs the open document and writes the signed copy to a file the user picks.
+// The original is never touched: the current state is serialized (folding in
+// any pending bookmarks) and a signature is appended, then the result is saved.
+static void SignDocument()
+{
+  if (!g.doc || g.pageCount == 0) return;
+  std::wstring signer;
+  if (!PromptText(signer, L"Stitchup User", L"Sign Document", L"Signer name:",
+                  false))
+    return;
+
+  std::wstring base = g.name.empty() ? L"document" : g.name;
+  if (base.size() > 4 && _wcsicmp(base.c_str() + base.size() - 4, L".pdf") == 0)
+    base = base.substr(0, base.size() - 4);
+  base += L" - signed.pdf";
+
+  wchar_t file[MAX_PATH] = L"";
+  wcsncpy_s(file, base.c_str(), _TRUNCATE);
+  OPENFILENAMEW ofn{};
+  ofn.lStructSize = sizeof(ofn);
+  ofn.hwndOwner = g.frame;
+  ofn.lpstrFilter = L"PDF Files (*.pdf)\0*.pdf\0\0";
+  ofn.lpstrFile = file;
+  ofn.nMaxFile = MAX_PATH;
+  ofn.lpstrDefExt = L"pdf";
+  ofn.Flags = OFN_OVERWRITEPROMPT | OFN_PATHMUSTEXIST | OFN_HIDEREADONLY;
+  if (!GetSaveFileNameW(&ofn)) return;
+
+  std::vector<unsigned char> buf;
+  if (!SerializeForSave(buf, true)) return;
+  std::string pdf(reinterpret_cast<const char*>(buf.data()), buf.size());
+  std::wstring err;
+  if (!AppendSignature(pdf, g.selected, FPDF_GetPageCount(g.doc), signer, L"",
+                       L"", &err))
+  {
+    MessageBoxW(g.frame, (L"Signing failed:\n" + err).c_str(), L"Stitchup",
+                MB_OK | MB_ICONWARNING);
+    return;
+  }
+
+  const std::wstring target = file;
+  const std::wstring tmp = target + L".tmp";
+  FILE* f = nullptr;
+  if (_wfopen_s(&f, tmp.c_str(), L"wb") != 0)
+  {
+    MessageBoxW(g.frame, L"Could not create the signed file.", L"Stitchup",
+                MB_OK | MB_ICONWARNING);
+    return;
+  }
+  const bool okw = fwrite(pdf.data(), 1, pdf.size(), f) == pdf.size();
+  fclose(f);
+  if (!okw || !MoveFileExW(tmp.c_str(), target.c_str(),
+                           MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH))
+  {
+    DeleteFileW(tmp.c_str());
+    MessageBoxW(g.frame, L"Could not write the signed file.", L"Stitchup",
+                MB_OK | MB_ICONWARNING);
+    return;
+  }
+  MessageBoxW(g.frame, (L"Signed document written to:\n" + target).c_str(),
+              L"Stitchup", MB_OK | MB_ICONINFORMATION);
 }
 
 static bool SaveAsString(FPDF_DOCUMENT d, std::vector<unsigned char>& out);
@@ -7576,6 +8081,8 @@ static void BuildToolbar(HWND)
      L"Place a common status stamp (Draft, Approved, Sold, Paid, ...)"},
     {ID_SAVEENC,      L"Encrypt",    66, 6, 0xE72E, false,
      L"Save a copy protected by a 128-bit RC4 password"},
+    {ID_SIGN,         L"Sign",       56, 6, 0xE8FB, false,
+     L"Add a digital signature and save a signed copy"},
   };
   for (const RibbonSpec& s : specs)
   {
@@ -8730,7 +9237,7 @@ static bool IsHandledCommand(int id)
   switch (id)
   {
     case ID_NEW: case ID_OPEN: case ID_SAVE: case ID_SAVEAS: case ID_SAVEENC:
-    case ID_IMPORT: case ID_MERGE_APPEND: case ID_COMBINE_NEW: case ID_COMPRESS_PDF: case ID_EDIT_TEXT: case ID_EXPORT_TEXT: case ID_EXPORT_CSV: case ID_WATERMARK:
+    case ID_IMPORT: case ID_MERGE_APPEND: case ID_COMBINE_NEW: case ID_COMPRESS_PDF: case ID_EDIT_TEXT: case ID_EXPORT_TEXT: case ID_EXPORT_CSV: case ID_WATERMARK: case ID_SIGN:
     case ID_EXIT: case ID_ROTR: case ID_ROTL: case ID_DELETE: case ID_ADD:
     case ID_TOOL_SELECT: case ID_OBJ_EDIT: case ID_OBJ_DELETE:
     case ID_OBJ_RECOLOR: case ID_OBJ_FONT: case ID_ZOOM_IN: case ID_ZOOM_OUT: case ID_ZOOM100:
@@ -8849,6 +9356,7 @@ static void DoCommand(int id)
     case ID_EXPORT_TEXT:  ExportTextAll(); break;
     case ID_EXPORT_CSV:   ExportCsvAll(); break;
     case ID_WATERMARK:    WatermarkCurrentDoc(); break;
+    case ID_SIGN:         SignDocument(); break;
     case ID_PRINT:        PrintDoc(); break;
     case ID_PRINT_PREVIEW: PrintPreviewDialog(); break;
     case ID_THEME:        ToggleTheme(); break;
@@ -8899,6 +9407,7 @@ static HMENU BuildMenu()
   addItem(file, ID_EXPORT_TEXT, L"Export Text...");
   addItem(file, ID_EXPORT_CSV, L"Export CSV...");
   addItem(file, ID_WATERMARK, L"Watermark...");
+  addItem(file, ID_SIGN, L"Sign Document...");
   AppendMenuW(file, MF_SEPARATOR, 0, nullptr);
   addItem(file, ID_PRINT, L"Print...\tCtrl+P");
   addItem(file, ID_PRINT_PREVIEW, L"Print Preview\tCtrl+Shift+P");
