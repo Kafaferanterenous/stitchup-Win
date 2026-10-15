@@ -1917,6 +1917,12 @@ struct BmCtx
 
 // Target for the next InsertAnnot(ID_ANN_LINK) call.
 static std::wstring g_linkUri;
+// When >= 0, the next link jumps to this page (0-based) instead of a web URI.
+static int g_linkTargetPage = -1;
+// Target pages of the internal links added this session. Each becomes a named
+// destination ("StitchupPage<N>") written into the catalog on save, because
+// PDFium exposes no API to write a /Dest array directly.
+static std::vector<int> g_linkDests;
 
 static LRESULT CALLBACK BmProc(HWND h, UINT m, WPARAM w, LPARAM l)
 {
@@ -2042,7 +2048,8 @@ static bool PromptBookmarkName(std::wstring& out, const std::wstring& deflt)
 // an empty target would create a dead link - refuse instead of writing junk.
 static bool PromptLinkUri(std::wstring& out, const std::wstring& deflt)
 {
-  return PromptText(out, deflt, L"Add Link", L"Web address:", false);
+  return PromptText(out, deflt, L"Add Link",
+                    L"Web address, or #page for an internal link:", false);
 }
 
 struct WmCtx
@@ -2885,6 +2892,191 @@ static bool AppendOutlines(std::string& pdf, const std::vector<UserBookmark>& bm
   return true;
 }
 
+// Drops "/Name value" pairs for the exact names in `names` from a destination
+// dictionary body. Only the names we are about to rewrite are removed, so
+// destinations added by earlier saves (which are not in this session's set) are
+// preserved instead of being silently lost. Literal strings and nested
+// containers are skipped whole so a '/' inside them is never mistaken for a key.
+static std::string StripNamedDest(const std::string& d,
+                                  const std::vector<std::string>& names)
+{
+  using namespace pdfout;
+  std::string out;
+  size_t p = 0;
+  while (p < d.size())
+  {
+    const char c = d[p];
+    if (c == '(' || (c == '<' && p + 1 < d.size() && d[p + 1] == '<') ||
+        c == '[')
+    {
+      size_t e = p;
+      if (!SkipContainer(d, p, d.size(), e)) { out += d.substr(p); break; }
+      out += d.substr(p, e - p);
+      p = e;
+      continue;
+    }
+    if (c == '/')
+    {
+      size_t q = p + 1;
+      while (q < d.size() && !IsWs(d[q]) && !IsDelim(d[q])) ++q;   // name token
+      const std::string nm = d.substr(p + 1, q - (p + 1));
+      const bool drop =
+          std::find(names.begin(), names.end(), nm) != names.end();
+      size_t vstart = q;
+      SkipWs(d, vstart);
+      size_t ve = vstart;
+      if (vstart < d.size() && (d.compare(vstart, 2, "<<") == 0 ||
+                                d[vstart] == '[' || d[vstart] == '('))
+      {
+        if (!SkipContainer(d, vstart, d.size(), ve)) { out += d.substr(p); break; }
+      }
+      else
+      {
+        while (ve < d.size() && !IsWs(d[ve]) && !IsDelim(d[ve])) ++ve;
+      }
+      if (!drop) out += d.substr(p, ve - p);
+      p = ve;
+      continue;
+    }
+    out += c;
+    ++p;
+  }
+  return out;
+}
+
+// Appends internal-link destinations as a /Dests dictionary in the catalog, as
+// an incremental update. Each tracked target page p becomes the name
+// "StitchupPage<N>" (N = p+1) pointing at that page with a /Fit view, which is
+// what a /Link annotation with the matching /Dest string resolves to. Any
+// destinations already present are preserved.
+static bool AppendNamedDests(std::string& pdf, const std::vector<int>& destPages,
+                             int expectPages, std::wstring* err)
+{
+  using namespace pdfout;
+  auto fail = [&](const wchar_t* m) {
+    if (err) *err = m;
+    return false;
+  };
+  if (destPages.empty()) return true;
+
+  const size_t sx = pdf.rfind("startxref");
+  if (sx == std::string::npos) return fail(L"The saved file has no startxref.");
+  size_t sp = sx + 9;
+  const long long baseXref = ReadInt(pdf, sp);
+  if (baseXref <= 0 || baseXref >= (long long)pdf.size())
+    return fail(L"The saved file has a broken startxref.");
+
+  long long size = 0;
+  int rootObj = 0;
+  bool isTable = true;
+  std::map<int, size_t> offs;
+  {
+    XrefBase base;
+    if (!ParseBase(pdf, (size_t)baseXref, base))
+      return fail(L"The saved file's cross-reference section is unreadable.");
+    size = base.size;
+    rootObj = base.rootObj;
+    isTable = base.table;
+    offs.swap(base.offs);
+  }
+  // A prior incremental update (e.g. the bookmarks) lists only its own objects,
+  // so rebuild the full map by scanning; all these objects are uncompressed.
+  if (!ScanObjects(pdf, offs)) return fail(L"No objects found in the saved file.");
+
+  Obj cat;
+  if (!ObjBody(pdf, offs, rootObj, cat)) return fail(L"Catalog object not found.");
+  int pagesObj = 0;
+  if (!GetRefEntry(pdf, cat.body, cat.end, "Pages", pagesObj))
+    return fail(L"Catalog has no /Pages reference.");
+  std::vector<int> pageObjs;
+  if (!CollectPages(pdf, offs, pagesObj, pageObjs))
+    return fail(L"Could not walk the page tree.");
+  if (expectPages > 0 && (int)pageObjs.size() != expectPages)
+    return fail(L"Page tree does not match the open document.");
+
+  // The exact names this save is responsible for; only these are replaced so
+  // destinations from earlier saves stay intact.
+  std::vector<std::string> names;
+  names.reserve(destPages.size());
+  for (int p : destPages) names.push_back("StitchupPage" + std::to_string(p + 1));
+
+  // Keep any destinations already in the file, minus the ones we are rewriting.
+  std::string oldEntries;
+  size_t dvs, dve;
+  if (FindKey(pdf, cat.body, cat.end, "Dests", dvs, dve))
+  {
+    std::string v;
+    if (dvs < dve && pdf.compare(dvs, 2, "<<") == 0)
+      v = pdf.substr(dvs, dve - dvs);
+    else
+    {
+      int dnum = 0;
+      if (GetRefEntry(pdf, cat.body, cat.end, "Dests", dnum))
+      {
+        Obj dob;
+        if (ObjBody(pdf, offs, dnum, dob))
+          v = pdf.substr(dob.body, dob.end - dob.body);
+      }
+    }
+    if (v.size() >= 4 && v.compare(0, 2, "<<") == 0)
+      oldEntries = StripNamedDest(v.substr(2, v.size() - 4), names);
+  }
+
+  std::string dest = "<< " + oldEntries;
+  for (int p : destPages)
+  {
+    if (p < 0 || p >= (int)pageObjs.size()) continue;
+    dest += " /StitchupPage" + std::to_string(p + 1) + " [" +
+            std::to_string(pageObjs[p]) + " 0 R /Fit]";
+  }
+  dest += " >>";
+
+  // Rewrite the catalog with /Dests replaced (never duplicated).
+  std::string clean = RemoveKey(pdf.substr(cat.body, cat.end - cat.body), "Dests");
+  if (clean.size() < 2 || clean.compare(clean.size() - 2, 2, ">>") != 0)
+    return fail(L"Catalog dictionary is malformed.");
+  clean.insert(clean.size() - 2, " /Dests " + dest + " ");
+
+  std::string add = "\n";
+  add += std::to_string(rootObj) + " 0 obj\n" + clean + "\nendobj\n";
+  const long long newSize = size;   // no new object numbers are allocated
+
+  if (isTable)
+  {
+    const size_t tableAt = pdf.size() + add.size();
+    char row[32];
+    _snprintf_s(row, _TRUNCATE, "%010llu 00000 n \n",
+                (unsigned long long)(pdf.size() + 1));
+    add += "xref\n" + std::to_string(rootObj) + " 1\n" + row;
+    add += "trailer\n<< /Size " + std::to_string(newSize) + " /Root " +
+           std::to_string(rootObj) + " 0 R /Prev " + std::to_string(baseXref) +
+           " >>\nstartxref\n" + std::to_string(tableAt) + "\n%%EOF\n";
+    pdf += add;
+    return true;
+  }
+
+  // xref stream, matching a base file that used one.
+  const int xrefNum = (int)newSize;
+  const unsigned use = (unsigned)(pdf.size() + 1);
+  std::string rows;
+  rows += (char)1;
+  rows += (char)((use >> 24) & 0xFF);
+  rows += (char)((use >> 16) & 0xFF);
+  rows += (char)((use >> 8) & 0xFF);
+  rows += (char)(use & 0xFF);
+  rows += (char)0;
+  rows += (char)0;   // gen 0
+  const size_t xrefObjOffset = pdf.size() + add.size();
+  add += std::to_string(xrefNum) + " 0 obj\n<< /Type /XRef /Size " +
+         std::to_string(newSize + 1) + " /Root " + std::to_string(rootObj) +
+         " 0 R /Prev " + std::to_string(baseXref) + " /W [1 4 2] /Index [" +
+         std::to_string(rootObj) + " 1] /Length " + std::to_string(rows.size()) +
+         " >>\nstream\n" + rows + "\nendstream\nendobj\nstartxref\n" +
+         std::to_string(xrefObjOffset) + "\n%%EOF\n";
+  pdf += add;
+  return true;
+}
+
 // --- Digital signatures (Windows CryptoAPI) --------------------------------
 namespace sigout {
 
@@ -3335,20 +3527,32 @@ static bool SerializeForSave(std::vector<unsigned char>& out, bool interactive)
                   L"Stitchup", MB_OK | MB_ICONWARNING);
     return false;
   }
-  if (g.marks.empty())
+  if (g.marks.empty() && g_linkDests.empty())
   {
     out.swap(fw.buf);
     return true;
   }
   std::string pdf(reinterpret_cast<const char*>(fw.buf.data()), fw.buf.size());
   std::wstring err;
-  if (!AppendOutlines(pdf, g.marks, FPDF_GetPageCount(g.doc), &err))
+  const int pages = FPDF_GetPageCount(g.doc);
+  if (!g.marks.empty() && !AppendOutlines(pdf, g.marks, pages, &err))
   {
     if (interactive)
     {
       const std::wstring msg =
           L"Save failed: your bookmarks could not be written into the PDF,\n"
           L"so the file was left untouched.\n\n" + err;
+      MessageBoxW(g.frame, msg.c_str(), L"Stitchup", MB_OK | MB_ICONWARNING);
+    }
+    return false;
+  }
+  if (!g_linkDests.empty() && !AppendNamedDests(pdf, g_linkDests, pages, &err))
+  {
+    if (interactive)
+    {
+      const std::wstring msg =
+          L"Save failed: internal link targets could not be written into the\n"
+          L"PDF, so the file was left untouched.\n\n" + err;
       MessageBoxW(g.frame, msg.c_str(), L"Stitchup", MB_OK | MB_ICONWARNING);
     }
     return false;
@@ -8550,7 +8754,20 @@ static bool InsertAnnot(FPDF_DOCUMENT doc, int pageIdx, int kind,
       float h = 20.0f;
       FS_RECTF rc = rect ? *rect : FS_RECTF{x, y + h, x + w, y};
       ok = FPDFAnnot_SetRect(a, &rc) != 0;
-      if (!uri.empty())
+      if (g_linkTargetPage >= 0)
+      {
+        // Internal link: PDFium cannot write a /Dest array, so point the link at
+        // a named destination that AppendNamedDests adds to the catalog on save.
+        const std::wstring name =
+            L"StitchupPage" + std::to_wstring(g_linkTargetPage + 1);
+        SetAnnotText(a, "Dest", name.c_str());
+        if (std::find(g_linkDests.begin(), g_linkDests.end(), g_linkTargetPage) ==
+            g_linkDests.end())
+          g_linkDests.push_back(g_linkTargetPage);
+        const std::wstring cap = L"#Page " + std::to_wstring(g_linkTargetPage + 1);
+        SetAnnotText(a, "Contents", cap.c_str());
+      }
+      else if (!uri.empty())
       {
         int n = WideCharToMultiByte(CP_UTF8, 0, uri.c_str(), -1, nullptr, 0,
                                     nullptr, nullptr);
@@ -8561,10 +8778,10 @@ static bool InsertAnnot(FPDF_DOCUMENT doc, int pageIdx, int kind,
                               nullptr, nullptr);
           ok = ok && (FPDFAnnot_SetURI(a, utf8.c_str()) != 0);
         }
+        SetAnnotText(a, "Contents", uri.c_str());
       }
       // Links draw no border of their own; the Rect is the click area.
       ok = ok && (FPDFAnnot_SetFlags(a, FPDF_ANNOT_FLAG_PRINT) != 0);
-      SetAnnotText(a, "Contents", uri.c_str());
     }
   }
 
@@ -9340,11 +9557,34 @@ static void DoCommand(int id)
     case ID_ANN_STAMP: SetAnnotTool(ID_ANN_STAMP); break;
     case ID_ANN_LINK:
     {
-      // Ask for the target first, then let the user drag its rectangle.
+      // Ask for the target first, then let the user drag its rectangle. A
+      // "#N" (or bare page number) makes an internal jump; anything else is a
+      // web address.
       std::wstring uri;
       if (PromptLinkUri(uri, g_linkUri))
       {
         g_linkUri = uri;
+        g_linkTargetPage = -1;
+        std::wstring t = uri;
+        size_t i = t.find_first_not_of(L" \t");
+        if (i != std::wstring::npos && t[i] == L'#') ++i;
+        else if (i == std::wstring::npos) i = t.size();
+        size_t j = i;
+        while (j < t.size() && t[j] >= L'0' && t[j] <= L'9') ++j;
+        if (j > i && j == t.size())
+        {
+          const int n = _wtoi(t.substr(i, j - i).c_str());
+          if (n >= 1 && n <= g.pageCount)
+            g_linkTargetPage = n - 1;
+          else
+          {
+            MessageBoxW(g.frame,
+                        (L"There is no page " + std::to_wstring(n) +
+                         L" in this document.").c_str(),
+                        L"Add Link", MB_OK | MB_ICONINFORMATION);
+            break;
+          }
+        }
         SetAnnotTool(ID_ANN_LINK);
       }
       break;

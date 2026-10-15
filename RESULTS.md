@@ -929,3 +929,26 @@ Self-test: 465 passed, 0 failed.
 
 Self-test: 465 passed, 0 failed.
 
+
+## v0.12.16 - internal page-destination links (2026-10-15)
+- The **Link** tool now also creates internal jumps: enter `#N` (or just `N`)
+  for the target page number, or a web address as before. The prompt reads
+  "Web address, or #page for an internal link", and an out-of-range page number
+  is reported rather than silently ignored.
+- PDFium can read a link's destination but exposes no API to *write* one, so the
+  link annotation carries a **named destination** and the catalog's `/Dests`
+  dictionary is added as an incremental update on save (reusing the same
+  machinery as bookmarks and signatures). Each target page becomes the name
+  `StitchupPage<N>` pointing at that page with a `/Fit` view.
+- Named destinations already in the file are preserved; only the entries the
+  current save owns (`StitchupPage<N>` for the pages linked this session) are
+  rewritten, so links added in an earlier session keep working. Bookmarks and
+  internal links are written together in one save (two chained incremental
+  updates) without disturbing each other.
+- Verified end to end with PDFium: after saving, `FPDFLink_Enumerate` finds the
+  link, `FPDFLink_GetDest` resolves it, and `FPDFDest_GetDestPageIndex` reports
+  the intended target page - including a second save that adds a new link while
+  keeping an existing one.
+
+Self-test: 465 passed, 0 failed.
+

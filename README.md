@@ -216,6 +216,11 @@ project (github.com/bblanchon/pdfium-binaries). Non-GPL build.
   annotation, and PDFium exposes `FPDFPage_CreateAnnot` plus
   `FPDFAnnot_SetURI` for writing the target. A newer `pdfium.dll` is therefore
   not required; the checked `chromium/8076` build exports the same set.
+- Internal links (jump to another page) are also supported: type `#N` at the
+  Link prompt. Since PDFium can read a `/Dest` but exposes no API to write one,
+  the target is stored as a named destination and the catalog's `/Dests`
+  dictionary is added as an incremental update on save. Existing named
+  destinations in the file are preserved.
 - Annotation placement is drag-to-draw: pick a tool, drag the rectangle on the
   page. A plain click still uses a sensible default rectangle, and Esc cancels
   the armed tool. (The earlier build placed every annotation at a fixed spot.)
@@ -226,8 +231,6 @@ project (github.com/bblanchon/pdfium-binaries). Non-GPL build.
 
 Not yet implemented, roughly by how much a user notices them missing:
 
-- Internal page-destination link creation — blocked: PDFium reads destinations
-  but exposes no API to write one
 - Static single-exe build — blocked: requires rebuilding PDFium from source with
   the static CRT, since the prebuilt import lib is not static
 
