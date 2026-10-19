@@ -314,6 +314,7 @@ struct App
   bool thumbDrag = false;
   int dragPage = -1;
   int dragCursor = -1;
+  int dropTab = -1;         // tab index under a cross-document page drag (-1 none)
 
   bool toolSelect = false;   // Select/Move content-object tool
   struct Sel
@@ -6486,6 +6487,107 @@ static HBITMAP GetThumb(int i)
   return hb;
 }
 
+// Tab-strip layout in g.tabbar client coordinates, mirroring TabBarProc::WM_PAINT
+// so a drag can hit-test the tabs (name width + padding, 2px gap).
+static void LayoutTabBarRects(std::vector<RECT>& out)
+{
+  out.clear();
+  if (!g.tabbar) return;
+  RECT rc;
+  GetClientRect(g.tabbar, &rc);
+  HDC dc = GetDC(g.tabbar);
+  HFONT f = CreateFontW(-MulDiv(11, g.dpi, 72), 0, 0, 0, FW_NORMAL, FALSE, FALSE,
+                        FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS,
+                        CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
+                        DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI");
+  HFONT of = (HFONT)SelectObject(dc, f);
+  int x = 4;
+  for (int i = 0; i < (int)g_tabs.size(); ++i)
+  {
+    const wchar_t* label = g_tabs[i].name.empty() ? L"Untitled"
+                                                  : g_tabs[i].name.c_str();
+    SIZE cxt{};
+    GetTextExtentPoint32W(dc, label, (int)wcslen(label), &cxt);
+    int w = cxt.cx + 34;
+    RECT tr{x, 4, x + w, rc.bottom - 3};
+    out.push_back(tr);
+    x = tr.right + 2;
+    if (x > rc.right) break;
+  }
+  SelectObject(dc, of);
+  DeleteObject(f);
+  ReleaseDC(g.tabbar, dc);
+}
+
+// Which tab (if any) is under a screen point; -1 when not over the tab strip or
+// over the active tab (dropping a page back onto its own document is a reorder).
+static int TabIndexAtScreen(POINT sp)
+{
+  if (!g.tabbar || g_tabs.empty()) return -1;
+  RECT tbr;
+  GetWindowRect(g.tabbar, &tbr);
+  if (!PtInRect(&tbr, sp)) return -1;
+  std::vector<RECT> rects;
+  LayoutTabBarRects(rects);
+  for (int i = 0; i < (int)rects.size(); ++i)
+  {
+    POINT tl{rects[i].left, rects[i].top}, br{rects[i].right, rects[i].bottom};
+    ClientToScreen(g.tabbar, &tl);
+    ClientToScreen(g.tabbar, &br);
+    RECT rs{tl.x, tl.y, br.x, br.y};
+    if (PtInRect(&rs, sp)) return (i == g_curTab) ? -1 : i;
+  }
+  return -1;
+}
+
+// Move the given (ascending, 0-based) pages of the current document into the
+// document open in |destTab|, appending them at the end. Both documents are
+// changed in memory (the destination is left dirty to be saved with its own
+// tab); the source keeps at least one page.
+static void MovePagesToTab(const std::vector<int>& pages, int destTab)
+{
+  if (pages.empty() || !g.doc) return;
+  if (destTab < 0 || destTab >= (int)g_tabs.size() || destTab == g_curTab) return;
+  FPDF_DOCUMENT dest = g_tabs[destTab].doc;
+  if (!dest) return;
+  if ((int)pages.size() >= g.pageCount)
+  {
+    MessageBoxW(g.frame, L"Can't move every page out of the document.",
+                L"Stitchup", MB_OK | MB_ICONWARNING);
+    return;
+  }
+  const int insertAt = FPDF_GetPageCount(dest);
+  if (!FPDF_ImportPagesByIndex(dest, g.doc, pages.data(),
+                               (unsigned long)pages.size(), insertAt))
+  {
+    MessageBoxW(g.frame, L"Could not move the page into the other document.",
+                L"Stitchup", MB_OK | MB_ICONWARNING);
+    return;
+  }
+  g_tabs[destTab].pageCount = FPDF_GetPageCount(dest);
+  g_tabs[destTab].dirty = true;
+  {
+    FPDF_PAGE p = FPDF_LoadPage(dest, g_tabs[destTab].pageCount - 1);
+    if (p) FPDF_ClosePage(p);
+  }
+
+  BeginEdit();
+  for (int k = (int)pages.size() - 1; k >= 0; --k)
+    FPDFPage_Delete(g.doc, pages[k]);
+  g.dirty = true;
+  g.selected = pages.front();   // RefreshState clamps to the new page count
+  RefreshState();
+  InvalidateRect(g.canvas, nullptr, TRUE);
+  InvalidateRect(g.thumbs, nullptr, TRUE);
+  RefreshTabBar();
+  InvalidateRect(g.status, nullptr, TRUE);
+  const std::wstring destName = g_tabs[destTab].name.empty() ? L"Untitled"
+                                                         : g_tabs[destTab].name;
+  const std::wstring msg = L"Moved " + std::to_wstring((int)pages.size()) +
+      (pages.size() == 1 ? L" page to \"" : L" pages to \"") + destName + L"\".";
+  MessageBoxW(g.frame, msg.c_str(), L"Stitchup", MB_OK | MB_ICONINFORMATION);
+}
+
 static LRESULT CALLBACK ThumbsProc(HWND hw, UINT msg, WPARAM wp, LPARAM lp)
 {
   switch (msg)
@@ -6673,6 +6775,25 @@ static LRESULT CALLBACK ThumbsProc(HWND hw, UINT msg, WPARAM wp, LPARAM lp)
     {
       if ((wp & MK_LBUTTON) && g.dragPage >= 0)
       {
+        // A drag that reaches the tab strip targets another open document: the
+        // page(s) will move there instead of reordering within this one.
+        POINT sp{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
+        ClientToScreen(hw, &sp);
+        const int drop = TabIndexAtScreen(sp);
+        if (drop != g.dropTab)
+        {
+          g.dropTab = drop;
+          if (g.tabbar) InvalidateRect(g.tabbar, nullptr, FALSE);
+        }
+        if (drop >= 0)
+        {
+          if (g.dragCursor != -1)
+          {
+            g.dragCursor = -1;   // hide the in-list insertion line
+            InvalidateRect(hw, nullptr, FALSE);
+          }
+          return 0;
+        }
         POINT pt{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
         SCROLLINFO si{};
         si.cbSize = sizeof(si);
@@ -6697,14 +6818,25 @@ static LRESULT CALLBACK ThumbsProc(HWND hw, UINT msg, WPARAM wp, LPARAM lp)
       ReleaseCapture();
       if (g.dragPage >= 0)
       {
-        int to = g.dragCursor;
         std::vector<int> sel = SelectedBlock();
+        if (sel.empty() && g.dragPage >= 0) sel.assign(1, g.dragPage);
+        const int drop = g.dropTab;
+        int to = g.dragCursor;
         g.dragPage = -1;
         g.dragCursor = -1;
-        bool noop = sel.empty();
-        for (int s : sel)
-          if (s == to || s == to - 1) noop = true;  // dropped on itself
-        if (!noop && to >= 0) ReorderPagesTo(sel, to);
+        g.dropTab = -1;
+        if (g.tabbar) InvalidateRect(g.tabbar, nullptr, FALSE);
+        if (drop >= 0)
+        {
+          MovePagesToTab(sel, drop);
+        }
+        else
+        {
+          bool noop = sel.empty();
+          for (int s : sel)
+            if (s == to || s == to - 1) noop = true;  // dropped on itself
+          if (!noop && to >= 0) ReorderPagesTo(sel, to);
+        }
         InvalidateRect(hw, nullptr, FALSE);
       }
       return 0;
@@ -6733,6 +6865,8 @@ static LRESULT CALLBACK ThumbsProc(HWND hw, UINT msg, WPARAM wp, LPARAM lp)
       ReleaseCapture();
       g.dragPage = -1;
       g.dragCursor = -1;
+      if (g.dropTab != -1 && g.tabbar) InvalidateRect(g.tabbar, nullptr, FALSE);
+      g.dropTab = -1;
       InvalidateRect(hw, nullptr, FALSE);
       return 0;
   }
@@ -15622,9 +15756,12 @@ static LRESULT CALLBACK TabBarProc(HWND hw, UINT msg, WPARAM wp, LPARAM lp)
         GetTextExtentPoint32W(dc, label, (int)wcslen(label), &cxt);
         int w = cxt.cx + 34;
         bool active = (i == g_curTab);
+        bool dropTarget = (i == g.dropTab);
         RECT tr{x, 4, x + w, rc.bottom - 3};
-        HBRUSH fill = CreateSolidBrush(active ? th.card : th.ribbonBg);
-        HPEN pen = CreatePen(PS_SOLID, 1, active ? th.accent : th.cardBorder);
+        HBRUSH fill = CreateSolidBrush(
+            active ? th.card : dropTarget ? th.btnHover : th.ribbonBg);
+        HPEN pen = CreatePen(PS_SOLID, dropTarget ? 2 : 1,
+                             (active || dropTarget) ? th.accent : th.cardBorder);
         HBRUSH wasb = (HBRUSH)SelectObject(dc, fill);
         HPEN wasp = (HPEN)SelectObject(dc, pen);
         RoundRect(dc, tr.left, tr.top, tr.right, tr.bottom, 6, 6);

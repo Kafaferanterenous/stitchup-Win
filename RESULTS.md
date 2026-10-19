@@ -1027,3 +1027,21 @@ Self-test: 465 passed, 0 failed.
 
 Self-test: 465 passed, 0 failed.
 
+## v0.12.20 - move pages into another open document (2026-10-19)
+- Dragging the selected page(s) out of the Pages pane and over the tab strip now
+  targets another open document: the hovered tab highlights
+  (`TabIndexAtScreen` hit-tests the same layout `TabBarProc` paints) and dropping
+  on it appends the pages there. The drag keeps its in-pane reorder behaviour
+  everywhere else, so nothing about the existing thumbnail drag changes.
+- `MovePagesToTab` copies the ascending page block into the destination document
+  with `FPDF_ImportPagesByIndex(dest, src, idx, len, pageCount(dest))`, updates
+  that tab's page count and marks it dirty (it is saved later under its own tab),
+  then deletes the pages from the source with `FPDFPage_Delete` (in memory, like
+  every other page edit) and re-focuses the page that took the first freed slot.
+  Moving *every* page out is refused so the source keeps at least one page.
+- New `dropTab` state on `App`; the tab strip draws the drop target with an
+  accent border, `WM_CANCELMODE` clears the highlight.
+- Self-test unchanged at 465 (mouse-driven drag; no headless coverage), exit 0.
+
+Self-test: 465 passed, 0 failed.
+
