@@ -1112,3 +1112,15 @@ Self-test: 465 passed, 0 failed.
 
 Self-test: 465 passed, 0 failed.
 
+## v0.12.25 - drop redundant ribbon group captions (2026-10-19)
+- The ribbon already shows one heading per tool group in its tab strip, and each
+  tab hosts a single group whose caption was set to that same heading
+  (`gb.name = RibbonTabName(g.ribbonTab)`), so the caption under the buttons just
+  repeated the tab above it. Removed the centred group-caption text (and its font)
+  from the group card.
+- Trimmed the freed band: `RIB_H` 102 -> 88 (buttons end at y=78, card now ends
+  at y=86), so the ribbon hugs the button row instead of leaving an empty strip.
+- Self-test unchanged at 465, exit 0.
+
+Self-test: 465 passed, 0 failed.
+

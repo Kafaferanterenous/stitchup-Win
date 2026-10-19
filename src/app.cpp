@@ -173,7 +173,7 @@ enum
   RIB_TAB_H = 30,   // ribbon tab strip: one tab per tool group
   RIB_BTN_Y = 38,   // button row top
   RIB_BTN_H = 40,   // button height (icon over caption)
-  RIB_H = 102,      // full ribbon height (buttons + group caption band)
+  RIB_H = 88,       // full ribbon height (tab strip + button row)
   PANE_TAB_H = 26,  // navigation-pane header height
   STATUS_H = 28,    // status bar height
 };
@@ -16535,21 +16535,6 @@ static LRESULT CALLBACK ToolbarProc(HWND hw, UINT msg, WPARAM wp, LPARAM lp)
         SelectObject(dc, wasp);
         DeleteObject(fill);
         DeleteObject(pen);
-
-        // Group caption centred under the buttons, ribbon-style.
-        RECT cap{card.left, RIB_BTN_Y + RIB_BTN_H, card.right, RIB_H - 6};
-        HFONT capFont = CreateFontW(-MulDiv(9, g.dpi, 72), 0, 0, 0, FW_SEMIBOLD,
-                                    FALSE, FALSE, FALSE, DEFAULT_CHARSET,
-                                    OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
-                                    CLEARTYPE_QUALITY,
-                                    DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI");
-        HFONT wasCap = (HFONT)SelectObject(dc, capFont);
-        SetBkMode(dc, TRANSPARENT);
-        SetTextColor(dc, th.textDim);
-        DrawTextW(dc, gb.name.c_str(), -1, &cap,
-                  DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
-        SelectObject(dc, wasCap);
-        DeleteObject(capFont);
       }
 
       HPEN pen = CreatePen(PS_SOLID, 1, th.cardBorder);
