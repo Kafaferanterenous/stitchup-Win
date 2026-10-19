@@ -1078,3 +1078,20 @@ Self-test: 465 passed, 0 failed.
 
 Self-test: 465 passed, 0 failed.
 
+## v0.12.23 - export text to DOCX (2026-10-19)
+- **File > Export DOCX...** writes a Word `.docx` file containing the document's
+  extracted text (reuses `PageTextRaw`/`DocTextRaw`). Each page becomes a series
+  of `<w:p>` paragraphs (one per line), with a `<w:br w:type="page"/>` separator
+  between pages.
+- Built without any third-party ZIP or Office library: a hand-rolled, STORE-only
+  ZIP writer (`BuildZip` with `ZipCrc32`) packages three entries —
+  `[Content_Types].xml`, `_rels/.rels` and `word/document.xml`. Text is
+  XML-escaped and encoded as UTF-8 so non-ASCII content survives intact.
+- Verified end-to-end against `Test1.pdf`: opened with .NET `ZipArchive` (which
+  validates the CRC32 of every entry) — all three parts present, and each `.xml`
+  part parses as well-formed XML. The extracted `word/document.xml` contained
+  151 paragraphs and 4 page breaks (matching 5 pages). Probe removed.
+- Self-test unchanged at 465 (no new headless checks), exit 0.
+
+Self-test: 465 passed, 0 failed.
+

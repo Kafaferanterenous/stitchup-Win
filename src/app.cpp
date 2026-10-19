@@ -96,6 +96,7 @@ ID_ANN_LINK,
   ID_EXPORT_CSV,
   ID_EXPORT_IMG,   // Export page images (JPG / PNG)
   ID_EXPORT_RTF,   // Export RTF
+  ID_EXPORT_DOCX,  // Export DOCX
   ID_THEME,
   ID_WATERMARK,
   ID_SAVEENC,
@@ -2101,6 +2102,233 @@ static void ExportRtfAll()
                   L"Export RTF", MB_OK | MB_ICONINFORMATION);
     else
       MessageBoxW(g.frame, L"Export failed.", L"Export RTF", MB_OK | MB_ICONERROR);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Export DOCX (minimal ZIP writer + OPC package, STORE method, CRC32)
+// ---------------------------------------------------------------------------
+// No third-party ZIP library: build a plain ZIP (method 0 = STORE) by hand.
+static void ZipPutU16(std::vector<unsigned char>& v, unsigned short x)
+{
+  v.push_back((unsigned char)(x & 0xFF));
+  v.push_back((unsigned char)((x >> 8) & 0xFF));
+}
+static void ZipPutU32(std::vector<unsigned char>& v, unsigned long x)
+{
+  v.push_back((unsigned char)(x & 0xFF));
+  v.push_back((unsigned char)((x >> 8) & 0xFF));
+  v.push_back((unsigned char)((x >> 16) & 0xFF));
+  v.push_back((unsigned char)((x >> 24) & 0xFF));
+}
+static unsigned long ZipCrc32(const unsigned char* d, size_t n)
+{
+  unsigned long c = 0xFFFFFFFFUL;
+  for (size_t i = 0; i < n; ++i)
+  {
+    c ^= d[i];
+    for (int k = 0; k < 8; ++k)
+      c = (c >> 1) ^ (0xEDB88320UL & (0UL - (c & 1UL)));
+  }
+  return c ^ 0xFFFFFFFFUL;
+}
+
+// entries: (name, data). Names and data are raw bytes; the ZIP is STORE-only.
+static std::vector<unsigned char> BuildZip(
+    const std::vector<std::pair<std::string, std::string>>& entries)
+{
+  std::vector<unsigned char> out;
+  std::vector<unsigned long> offsets;
+  for (const auto& e : entries)
+  {
+    offsets.push_back((unsigned long)out.size());
+    ZipPutU32(out, 0x04034b50);        // local file header signature
+    ZipPutU16(out, 20);                // version needed
+    ZipPutU16(out, 0x0800);            // general purpose bit flag (UTF-8 names)
+    ZipPutU16(out, 0);                 // compression method: STORE
+    ZipPutU16(out, 0);                 // last mod time
+    ZipPutU16(out, 0);                 // last mod date
+    ZipPutU32(out, ZipCrc32((const unsigned char*)e.second.data(), e.second.size()));
+    ZipPutU32(out, (unsigned long)e.second.size());   // compressed size
+    ZipPutU32(out, (unsigned long)e.second.size());   // uncompressed size
+    ZipPutU16(out, (unsigned short)e.first.size());
+    ZipPutU16(out, 0);                 // extra field length
+    out.insert(out.end(), e.first.begin(), e.first.end());
+    out.insert(out.end(), e.second.begin(), e.second.end());
+  }
+  const unsigned long cdStart = (unsigned long)out.size();
+  for (size_t i = 0; i < entries.size(); ++i)
+  {
+    const auto& e = entries[i];
+    ZipPutU32(out, 0x02014b50);        // central directory signature
+    ZipPutU16(out, 20);                // version made by
+    ZipPutU16(out, 20);                // version needed
+    ZipPutU16(out, 0x0800);            // flags (UTF-8 names)
+    ZipPutU16(out, 0);                 // method: STORE
+    ZipPutU16(out, 0);                 // time
+    ZipPutU16(out, 0);                 // date
+    ZipPutU32(out, ZipCrc32((const unsigned char*)e.second.data(), e.second.size()));
+    ZipPutU32(out, (unsigned long)e.second.size());
+    ZipPutU32(out, (unsigned long)e.second.size());
+    ZipPutU16(out, (unsigned short)e.first.size());
+    ZipPutU16(out, 0);                 // extra length
+    ZipPutU16(out, 0);                 // comment length
+    ZipPutU16(out, 0);                 // disk number start
+    ZipPutU16(out, 0);                 // internal attributes
+    ZipPutU32(out, 0);                 // external attributes
+    ZipPutU32(out, offsets[i]);
+    out.insert(out.end(), e.first.begin(), e.first.end());
+  }
+  const unsigned long cdSize = (unsigned long)out.size() - cdStart;
+  ZipPutU32(out, 0x06054b50);          // end of central directory
+  ZipPutU16(out, 0);
+  ZipPutU16(out, 0);
+  ZipPutU16(out, (unsigned short)entries.size());
+  ZipPutU16(out, (unsigned short)entries.size());
+  ZipPutU32(out, cdSize);
+  ZipPutU32(out, cdStart);
+  ZipPutU16(out, 0);                   // comment length
+  return out;
+}
+
+// Escape text for XML; control characters (other than tab/newline) are dropped.
+// Returns a wide string (to be converted to UTF-8) so non-ASCII survives intact.
+static std::wstring XmlEscape(const std::wstring& s)
+{
+  std::wstring o;
+  o.reserve(s.size());
+  for (size_t i = 0; i < s.size(); ++i)
+  {
+    const wchar_t c = s[i];
+    if (c == L'&') o += L"&amp;";
+    else if (c == L'<') o += L"&lt;";
+    else if (c == L'>') o += L"&gt;";
+    else if (c == L'"') o += L"&quot;";
+    else if (c == L'\'') o += L"&apos;";
+    else if (c < 0x20 && c != L'\t' && c != L'\n') continue;
+    else o += c;
+  }
+  return o;
+}
+
+static std::string WideToUtf8(const std::wstring& s)
+{
+  if (s.empty()) return std::string();
+  const int n = WideCharToMultiByte(CP_UTF8, 0, s.c_str(), (int)s.size(),
+                                    nullptr, 0, nullptr, nullptr);
+  if (n <= 0) return std::string();
+  std::string o(static_cast<size_t>(n), '\0');
+  WideCharToMultiByte(CP_UTF8, 0, s.c_str(), (int)s.size(), &o[0], n, nullptr, nullptr);
+  return o;
+}
+
+// Minimal DOCX package: one <w:p> per line, a page break between pages.
+static std::string BuildDocxPackage(FPDF_DOCUMENT d)
+{
+  std::wstring body;
+  const int np = d ? FPDF_GetPageCount(d) : 0;
+  for (int i = 0; i < np; ++i)
+  {
+    FPDF_PAGE p = FPDF_LoadPage(d, i);
+    if (!p) continue;
+    std::wstring t = PageTextRaw(p);
+    FPDF_ClosePage(p);
+    if (i > 0)
+      body += L"<w:p><w:r><w:br w:type=\"page\"/></w:r></w:p>";
+    size_t pos = 0;
+    while (pos < t.size())
+    {
+      size_t nl = t.find_first_of(L"\r\n", pos);
+      std::wstring line = t.substr(pos, nl == std::wstring::npos ? std::wstring::npos
+                                                                : nl - pos);
+      body += L"<w:p><w:r><w:t xml:space=\"preserve\">";
+      body += XmlEscape(line);
+      body += L"</w:t></w:r></w:p>";
+      if (nl == std::wstring::npos) break;
+      pos = nl;
+      while (pos < t.size() && (t[pos] == L'\r' || t[pos] == L'\n')) ++pos;
+    }
+  }
+  static const std::string kTypes =
+      "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n"
+      "<Types xmlns=\"http://schemas.openxmlformats.org/package/2006/content-types\">"
+      "<Default Extension=\"rels\" "
+      "ContentType=\"application/vnd.openxmlformats-package.relationships+xml\"/>"
+      "<Default Extension=\"xml\" ContentType=\"application/xml\"/>"
+      "<Override PartName=\"/word/document.xml\" "
+      "ContentType=\"application/vnd.openxmlformats-officedocument."
+      "wordprocessingml.document.main+xml\"/></Types>";
+  static const std::string kRels =
+      "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n"
+      "<Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/"
+      "relationships\">"
+      "<Relationship Id=\"rId1\" Type=\"http://schemas.openxmlformats.org/"
+      "officeDocument/2006/relationships/officeDocument\" "
+      "Target=\"word/document.xml\"/></Relationships>";
+
+  std::string doc =
+      "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n"
+      "<w:document xmlns:w=\"http://schemas.openxmlformats.org/wordprocessingml/"
+      "2006/main\"><w:body>";
+  doc += WideToUtf8(body);
+  doc += "<w:sectPr/></w:body></w:document>";
+
+  std::vector<std::pair<std::string, std::string>> entries = {
+      {"[Content_Types].xml", kTypes},
+      {"_rels/.rels", kRels},
+      {"word/document.xml", doc},
+  };
+  const std::vector<unsigned char> zip = BuildZip(entries);
+  return std::string((const char*)zip.data(), zip.size());
+}
+
+static bool ExportDocxToFile(FPDF_DOCUMENT d, const std::wstring& target)
+{
+  if (!d) return false;
+  const std::string pkg = BuildDocxPackage(d);
+  if (pkg.size() < 4) return false;
+  FILE* f = nullptr;
+  if (_wfopen_s(&f, target.c_str(), L"wb") != 0) return false;
+  const bool ok = fwrite(pkg.data(), 1, pkg.size(), f) == pkg.size();
+  fclose(f);
+  return ok;
+}
+
+static void ExportDocxAll()
+{
+  if (!g.doc)
+  {
+    MessageBoxW(g.frame, L"No document open.", L"Export DOCX",
+                MB_OK | MB_ICONINFORMATION);
+    return;
+  }
+  if (DocTextRaw(g.doc).empty())
+  {
+    MessageBoxW(g.frame, L"No extractable text in this document.",
+                L"Export DOCX", MB_OK | MB_ICONINFORMATION);
+    return;
+  }
+  std::wstring target = g.path;
+  const size_t dot = target.find_last_of(L'.');
+  if (dot != std::wstring::npos) target.resize(dot);
+  target += L".docx";
+  wchar_t buf[MAX_PATH];
+  wcscpy_s(buf, target.c_str());
+  OPENFILENAMEW ofn{};
+  ofn.lStructSize = sizeof(ofn);
+  ofn.hwndOwner = g.frame;
+  ofn.lpstrFilter = L"Word Document (*.docx)\0*.docx\0All Files\0*.*\0\0";
+  ofn.lpstrDefExt = L"docx";
+  ofn.lpstrFile = buf;
+  ofn.nMaxFile = MAX_PATH;
+  ofn.Flags = OFN_OVERWRITEPROMPT | OFN_PATHMUSTEXIST;
+  if (GetSaveFileNameW(&ofn))
+  {
+    if (ExportDocxToFile(g.doc, buf))
+      MessageBoxW(g.frame, (std::wstring(L"Exported DOCX to:\n") + buf).c_str(),
+                  L"Export DOCX", MB_OK | MB_ICONINFORMATION);
+    else
+      MessageBoxW(g.frame, L"Export failed.", L"Export DOCX", MB_OK | MB_ICONERROR);
   }
 }
 
@@ -9597,6 +9825,8 @@ static void BuildToolbar(HWND)
      L"Export each page as a JPG or PNG image"},
     {ID_EXPORT_RTF,   L"RTF",        52, 0, 0xE8A2, false,
      L"Write the document text out to an RTF file"},
+    {ID_EXPORT_DOCX,  L"DOCX",       62, 0, 0xE8A3, false,
+     L"Write the document text out to a Word .docx file"},
     {ID_PRINT,        L"Print",      62, 0, 0xE749, false,
      L"Print the document, all pages or a page range (Ctrl+P)"},
     {ID_PRINT_PREVIEW, L"Preview",   74, 0, 0xE749, false,
@@ -10919,7 +11149,7 @@ static bool IsHandledCommand(int id)
   switch (id)
   {
     case ID_NEW: case ID_OPEN: case ID_SAVE: case ID_SAVEAS: case ID_SAVEENC:
-    case ID_IMPORT: case ID_MERGE_APPEND: case ID_COMBINE_NEW: case ID_COMPRESS_PDF: case ID_EDIT_TEXT: case ID_EXPORT_TEXT: case ID_EXPORT_CSV: case ID_EXPORT_IMG: case ID_EXPORT_RTF: case ID_WATERMARK: case ID_SIGN: case ID_META: case ID_ATTACHMENTS:
+    case ID_IMPORT: case ID_MERGE_APPEND: case ID_COMBINE_NEW: case ID_COMPRESS_PDF: case ID_EDIT_TEXT: case ID_EXPORT_TEXT: case ID_EXPORT_CSV: case ID_EXPORT_IMG: case ID_EXPORT_RTF: case ID_EXPORT_DOCX: case ID_WATERMARK: case ID_SIGN: case ID_META: case ID_ATTACHMENTS:
     case ID_EXIT: case ID_ROTR: case ID_ROTL: case ID_DELETE: case ID_ADD:
     case ID_TOOL_SELECT: case ID_OBJ_EDIT: case ID_OBJ_DELETE:
     case ID_OBJ_RECOLOR: case ID_OBJ_FONT: case ID_ZOOM_IN: case ID_ZOOM_OUT: case ID_ZOOM100:
@@ -11067,6 +11297,7 @@ static void DoCommand(int id)
     case ID_EXPORT_CSV:   ExportCsvAll(); break;
     case ID_EXPORT_IMG:   ExportImagesAll(); break;
     case ID_EXPORT_RTF:   ExportRtfAll(); break;
+    case ID_EXPORT_DOCX:  ExportDocxAll(); break;
     case ID_WATERMARK:    WatermarkCurrentDoc(); break;
       case ID_SIGN:         SignDocument(); break;
       case ID_META:         EditMetadata(); break;
@@ -11123,6 +11354,7 @@ static HMENU BuildMenu()
   addItem(file, ID_EXPORT_CSV, L"Export CSV...");
   addItem(file, ID_EXPORT_IMG, L"Export Images...");
   addItem(file, ID_EXPORT_RTF, L"Export RTF...");
+  addItem(file, ID_EXPORT_DOCX, L"Export DOCX...");
   addItem(file, ID_WATERMARK, L"Watermark...");
   addItem(file, ID_SIGN, L"Sign Document...");
   addItem(file, ID_META, L"Document Properties...");

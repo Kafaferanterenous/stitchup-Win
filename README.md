@@ -208,7 +208,8 @@ project (github.com/bblanchon/pdfium-binaries). Non-GPL build.
   auto-crop, now selection-aware) + text export + CSV export + password-unlock +
   watermarks + encrypt-on-save + redaction + digital signatures + print-to-PDF +
   document properties + moving pages between open documents + page image export
-  + RTF text export are done. Rendering, page model, editing operations, ribbon
+  + RTF text export + DOCX text export are done. Rendering, page model, editing
+  operations, ribbon
   navigation, the bookmarks pane, annotation creation/persistence, link
   navigation, link *creation* and page extract/split/crop are functional.
 - Digital signatures are written as an incremental update with Windows
@@ -251,8 +252,13 @@ project (github.com/bblanchon/pdfium-binaries). Non-GPL build.
   image library is needed.
 - Text can be exported as RTF (File > Export RTF...): each page's raw text is
   written into a plain RTF document, with `\page` and `\par` separators.
+- Text can be exported as a Word `.docx` (File > Export DOCX...): each page's
+  extracted text is written as one paragraph per line (with page breaks between
+  pages) inside a minimal, hand-built OPC package (a STORE-only ZIP with
+  `[Content_Types].xml`, `_rels/.rels` and `word/document.xml`). No third-party
+  ZIP or Office library is used.
 - Tools menu/ribbon tab hosts the Security (Save As Encrypted) and Export
-  (Export Text / Export CSV / Images / RTF) groups.
+  (Export Text / Export CSV / Images / RTF / DOCX) groups.
 
 ### Remaining goals
 
@@ -263,10 +269,7 @@ Not yet implemented, roughly by how much a user notices them missing:
 
 ### Nice to have
 
-1. Export → DOCX — **0% done**, difficulty **30%**
-2. Export → ODF / ODT — **0% done**, difficulty **30%**
-3. Autosave / crash recovery — **0% done**, difficulty **35%**
-4. AcroForm field filling (interactive fields) — **0% done**, difficulty **45%**
-5. OCR (searchable scans) — **0% done**, difficulty **90%**
-  (Legacy `.doc` is an OLE compound file and is not produced natively; RTF is the
-  usual stand-in.)
+1. Export → ODF / ODT — **0% done**, difficulty **30%**
+2. Autosave / crash recovery — **0% done**, difficulty **35%**
+3. AcroForm field filling (interactive fields) — **0% done**, difficulty **45%**
+4. OCR (searchable scans) — **0% done**, difficulty **90%**
