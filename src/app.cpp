@@ -95,6 +95,7 @@ ID_ANN_LINK,
   ID_EXPORT_TEXT,
   ID_EXPORT_CSV,
   ID_EXPORT_IMG,   // Export page images (JPG / PNG)
+  ID_EXPORT_RTF,   // Export RTF
   ID_THEME,
   ID_WATERMARK,
   ID_SAVEENC,
@@ -1995,6 +1996,112 @@ static void ExportImagesAll()
   msg += (g.pageCount == 1) ? (stem + suffix)
                             : (stem + L"-1" + suffix + L" ...");
   MessageBoxW(g.frame, msg.c_str(), L"Export Images", MB_OK | MB_ICONINFORMATION);
+}
+
+// ---------------------------------------------------------------------------
+// Export RTF (rich text; plain runs with paragraph and page breaks)
+// ---------------------------------------------------------------------------
+// RTF is plain text, so every non-ASCII code unit is emitted as a \uN? escape
+// and the file itself stays 7-bit; newlines become \par and tabs \tab.
+static void AppendRtfEscaped(std::string& out, const std::wstring& t)
+{
+  for (size_t i = 0; i < t.size(); ++i)
+  {
+    const wchar_t c = t[i];
+    if (c == L'\r')
+    {
+      if (i + 1 < t.size() && t[i + 1] == L'\n') ++i;
+      out += "\\par\n";
+    }
+    else if (c == L'\n') out += "\\par\n";
+    else if (c == L'\t') out += "\\tab ";
+    else if (c == L'\\') out += "\\\\";
+    else if (c == L'{') out += "\\{";
+    else if (c == L'}') out += "\\}";
+    else if (c >= 0x20 && c < 0x7F) out += (char)c;
+    else if (c < 0x20) continue;   // drop other control characters
+    else
+    {
+      int u = (int)c;
+      if (u > 0x7FFF) u -= 0x10000;   // RTF wants a signed 16-bit value
+      out += "\\u";
+      out += std::to_string(u);
+      out += "?";
+    }
+  }
+}
+
+static std::string BuildRtf(FPDF_DOCUMENT d)
+{
+  std::string rtf =
+      "{\\rtf1\\ansi\\ansicpg1252\\deff0\\nouicompat"
+      "{\\fonttbl{\\f0\\fnil\\fcharset0 Calibri;}}"
+      "\\viewkind4\\uc1\\pard\\f0\\fs22 ";
+  if (d)
+  {
+    const int np = FPDF_GetPageCount(d);
+    for (int i = 0; i < np; ++i)
+    {
+      FPDF_PAGE p = FPDF_LoadPage(d, i);
+      if (!p) continue;
+      std::wstring t = PageTextRaw(p);
+      FPDF_ClosePage(p);
+      if (i > 0) rtf += "\\page ";
+      AppendRtfEscaped(rtf, t);
+      rtf += "\\par";
+    }
+  }
+  rtf += "}";
+  return rtf;
+}
+
+static bool ExportRtfToFile(FPDF_DOCUMENT d, const std::wstring& target)
+{
+  if (!d) return false;
+  const std::string rtf = BuildRtf(d);
+  FILE* f = nullptr;
+  if (_wfopen_s(&f, target.c_str(), L"wb") != 0) return false;
+  const bool ok = fwrite(rtf.data(), 1, rtf.size(), f) == rtf.size();
+  fclose(f);
+  return ok;
+}
+
+static void ExportRtfAll()
+{
+  if (!g.doc)
+  {
+    MessageBoxW(g.frame, L"No document open.", L"Export RTF",
+                MB_OK | MB_ICONINFORMATION);
+    return;
+  }
+  if (DocTextRaw(g.doc).empty())
+  {
+    MessageBoxW(g.frame, L"No extractable text in this document.",
+                L"Export RTF", MB_OK | MB_ICONINFORMATION);
+    return;
+  }
+  std::wstring target = g.path;
+  const size_t dot = target.find_last_of(L'.');
+  if (dot != std::wstring::npos) target.resize(dot);
+  target += L".rtf";
+  wchar_t buf[MAX_PATH];
+  wcscpy_s(buf, target.c_str());
+  OPENFILENAMEW ofn{};
+  ofn.lStructSize = sizeof(ofn);
+  ofn.hwndOwner = g.frame;
+  ofn.lpstrFilter = L"Rich Text (*.rtf)\0*.rtf\0All Files\0*.*\0\0";
+  ofn.lpstrDefExt = L"rtf";
+  ofn.lpstrFile = buf;
+  ofn.nMaxFile = MAX_PATH;
+  ofn.Flags = OFN_OVERWRITEPROMPT | OFN_PATHMUSTEXIST;
+  if (GetSaveFileNameW(&ofn))
+  {
+    if (ExportRtfToFile(g.doc, buf))
+      MessageBoxW(g.frame, (std::wstring(L"Exported RTF to:\n") + buf).c_str(),
+                  L"Export RTF", MB_OK | MB_ICONINFORMATION);
+    else
+      MessageBoxW(g.frame, L"Export failed.", L"Export RTF", MB_OK | MB_ICONERROR);
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -9488,6 +9595,8 @@ static void BuildToolbar(HWND)
      L"Write page data out to a .csv file"},
     {ID_EXPORT_IMG,   L"Images",     66, 0, 0xE8B9, false,
      L"Export each page as a JPG or PNG image"},
+    {ID_EXPORT_RTF,   L"RTF",        52, 0, 0xE8A2, false,
+     L"Write the document text out to an RTF file"},
     {ID_PRINT,        L"Print",      62, 0, 0xE749, false,
      L"Print the document, all pages or a page range (Ctrl+P)"},
     {ID_PRINT_PREVIEW, L"Preview",   74, 0, 0xE749, false,
@@ -10810,7 +10919,7 @@ static bool IsHandledCommand(int id)
   switch (id)
   {
     case ID_NEW: case ID_OPEN: case ID_SAVE: case ID_SAVEAS: case ID_SAVEENC:
-    case ID_IMPORT: case ID_MERGE_APPEND: case ID_COMBINE_NEW: case ID_COMPRESS_PDF: case ID_EDIT_TEXT: case ID_EXPORT_TEXT: case ID_EXPORT_CSV: case ID_EXPORT_IMG: case ID_WATERMARK: case ID_SIGN: case ID_META: case ID_ATTACHMENTS:
+    case ID_IMPORT: case ID_MERGE_APPEND: case ID_COMBINE_NEW: case ID_COMPRESS_PDF: case ID_EDIT_TEXT: case ID_EXPORT_TEXT: case ID_EXPORT_CSV: case ID_EXPORT_IMG: case ID_EXPORT_RTF: case ID_WATERMARK: case ID_SIGN: case ID_META: case ID_ATTACHMENTS:
     case ID_EXIT: case ID_ROTR: case ID_ROTL: case ID_DELETE: case ID_ADD:
     case ID_TOOL_SELECT: case ID_OBJ_EDIT: case ID_OBJ_DELETE:
     case ID_OBJ_RECOLOR: case ID_OBJ_FONT: case ID_ZOOM_IN: case ID_ZOOM_OUT: case ID_ZOOM100:
@@ -10957,6 +11066,7 @@ static void DoCommand(int id)
     case ID_EXPORT_TEXT:  ExportTextAll(); break;
     case ID_EXPORT_CSV:   ExportCsvAll(); break;
     case ID_EXPORT_IMG:   ExportImagesAll(); break;
+    case ID_EXPORT_RTF:   ExportRtfAll(); break;
     case ID_WATERMARK:    WatermarkCurrentDoc(); break;
       case ID_SIGN:         SignDocument(); break;
       case ID_META:         EditMetadata(); break;
@@ -11012,6 +11122,7 @@ static HMENU BuildMenu()
   addItem(file, ID_EXPORT_TEXT, L"Export Text...");
   addItem(file, ID_EXPORT_CSV, L"Export CSV...");
   addItem(file, ID_EXPORT_IMG, L"Export Images...");
+  addItem(file, ID_EXPORT_RTF, L"Export RTF...");
   addItem(file, ID_WATERMARK, L"Watermark...");
   addItem(file, ID_SIGN, L"Sign Document...");
   addItem(file, ID_META, L"Document Properties...");
