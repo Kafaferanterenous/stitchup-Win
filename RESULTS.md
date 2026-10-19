@@ -1045,3 +1045,23 @@ Self-test: 465 passed, 0 failed.
 
 Self-test: 465 passed, 0 failed.
 
+## v0.12.21 - export pages as JPG / PNG images (2026-10-19)
+- **File > Export Images...** (menu and Document ribbon tab) asks for JPEG or PNG,
+  then for an output file, and writes every page rendered at 150 DPI. A single
+  page uses the chosen name; a multi-page document gets `name-1.jpg`,
+  `name-2.jpg`, ... beside it. Confirmation reports how many were written.
+- Rendering is reused from the existing viewer path: the page goes straight into
+  a 32bpp BGRA buffer (`FPDFBitmap_CreateEx` + `FPDF_RenderPageBitmap` with
+  `FPDF_ANNOT | FPDF_LCD_TEXT`) and encoding is done by **GDI+** (`GdiplusStartup`
+  is started lazily on first export; encoders are looked up with
+  `GetImageEncoders`). No third-party image library; `gdiplus` is the only new
+  link dependency.
+- Verified end-to-end with a throw-away probe against `Test1.pdf`: a 1240x1754
+  (A4 @150 DPI) render had 67,701 non-white pixels, and GDI+ wrote a PNG
+  (`89 50 4E 47`, 153 KB) and a JPEG (`FF D8 FF`, 143 KB) that both reload as
+  1240x1754 images with the correct format CLSIDs. Probe removed afterwards.
+- Self-test unchanged at 465 (the encoder is exercised by the probe, not the
+  headless suite), exit 0.
+
+Self-test: 465 passed, 0 failed.
+

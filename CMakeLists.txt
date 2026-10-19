@@ -39,7 +39,7 @@ target_compile_definitions(Stitchup PRIVATE
                            STITCHUP_VERSION=L"${STITCHUP_VERSION}")
 target_include_directories(Stitchup PRIVATE src ${PDFIUM_DIR}/include)
 target_link_libraries(Stitchup PRIVATE gdi32 user32 shell32 comdlg32 comctl32
-                      uxtheme dwmapi version crypt32 advapi32 winspool
+                      uxtheme dwmapi version crypt32 advapi32 winspool gdiplus
                       ${PDFIUM_DIR}/lib/pdfium.dll.lib)
 
 add_custom_command(TARGET Stitchup POST_BUILD

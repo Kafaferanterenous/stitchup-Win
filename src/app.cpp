@@ -13,6 +13,10 @@
 #include <winver.h>
 #include <wincrypt.h>
 #include <winspool.h>
+#pragma warning(push, 0)
+#include <objidl.h>   // IUnknown / IStream, required by the GDI+ headers
+#include <gdiplus.h>
+#pragma warning(pop)
 
 #pragma warning(push, 0)
 #include <fpdfview.h>
@@ -90,6 +94,7 @@ ID_ANN_LINK,
   ID_PAGE_CROP,
   ID_EXPORT_TEXT,
   ID_EXPORT_CSV,
+  ID_EXPORT_IMG,   // Export page images (JPG / PNG)
   ID_THEME,
   ID_WATERMARK,
   ID_SAVEENC,
@@ -1856,6 +1861,140 @@ static void ExportCsvAll()
     else
       MessageBoxW(g.frame, L"Export failed.", L"Export CSV", MB_OK | MB_ICONERROR);
   }
+}
+
+// ---------------------------------------------------------------------------
+// Export page images (JPG / PNG)
+// ---------------------------------------------------------------------------
+// GDI+ is only needed to encode; start it lazily so the headless self-test (and
+// a session that never exports an image) pays nothing for it.
+static ULONG_PTR g_gdiplusToken = 0;
+
+static bool EnsureGdiplus()
+{
+  if (g_gdiplusToken) return true;
+  Gdiplus::GdiplusStartupInput in;
+  return Gdiplus::GdiplusStartup(&g_gdiplusToken, &in, nullptr) == Gdiplus::Ok;
+}
+
+static bool GdiplusEncoderClsid(const wchar_t* mime, CLSID* clsid)
+{
+  UINT num = 0, size = 0;
+  Gdiplus::GetImageEncodersSize(&num, &size);
+  if (size == 0) return false;
+  std::vector<unsigned char> buf(size);
+  Gdiplus::ImageCodecInfo* info =
+      reinterpret_cast<Gdiplus::ImageCodecInfo*>(buf.data());
+  if (Gdiplus::GetImageEncoders(num, size, info) != Gdiplus::Ok) return false;
+  for (UINT i = 0; i < num; ++i)
+    if (wcscmp(info[i].MimeType, mime) == 0)
+    {
+      *clsid = info[i].Clsid;
+      return true;
+    }
+  return false;
+}
+
+// Renders one page into a fresh 32bpp BGRA buffer at `dpi`, white background.
+static bool RenderPageToBgra(FPDF_DOCUMENT d, int index, double dpi,
+                             std::vector<unsigned char>& out, int& ow, int& oh)
+{
+  FPDF_PAGE p = FPDF_LoadPage(d, index);
+  if (!p) return false;
+  const double pw = FPDF_GetPageWidthF(p);
+  const double ph = FPDF_GetPageHeightF(p);
+  int w = (int)std::lround(pw * dpi / 72.0);
+  int h = (int)std::lround(ph * dpi / 72.0);
+  if (w < 1) w = 1;
+  if (h < 1) h = 1;
+  const int stride = w * 4;
+  out.assign(static_cast<size_t>(stride) * h, 0xFF);
+  FPDF_BITMAP fb = FPDFBitmap_CreateEx(w, h, FPDFBitmap_BGRA, out.data(), stride);
+  FPDFBitmap_FillRect(fb, 0, 0, w, h, 0xFFFFFFFF);
+  FPDF_RenderPageBitmap(fb, p, 0, 0, w, h, 0, FPDF_ANNOT | FPDF_LCD_TEXT);
+  FPDFBitmap_Destroy(fb);
+  FPDF_ClosePage(p);
+  ow = w;
+  oh = h;
+  return true;
+}
+
+// Encodes a BGRA buffer to a JPEG or PNG file at `path`.
+static bool EncodeBgraToFile(const std::vector<unsigned char>& bits, int w, int h,
+                             bool jpeg, const std::wstring& path)
+{
+  if (!EnsureGdiplus() || bits.empty() || w < 1 || h < 1) return false;
+  const int stride = w * 4;
+  Gdiplus::Bitmap bmp(w, h, stride, PixelFormat32bppARGB,
+                      const_cast<BYTE*>(reinterpret_cast<const BYTE*>(bits.data())));
+  if (bmp.GetLastStatus() != Gdiplus::Ok) return false;
+  CLSID clsid;
+  if (!GdiplusEncoderClsid(jpeg ? L"image/jpeg" : L"image/png", &clsid))
+    return false;
+  return bmp.Save(path.c_str(), &clsid, nullptr) == Gdiplus::Ok;
+}
+
+static void ExportImagesAll()
+{
+  if (!g.doc || g.pageCount < 1)
+  {
+    MessageBoxW(g.frame, L"No document open.", L"Export Images",
+                MB_OK | MB_ICONINFORMATION);
+    return;
+  }
+  const int r = MessageBoxW(
+      g.frame, L"Image format?\nYes = JPEG (.jpg)\nNo = PNG (.png)\nCancel = abort",
+      L"Export Images", MB_YESNOCANCEL | MB_ICONQUESTION);
+  if (r == IDCANCEL) return;
+  const bool jpeg = (r == IDYES);
+  const wchar_t* ext = jpeg ? L"jpg" : L"png";
+
+  std::wstring target = g.path;
+  const size_t dot = target.find_last_of(L'.');
+  if (dot != std::wstring::npos) target.resize(dot);
+  target += L".";
+  target += ext;
+  wchar_t buf[MAX_PATH];
+  wcscpy_s(buf, target.c_str());
+  OPENFILENAMEW ofn{};
+  ofn.lStructSize = sizeof(ofn);
+  ofn.hwndOwner = g.frame;
+  ofn.lpstrFilter = jpeg ? L"JPEG Images (*.jpg)\0*.jpg\0All Files\0*.*\0\0"
+                         : L"PNG Images (*.png)\0*.png\0All Files\0*.*\0\0";
+  ofn.lpstrDefExt = ext;
+  ofn.lpstrFile = buf;
+  ofn.nMaxFile = MAX_PATH;
+  ofn.Flags = OFN_OVERWRITEPROMPT | OFN_PATHMUSTEXIST;
+  if (!GetSaveFileNameW(&ofn)) return;
+
+  std::wstring base = buf;
+  const size_t bdot = base.find_last_of(L'.');
+  std::wstring stem = (bdot == std::wstring::npos) ? base : base.substr(0, bdot);
+  const std::wstring suffix = std::wstring(L".") + ext;
+  const double dpi = 150.0;
+  int done = 0;
+  std::vector<unsigned char> pixels;
+  for (int i = 0; i < g.pageCount; ++i)
+  {
+    int w = 0, h = 0;
+    if (!RenderPageToBgra(g.doc, i, dpi, pixels, w, h)) continue;
+    std::wstring path;
+    if (g.pageCount == 1)
+      path = stem + suffix;
+    else
+      path = stem + L"-" + std::to_wstring(i + 1) + suffix;
+    if (EncodeBgraToFile(pixels, w, h, jpeg, path)) ++done;
+  }
+  if (done == 0)
+  {
+    MessageBoxW(g.frame, L"Export failed.", L"Export Images", MB_OK | MB_ICONERROR);
+    return;
+  }
+  std::wstring msg = L"Exported " + std::to_wstring(done) + L" image" +
+                     (done == 1 ? L"" : L"s") + L" to:\n";
+  msg += (g.pageCount == 1) ? (stem + suffix)
+                            : (stem + L"-1" + suffix + L" ...");
+  MessageBoxW(g.frame, msg.c_str(), L"Export Images", MB_OK | MB_ICONINFORMATION);
 }
 
 // ---------------------------------------------------------------------------
@@ -9347,6 +9486,8 @@ static void BuildToolbar(HWND)
      L"Write the document text out to a .txt file"},
     {ID_EXPORT_CSV,   L"Export CSV", 66, 0, 0xE8FD, false,
      L"Write page data out to a .csv file"},
+    {ID_EXPORT_IMG,   L"Images",     66, 0, 0xE8B9, false,
+     L"Export each page as a JPG or PNG image"},
     {ID_PRINT,        L"Print",      62, 0, 0xE749, false,
      L"Print the document, all pages or a page range (Ctrl+P)"},
     {ID_PRINT_PREVIEW, L"Preview",   74, 0, 0xE749, false,
@@ -10669,7 +10810,7 @@ static bool IsHandledCommand(int id)
   switch (id)
   {
     case ID_NEW: case ID_OPEN: case ID_SAVE: case ID_SAVEAS: case ID_SAVEENC:
-    case ID_IMPORT: case ID_MERGE_APPEND: case ID_COMBINE_NEW: case ID_COMPRESS_PDF: case ID_EDIT_TEXT: case ID_EXPORT_TEXT: case ID_EXPORT_CSV: case ID_WATERMARK: case ID_SIGN: case ID_META: case ID_ATTACHMENTS:
+    case ID_IMPORT: case ID_MERGE_APPEND: case ID_COMBINE_NEW: case ID_COMPRESS_PDF: case ID_EDIT_TEXT: case ID_EXPORT_TEXT: case ID_EXPORT_CSV: case ID_EXPORT_IMG: case ID_WATERMARK: case ID_SIGN: case ID_META: case ID_ATTACHMENTS:
     case ID_EXIT: case ID_ROTR: case ID_ROTL: case ID_DELETE: case ID_ADD:
     case ID_TOOL_SELECT: case ID_OBJ_EDIT: case ID_OBJ_DELETE:
     case ID_OBJ_RECOLOR: case ID_OBJ_FONT: case ID_ZOOM_IN: case ID_ZOOM_OUT: case ID_ZOOM100:
@@ -10815,6 +10956,7 @@ static void DoCommand(int id)
     case ID_PAGE_CROP:    CropSelectedPagesToContent(); break;
     case ID_EXPORT_TEXT:  ExportTextAll(); break;
     case ID_EXPORT_CSV:   ExportCsvAll(); break;
+    case ID_EXPORT_IMG:   ExportImagesAll(); break;
     case ID_WATERMARK:    WatermarkCurrentDoc(); break;
       case ID_SIGN:         SignDocument(); break;
       case ID_META:         EditMetadata(); break;
@@ -10869,6 +11011,7 @@ static HMENU BuildMenu()
   addItem(file, ID_COMPRESS_PDF, L"Compress PDF...");
   addItem(file, ID_EXPORT_TEXT, L"Export Text...");
   addItem(file, ID_EXPORT_CSV, L"Export CSV...");
+  addItem(file, ID_EXPORT_IMG, L"Export Images...");
   addItem(file, ID_WATERMARK, L"Watermark...");
   addItem(file, ID_SIGN, L"Sign Document...");
   addItem(file, ID_META, L"Document Properties...");

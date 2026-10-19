@@ -207,8 +207,8 @@ project (github.com/bblanchon/pdfium-binaries). Non-GPL build.
 - Shell + annotations + link activation + page management (extract/split/
   auto-crop, now selection-aware) + text export + CSV export + password-unlock +
   watermarks + encrypt-on-save + redaction + digital signatures + print-to-PDF +
-  document properties + moving pages between open documents are done. Rendering,
-  page model, editing operations, ribbon
+  document properties + moving pages between open documents + page image export
+  are done. Rendering, page model, editing operations, ribbon
   navigation, the bookmarks pane, annotation creation/persistence, link
   navigation, link *creation* and page extract/split/crop are functional.
 - Digital signatures are written as an incremental update with Windows
@@ -244,8 +244,13 @@ project (github.com/bblanchon/pdfium-binaries). Non-GPL build.
   Pages pane onto another tab in the tab strip (the target tab highlights). The
   pages are appended to that document, which is left dirty to be saved under its
   own tab, and removed from the current one, which always keeps at least one page.
+- Pages can be exported as images (File > Export Images...): choose JPEG or PNG,
+  pick an output file, and every page is rendered at 150 DPI and written next to
+  it (`name-1.jpg`, `name-2.jpg`, ... for multi-page documents). Rendering goes
+  straight to a 32bpp BGRA buffer and GDI+ does the encoding, so no third-party
+  image library is needed.
 - Tools menu/ribbon tab hosts the Security (Save As Encrypted) and Export
-  (Export Text / Export CSV) groups.
+  (Export Text / Export CSV / Images) groups.
 
 ### Remaining goals
 
@@ -260,12 +265,12 @@ Not yet implemented, roughly by how much a user notices them missing:
 - Autosave / crash recovery
 - AcroForm field filling
 - Export the document to other formats (all offline, no third-party libraries):
-  - Images (JPG / PNG) — render each page to a bitmap and encode via WIC/GDI+
   - DOCX — a hand-rolled minimal ZIP writer (STORE method + CRC32) plus
     `[Content_Types].xml` and `word/document.xml`
   - ODF / ODT — the same ZIP writer with an uncompressed `mimetype` first entry
     and a `content.xml`
   - RTF — a plain text-run writer
   - TXT — already covered by Export Text
+  - Images (JPG / PNG) — done, see Export Images above
   (Legacy `.doc` is an OLE compound file and is not produced natively; RTF is the
   usual stand-in.)
