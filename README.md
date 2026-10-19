@@ -263,16 +263,13 @@ Not yet implemented, roughly by how much a user notices them missing:
 
 ### Nice to have
 
-- OCR, so scanned pages become searchable
-- Autosave / crash recovery
-- AcroForm field filling
-- Export the document to other formats (all offline, no third-party libraries):
-  - DOCX — a hand-rolled minimal ZIP writer (STORE method + CRC32) plus
-    `[Content_Types].xml` and `word/document.xml`
-  - ODF / ODT — the same ZIP writer with an uncompressed `mimetype` first entry
-    and a `content.xml`
-  - TXT — already covered by Export Text
-  - Images (JPG / PNG) — done
-  - RTF — done
+1. Export → RTF — **100% done** — difficulty **20%**
+2. Export → TXT — **100% done** — difficulty **5%**
+3. Export → Images (JPG / PNG) — **100% done** — difficulty **15%**
+4. Export → DOCX — **0% done**, difficulty **30%**
+5. Export → ODF / ODT — **0% done**, difficulty **30%**
+6. Autosave / crash recovery — **0% done**, difficulty **35%**
+7. AcroForm field filling (interactive fields) — **0% done**, difficulty **45%**
+8. OCR (searchable scans) — **0% done**, difficulty **90%**
   (Legacy `.doc` is an OLE compound file and is not produced natively; RTF is the
   usual stand-in.)
