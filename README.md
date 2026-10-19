@@ -136,7 +136,10 @@ Produces `dist\Stitchup.exe` + `dist\pdfium.dll`.
   image — on the current page to select it (accent bounding box + handles), then
   drag to move it, Ctrl+Del (or Menu > Delete Selected Object) to remove it,
   RecColor to recolor the fill, or Edit Text (double-click) to replace the text
-  run; edits persist through Save and reload (4 object tests added)
+  run; edits persist through Save and reload (4 object tests added). Ctrl+click
+  adds or removes objects from the selection, Ctrl+A (with the Select tool armed)
+  selects every object on the page, and Delete / ReColor / the font controls then
+  act on the whole set; dragging any selected object moves them together
 - Double-clicking a line of text enters edit mode on it: the run is selected and
   the Select tool is armed, and the Edit Text dialog opens with that run's text
   preselected and the caret ready, so the line can be retyped immediately
@@ -233,6 +236,9 @@ project (github.com/bblanchon/pdfium-binaries). Non-GPL build.
   File > Document Properties.... PDFium has no metadata setter, so the values are
   held for the session and the `/Info` dictionary is rewritten as an incremental
   update on save; unrelated entries are preserved.
+- Embedded file attachments are listed by File > Attachments... (name, size, MIME
+  type, description); each can be saved to disk or opened, extracted to a temp
+  file and handed to the shell.
 - Tools menu/ribbon tab hosts the Security (Save As Encrypted) and Export
   (Export Text / Export CSV) groups.
 
@@ -246,8 +252,6 @@ Not yet implemented, roughly by how much a user notices them missing:
 ### Nice to have
 
 - OCR, so scanned pages become searchable
-- View embedded file attachments
 - Drag a page into another open document
 - Autosave / crash recovery
-- Select All and multi-select for content objects (pages now support it)
 - AcroForm field filling

@@ -21,6 +21,7 @@
 #include <fpdf_ppo.h>
 #include <fpdf_doc.h>
 #include <fpdf_annot.h>
+#include <fpdf_attachment.h>
 #include <fpdf_transformpage.h>
 #include <fpdf_text.h>
 #pragma warning(pop)
@@ -94,6 +95,7 @@ ID_ANN_LINK,
   ID_SAVEENC,
   ID_SIGN,
   ID_META,
+  ID_ATTACHMENTS,   // View embedded file attachments
   ID_TOOL_SELECT,
   ID_OBJ_EDIT,
   ID_OBJ_DELETE,
@@ -318,7 +320,8 @@ struct App
   {
     bool active = false;
     int page = -1;
-    int index = -1;
+    int index = -1;            // primary object (drives font controls / text edit)
+    std::vector<int> objects;  // full set selected on `page` (multi-select)
     int type = 0;
     float l = 0, b = 0, r = 0, t = 0;
     bool textEditing = false;
@@ -1299,6 +1302,8 @@ static void CloseDoc()
   g.findQuery.clear();
   g.findHits.clear();
   g.findCur = -1;
+  g.sel.active = false;
+  g.sel.objects.clear();
   g_metaDirty = false;
   g_metaTitle.clear();
   g_metaAuthor.clear();
@@ -2246,6 +2251,296 @@ static void EditMetadata()
               L"Document properties updated. Save the document to write them "
               L"into the PDF.",
               L"Stitchup", MB_OK | MB_ICONINFORMATION);
+}
+
+// ---------------------------------------------------------------------------
+// Embedded file attachments viewer (File > Attachments...)
+// ---------------------------------------------------------------------------
+// A read-only list of the files embedded in the document (the /EmbeddedFiles
+// name tree), with Save As and Open. The listing is captured once when the
+// dialog opens; a modal singleton so one flat vector is enough.
+struct AttachItem
+{
+  std::wstring name;
+  std::wstring type;   // MIME subtype
+  std::wstring desc;
+  unsigned long long size = 0;
+  bool haveSize = false;
+};
+static std::vector<AttachItem> g_attachItems;
+
+static std::wstring FormatBytes(unsigned long long n)
+{
+  wchar_t b[48];
+  if (n < 1024ull) swprintf(b, 48, L"%llu B", n);
+  else if (n < 1024ull * 1024ull) swprintf(b, 48, L"%.1f kB", n / 1024.0);
+  else if (n < 1024ull * 1024ull * 1024ull)
+    swprintf(b, 48, L"%.1f MB", n / (1024.0 * 1024.0));
+  else swprintf(b, 48, L"%.2f GB", n / (1024.0 * 1024.0 * 1024.0));
+  return b;
+}
+
+// which: 0 = name, 1 = MIME subtype, 2 = description. PDFium reports the byte
+// count it needs on the first (null) call; the buffer is UTF-16LE incl. NUL.
+static std::wstring AttachReadStr(FPDF_ATTACHMENT a, int which)
+{
+  if (!a) return L"";
+  unsigned long n = 0;
+  if (which == 0) n = FPDFAttachment_GetName(a, nullptr, 0);
+  else if (which == 1) n = FPDFAttachment_GetSubtype(a, nullptr, 0);
+  else n = FPDFAttachment_GetDescription(a, nullptr, 0);
+  if (n <= 2) return L"";
+  std::vector<unsigned short> buf((n + 1) / 2, 0);
+  if (which == 0) FPDFAttachment_GetName(a, buf.data(), n);
+  else if (which == 1) FPDFAttachment_GetSubtype(a, buf.data(), n);
+  else FPDFAttachment_GetDescription(a, buf.data(), n);
+  return std::wstring(reinterpret_cast<const wchar_t*>(buf.data()));
+}
+
+static bool AttachReadFile(FPDF_ATTACHMENT a, std::vector<unsigned char>& out)
+{
+  out.clear();
+  if (!a) return false;
+  unsigned long n = 0;
+  if (!FPDFAttachment_GetFile(a, nullptr, 0, &n) || n == 0) return false;
+  out.assign(n, 0);
+  unsigned long got = 0;
+  if (!FPDFAttachment_GetFile(a, out.data(), n, &got) || got == 0 || got > n)
+  {
+    out.clear();
+    return false;
+  }
+  out.resize(got);
+  return true;
+}
+
+static bool WriteAllBytes(const std::wstring& path,
+                          const std::vector<unsigned char>& data)
+{
+  HANDLE h = CreateFileW(path.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
+                         FILE_ATTRIBUTE_NORMAL, nullptr);
+  if (h == INVALID_HANDLE_VALUE) return false;
+  bool ok = true;
+  if (!data.empty())
+  {
+    DWORD written = 0;
+    ok = WriteFile(h, data.data(), (DWORD)data.size(), &written, nullptr) &&
+         written == (DWORD)data.size();
+  }
+  CloseHandle(h);
+  return ok;
+}
+
+// Extract attachment |i| to disk. Returns the path written (empty on failure).
+static std::wstring AttachExtractTo(int i, const std::wstring& path)
+{
+  if (i < 0 || i >= (int)g_attachItems.size() || !g.doc) return L"";
+  FPDF_ATTACHMENT a = FPDFDoc_GetAttachment(g.doc, i);
+  std::vector<unsigned char> data;
+  if (!AttachReadFile(a, data)) return L"";
+  if (!WriteAllBytes(path, data)) return L"";
+  return path;
+}
+
+static void AttachSaveAs(HWND owner, int i)
+{
+  if (i < 0 || i >= (int)g_attachItems.size()) return;
+  wchar_t buf[MAX_PATH];
+  wcscpy_s(buf, g_attachItems[i].name.c_str());
+  OPENFILENAMEW ofn{};
+  ofn.lStructSize = sizeof(ofn);
+  ofn.hwndOwner = owner;
+  ofn.lpstrFilter = L"All Files\0*.*\0\0";
+  ofn.lpstrFile = buf;
+  ofn.nMaxFile = MAX_PATH;
+  ofn.Flags = OFN_OVERWRITEPROMPT | OFN_PATHMUSTEXIST;
+  if (!GetSaveFileNameW(&ofn)) return;
+  if (AttachExtractTo(i, buf).empty())
+    MessageBoxW(owner, L"Could not read the attachment data.",
+                L"Attachments", MB_OK | MB_ICONERROR);
+  else
+    MessageBoxW(owner, (std::wstring(L"Saved:\n") + buf).c_str(),
+                L"Attachments", MB_OK | MB_ICONINFORMATION);
+}
+
+static void AttachOpen(HWND owner, int i)
+{
+  if (i < 0 || i >= (int)g_attachItems.size()) return;
+  wchar_t tmp[MAX_PATH];
+  if (!GetTempPathW(MAX_PATH, tmp)) return;
+  const std::wstring dir = std::wstring(tmp) + L"StitchupAttach";
+  CreateDirectoryW(dir.c_str(), nullptr);
+  const std::wstring path = dir + L"\\" + g_attachItems[i].name;
+  if (AttachExtractTo(i, path).empty())
+  {
+    MessageBoxW(owner, L"Could not read the attachment data.",
+                L"Attachments", MB_OK | MB_ICONERROR);
+    return;
+  }
+  const HINSTANCE r = ShellExecuteW(owner, L"open", path.c_str(), nullptr,
+                                    nullptr, SW_SHOWNORMAL);
+  if ((INT_PTR)r <= 32)
+    MessageBoxW(owner, (L"No handler to open it. It was extracted to:\n" + path).c_str(),
+                L"Attachments", MB_OK | MB_ICONINFORMATION);
+}
+
+enum { ATTACH_LIST = 100, ATTACH_SAVE, ATTACH_OPEN, ATTACH_CLOSE };
+
+static int AttachSelItem(HWND h)
+{
+  HWND lv = GetDlgItem(h, ATTACH_LIST);
+  return lv ? ListView_GetNextItem(lv, -1, LVNI_SELECTED) : -1;
+}
+
+static LRESULT CALLBACK AttachProc(HWND h, UINT m, WPARAM w, LPARAM l)
+{
+  switch (m)
+  {
+    case WM_CREATE:
+    {
+      HWND lv = CreateWindowExW(WS_EX_CLIENTEDGE, WC_LISTVIEWW, L"",
+        WS_CHILD | WS_VISIBLE | WS_TABSTOP | LVS_REPORT | LVS_SINGLESEL |
+        LVS_SHOWSELALWAYS, 12, 12, 556, 226, h, (HMENU)ATTACH_LIST, g.inst,
+        nullptr);
+      ListView_SetExtendedListViewStyle(lv, LVS_EX_FULLROWSELECT | LVS_EX_GRIDLINES);
+      struct { const wchar_t* t; int w; }
+      cols[] = { { L"Name", 210 }, { L"Size", 80 }, { L"Type", 130 },
+                 { L"Description", 116 } };
+      for (int i = 0; i < 4; ++i)
+      {
+        LVCOLUMNW c{};
+        c.mask = LVCF_TEXT | LVCF_WIDTH;
+        c.pszText = const_cast<LPWSTR>(cols[i].t);
+        c.cx = cols[i].w;
+        ListView_InsertColumn(lv, i, &c);
+      }
+      for (int i = 0; i < (int)g_attachItems.size(); ++i)
+      {
+        const AttachItem& it = g_attachItems[i];
+        LVITEMW li{};
+        li.mask = LVIF_TEXT;
+        li.iItem = i;
+        li.pszText = const_cast<LPWSTR>(it.name.c_str());
+        ListView_InsertItem(lv, &li);
+        const std::wstring sz = it.haveSize ? FormatBytes(it.size) : L"";
+        ListView_SetItemText(lv, i, 1, const_cast<LPWSTR>(sz.c_str()));
+        ListView_SetItemText(lv, i, 2, const_cast<LPWSTR>(it.type.c_str()));
+        ListView_SetItemText(lv, i, 3, const_cast<LPWSTR>(it.desc.c_str()));
+      }
+      if (!g_attachItems.empty())
+        ListView_SetItemState(lv, 0, LVIS_SELECTED | LVIS_FOCUSED,
+                              LVIS_SELECTED | LVIS_FOCUSED);
+      CreateWindowExW(0, L"BUTTON", L"Save As...",
+        WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
+        12, 248, 96, 28, h, (HMENU)ATTACH_SAVE, g.inst, nullptr);
+      CreateWindowExW(0, L"BUTTON", L"Open",
+        WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
+        116, 248, 90, 28, h, (HMENU)ATTACH_OPEN, g.inst, nullptr);
+      CreateWindowExW(0, L"BUTTON", L"Close",
+        WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_DEFPUSHBUTTON,
+        478, 248, 90, 28, h, (HMENU)ATTACH_CLOSE, g.inst, nullptr);
+      return 0;
+    }
+    case WM_COMMAND:
+    {
+      const int id = LOWORD(w);
+      if (id == ATTACH_CLOSE) { DestroyWindow(h); return 0; }
+      const int i = AttachSelItem(h);
+      if (id == ATTACH_SAVE) { AttachSaveAs(h, i); return 0; }
+      if (id == ATTACH_OPEN) { AttachOpen(h, i); return 0; }
+      break;
+    }
+    case WM_NOTIFY:
+    {
+      const NMHDR* nh = reinterpret_cast<const NMHDR*>(l);
+      if (nh && nh->code == NM_DBLCLK && nh->idFrom == ATTACH_LIST)
+      {
+        AttachOpen(h, AttachSelItem(h));
+        return 0;
+      }
+      break;
+    }
+    case WM_CLOSE:
+      DestroyWindow(h);
+      return 0;
+  }
+  return DefWindowProcW(h, m, w, l);
+}
+
+static void ShowAttachments()
+{
+  if (!g.doc)
+  {
+    MessageBoxW(g.frame, L"No document is open.", L"Stitchup",
+                MB_OK | MB_ICONINFORMATION);
+    return;
+  }
+  g_attachItems.clear();
+  const int n = FPDFDoc_GetAttachmentCount(g.doc);
+  for (int i = 0; i < n; ++i)
+  {
+    FPDF_ATTACHMENT a = FPDFDoc_GetAttachment(g.doc, i);
+    if (!a) continue;
+    AttachItem it;
+    it.name = AttachReadStr(a, 0);
+    if (it.name.empty()) it.name = L"(unnamed)";
+    it.type = AttachReadStr(a, 1);
+    it.desc = AttachReadStr(a, 2);
+    unsigned long sz = 0;
+    if (FPDFAttachment_GetFile(a, nullptr, 0, &sz)) { it.size = sz; it.haveSize = true; }
+    g_attachItems.push_back(it);
+  }
+  if (g_attachItems.empty())
+  {
+    MessageBoxW(g.frame, L"This document has no embedded file attachments.",
+                L"Attachments", MB_OK | MB_ICONINFORMATION);
+    return;
+  }
+
+  const wchar_t cls[] = L"SKAttachWnd";
+  static bool reg = false;
+  if (!reg)
+  {
+    WNDCLASSEXW wc{};
+    wc.cbSize = sizeof(wc);
+    wc.lpfnWndProc = AttachProc;
+    wc.hInstance = g.inst;
+    wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+    wc.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
+    wc.lpszClassName = cls;
+    RegisterClassExW(&wc);
+    reg = true;
+  }
+
+  HWND hw = CreateWindowExW(WS_EX_DLGMODALFRAME, cls, L"Attachments",
+                            WS_POPUP | WS_CAPTION | WS_SYSMENU,
+                            CW_USEDEFAULT, CW_USEDEFAULT, 596, 324,
+                            g.frame, nullptr, g.inst, nullptr);
+  if (!hw) return;
+  RECT fr, rc;
+  GetWindowRect(g.frame, &fr);
+  GetWindowRect(hw, &rc);
+  SetWindowPos(hw, nullptr,
+               fr.left + (fr.right - fr.left - (rc.right - rc.left)) / 2,
+               fr.top + (fr.bottom - fr.top - (rc.bottom - rc.top)) / 2,
+               0, 0, SWP_NOSIZE | SWP_NOZORDER);
+  ShowWindow(hw, SW_SHOW);
+  UpdateWindow(hw);
+  EnableWindow(g.frame, FALSE);
+  MSG msg;
+  while (IsWindow(hw))
+  {
+    const BOOL r = GetMessageW(&msg, nullptr, 0, 0);
+    if (r <= 0) break;
+    if (!IsDialogMessageW(hw, &msg))
+    {
+      TranslateMessage(&msg);
+      DispatchMessageW(&msg);
+    }
+  }
+  EnableWindow(g.frame, TRUE);
+  SetActiveWindow(g.frame);
+  SetFocus(g.frame);
 }
 
 struct WmCtx
@@ -6542,10 +6837,42 @@ static bool HitTestObject(int pi, double px, double py, PageObject& best)
   return false;
 }
 
+// --- content-object multi-selection (Select tool) --------------------------
+// g.sel.objects holds every selected object index on g.sel.page; g.sel.index is
+// the primary (last picked) and drives the font controls / in-place text edit.
+static bool IsObjSelected(int index)
+{
+  for (int i : g.sel.objects) if (i == index) return true;
+  return false;
+}
+
+static void ClearObjSel()
+{
+  g.sel.objects.clear();
+  g.sel.active = false;
+}
+
 static void RefreshSelBounds()
 {
   if (!g.sel.active) { UpdateFontControls(); return; }
-  for (const PageObject& po : ListPageObjects(g.sel.page))
+  if (g.sel.objects.empty() && g.sel.index >= 0)
+    g.sel.objects.push_back(g.sel.index);   // seed an older single selection
+  const std::vector<PageObject> objs = ListPageObjects(g.sel.page);
+  // Prune the set to objects that still exist (page reloads drop unchanged
+  // indices; a deleted object is simply gone).
+  std::vector<int> keep;
+  for (int idx : g.sel.objects)
+    for (const PageObject& po : objs)
+      if (po.index == idx) { keep.push_back(idx); break; }
+  g.sel.objects.swap(keep);
+  if (g.sel.objects.empty())
+  {
+    g.sel.active = false;
+    UpdateFontControls();
+    return;
+  }
+  if (!IsObjSelected(g.sel.index)) g.sel.index = g.sel.objects.back();
+  for (const PageObject& po : objs)
   {
     if (po.index == g.sel.index)
     {
@@ -6562,7 +6889,7 @@ static void RefreshSelBounds()
 static void SetToolSelect(bool on)
 {
   g.toolSelect = on;
-  if (!on) g.sel.active = false;
+  if (!on) { g.sel.active = false; g.sel.objects.clear(); }
   for (HWND h : g.ribbonBtns)
   {
     if (GetWindowLongPtrW(h, GWLP_ID) == ID_TOOL_SELECT)
@@ -6574,7 +6901,7 @@ static void SetToolSelect(bool on)
   InvalidateRect(g.status, nullptr, TRUE);
 }
 
-static void ApplyRecolor(int pi, int index, int r, int g_, int b);
+static void ApplyRecolorBatch(int pi, const std::vector<int>& idx, int r, int g_, int b);
 
 // Persist object edits: serializes the (already GenerateContent'ed) doc and
 // reloads it, exactly like Save-in-place. Selection is invalidated on reload.
@@ -6584,28 +6911,63 @@ static void CommitEdits()
   g.editObj = nullptr;
   g.selDrag = false;
   g.sel.active = false;
+  g.sel.objects.clear();
   SaveInPlace();
   RefreshSelBounds();
 }
 
+// Select every content object on the current page (Ctrl+A while the Select tool
+// is armed; otherwise Ctrl+A keeps its page-selection meaning).
+static void SelectAllObjects()
+{
+  if (!g.doc || g.selected < 0 || g.selected >= g.pageCount) return;
+  std::vector<int> idx;
+  for (const PageObject& po : ListPageObjects(g.selected))
+    if (po.isPainted()) idx.push_back(po.index);
+  g.sel.page = g.selected;
+  if (idx.empty())
+  {
+    MessageBoxW(g.frame, L"No selectable objects on this page.", L"Stitchup",
+                MB_OK | MB_ICONINFORMATION);
+    return;
+  }
+  g.sel.objects = idx;
+  g.sel.index = idx.back();
+  g.sel.active = true;
+  RefreshSelBounds();
+  ClearCanvasCache();
+  if (g.canvas) InvalidateRect(g.canvas, nullptr, TRUE);
+  if (g.status) InvalidateRect(g.status, nullptr, TRUE);
+  UpdateFontControls();
+  SyncColorControls();
+}
+
 static void DeleteSelectedObject()
 {
-  if (!g.sel.active)
+  if (!g.sel.active || g.sel.objects.empty())
   {
     MessageBoxW(g.frame, L"Nothing selected. Use the Select tool to pick an object.",
                 L"Stitchup", MB_OK | MB_ICONINFORMATION);
     return;
   }
+  // Remove indices high-to-low so earlier removals don't shift later ones.
+  std::vector<int> idx = g.sel.objects;
+  std::sort(idx.begin(), idx.end(), std::greater<int>());
   FPDF_PAGE page = FPDF_LoadPage(g.doc, g.sel.page);
-  FPDF_PAGEOBJECT o = page ? FPDFPage_GetObject(page, g.sel.index) : nullptr;
-  if (o)
+  bool any = false;
+  if (page)
   {
-    BeginEdit();
-    FPDFPage_RemoveObject(page, o);
+    for (int i : idx)
+    {
+      FPDF_PAGEOBJECT o = FPDFPage_GetObject(page, i);
+      if (!o) continue;
+      if (!any) { BeginEdit(); any = true; }
+      FPDFPage_RemoveObject(page, o);
+    }
+    if (any) FPDFPage_GenerateContent(page);
+    FPDF_ClosePage(page);
   }
-  if (page && o) FPDFPage_GenerateContent(page);
-  if (page) FPDF_ClosePage(page);
-  if (!o) CancelEdit();
+  if (!any) CancelEdit();
   CommitEdits();
 }
 
@@ -6620,6 +6982,8 @@ static std::vector<COLORREF> kPalette = {
 static const wchar_t* kPaletteNames[] = {
   L"Black", L"White", L"Red", L"Green", L"Blue", L"Yellow", L"Orange", L"Gray",
 };
+// Objects the recolor dialog will repaint (snapshot of the multi-selection).
+static std::vector<int> g_recolorIdx;
 
 static LRESULT CALLBACK ClrProc(HWND h, UINT m, WPARAM w, LPARAM l)
 {
@@ -6652,7 +7016,7 @@ static LRESULT CALLBACK ClrProc(HWND h, UINT m, WPARAM w, LPARAM l)
         col[0] = (kPalette[id - 1] >> 16) & 0xFF;
         col[1] = (kPalette[id - 1] >> 8) & 0xFF;
         col[2] = kPalette[id - 1] & 0xFF;
-        ApplyRecolor(g.sel.page, g.sel.index, col[0], col[1], col[2]);
+        ApplyRecolorBatch(g.sel.page, g_recolorIdx, col[0], col[1], col[2]);
         DestroyWindow(h);
         return 0;
       }
@@ -6668,24 +7032,30 @@ static LRESULT CALLBACK ClrProc(HWND h, UINT m, WPARAM w, LPARAM l)
 
 static void ApplyRecolorSelected()
 {
-  if (!g.sel.active)
+  if (!g.sel.active || g.sel.objects.empty())
   {
     MessageBoxW(g.frame, L"Nothing selected. Use the Select tool to pick an object.",
                 L"Stitchup", MB_OK | MB_ICONINFORMATION);
     return;
   }
+  // Keep only the text / vector objects in the selection; images can't recolor.
   FPDF_PAGE page = FPDF_LoadPage(g.doc, g.sel.page);
-  FPDF_PAGEOBJECT o = page ? FPDFPage_GetObject(page, g.sel.index) : nullptr;
-  if (!o || !page) { if (page) FPDF_ClosePage(page); return; }
-  const int t = FPDFPageObj_GetType(o);
-  if (t != FPDF_PAGEOBJ_TEXT && t != FPDF_PAGEOBJ_PATH)
+  if (!page) return;
+  g_recolorIdx.clear();
+  for (int i : g.sel.objects)
   {
-    FPDF_ClosePage(page);
+    FPDF_PAGEOBJECT o = FPDFPage_GetObject(page, i);
+    if (!o) continue;
+    const int t = FPDFPageObj_GetType(o);
+    if (t == FPDF_PAGEOBJ_TEXT || t == FPDF_PAGEOBJ_PATH) g_recolorIdx.push_back(i);
+  }
+  FPDF_ClosePage(page);
+  if (g_recolorIdx.empty())
+  {
     MessageBoxW(g.frame, L"Recolor works on text and vector objects, not images.",
                 L"Stitchup", MB_OK | MB_ICONINFORMATION);
     return;
   }
-  FPDF_ClosePage(page);
 
   const wchar_t cls[] = L"SKClrWnd";
   static bool reg = false;
@@ -6996,19 +7366,24 @@ static void EditTextObject(int pi, int index, const std::wstring& newText,
   CommitEdits();
 }
 
-static void ApplyRecolor(int pi, int index, int r, int g_, int b)
+static void ApplyRecolorBatch(int pi, const std::vector<int>& idx, int r, int g_, int b)
 {
-  if (pi < 0 || pi >= g.pageCount) return;
+  if (pi < 0 || pi >= g.pageCount || idx.empty()) return;
   FPDF_PAGE page = FPDF_LoadPage(g.doc, pi);
-  FPDF_PAGEOBJECT o = page ? FPDFPage_GetObject(page, index) : nullptr;
-  if (o)
+  if (!page) return;
+  BeginEdit();
+  bool any = false;
+  for (int i : idx)
   {
-    BeginEdit();
+    FPDF_PAGEOBJECT o = FPDFPage_GetObject(page, i);
+    if (!o) continue;
     FPDFPageObj_SetFillColor(o, (unsigned int)r, (unsigned int)g_, (unsigned int)b, 255);
     FPDFPageObj_SetStrokeColor(o, (unsigned int)r, (unsigned int)g_, (unsigned int)b, 255);
-    FPDFPage_GenerateContent(page);
+    any = true;
   }
-  if (page) FPDF_ClosePage(page);
+  if (any) FPDFPage_GenerateContent(page);
+  FPDF_ClosePage(page);
+  if (!any) CancelEdit();
   CommitEdits();
 }
 
@@ -7501,18 +7876,25 @@ static void ApplyFontChoice(const std::string& fam, float size)
   if (g.sel.active && g.sel.type == FPDF_PAGEOBJ_TEXT)
   {
     const int pi = g.sel.page;
-    const int oi = g.sel.index;
-    std::wstring cur;
+    std::vector<int> sel = g.sel.objects;
+    if (sel.empty()) sel.push_back(g.sel.index);
+    // Restyle every text object in the selection. EditTextObject replaces the
+    // object in place (same index) and reloads, so the snapshot stays valid.
+    std::vector<std::pair<int, std::wstring>> targets;
     for (const PageObject& po : ListPageObjects(pi))
-      if (po.index == oi) { cur = po.text; break; }
-    EditTextObject(pi, oi, cur, fam, size);
-    // Re-select the just-restyled object: changing the font reloads the page and
-    // drops the selection, which stopped the user setting the size after picking
-    // a family. Keeping it selected lets family and size both be adjusted.
+      if (po.isText() && std::find(sel.begin(), sel.end(), po.index) != sel.end())
+        targets.push_back(std::make_pair(po.index, po.text));
+    if (targets.empty()) return;
+    for (const std::pair<int, std::wstring>& t : targets)
+      EditTextObject(pi, t.first, t.second, fam, size);
+    // Re-select the primary: changing the font reloads the page and drops the
+    // selection, which stopped the user setting the size after picking a family.
     g.sel.active = true;
     g.sel.type = FPDF_PAGEOBJ_TEXT;
     g.sel.page = pi;
-    g.sel.index = oi;
+    if (std::find(sel.begin(), sel.end(), g.sel.index) == sel.end())
+      g.sel.index = targets.front().first;
+    g.sel.objects = sel;
     RefreshSelBounds();
   }
 }
@@ -7666,24 +8048,53 @@ static void CanvasPaint(HDC dc, int cw, int ch)
         }
       }
 
-      // Content-object selection overlay (Select tool)
+      // Content-object selection overlay (Select tool). The primary carries the
+      // resize handles; a multi-selection outlines every other member too.
       if (g.sel.active && g.sel.page == i && g.sel.type > 0)
       {
-        float slx = g.sel.l, sbx = g.sel.b, srx = g.sel.r, stx = g.sel.t;
-        if (srx > slx && stx > sbx)
+        const bool havePrimary = (g.sel.r > g.sel.l && g.sel.t > g.sel.b);
+        const float phh = PageH(i);
+        std::vector<FS_RECTF> boxes;
+        if (havePrimary)
+          boxes.push_back(FS_RECTF{g.sel.l, g.sel.t, g.sel.r, g.sel.b});
+        if (g.sel.objects.size() > 1)
         {
-          float phh = PageH(i);
-          int ax = x + (int)std::lround(slx * s);
-          int ay = y + (int)std::lround((phh - stx) * s);
-          int aw = (int)std::lround((srx - slx) * s);
-          int ah = (int)std::lround((stx - sbx) * s);
+          const std::vector<PageObject> objs = ListPageObjects(i);
+          for (int idx : g.sel.objects)
+          {
+            if (idx == g.sel.index) continue;
+            for (const PageObject& po : objs)
+              if (po.index == idx)
+              {
+                boxes.push_back(FS_RECTF{po.l, po.t, po.r, po.b});
+                break;
+              }
+          }
+        }
+        if (!boxes.empty())
+        {
           HPEN pen = CreatePen(PS_SOLID, 2, th.accent);
           HPEN old = (HPEN)SelectObject(dc, pen);
           HBRUSH oldb = (HBRUSH)SelectObject(dc, GetStockObject(NULL_BRUSH));
-          Rectangle(dc, ax, ay, ax + aw, ay + ah);
+          for (const FS_RECTF& q : boxes)
+          {
+            int ax = x + (int)std::lround(q.left * s);
+            int ay = y + (int)std::lround((phh - q.top) * s);
+            int aw = (int)std::lround((q.right - q.left) * s);
+            int ah = (int)std::lround((q.top - q.bottom) * s);
+            if (aw < 1 || ah < 1) continue;
+            Rectangle(dc, ax, ay, ax + aw, ay + ah);
+          }
           SelectObject(dc, oldb);
           SelectObject(dc, old);
           DeleteObject(pen);
+        }
+        if (havePrimary)
+        {
+          int ax = x + (int)std::lround(g.sel.l * s);
+          int ay = y + (int)std::lround((phh - g.sel.t) * s);
+          int aw = (int)std::lround((g.sel.r - g.sel.l) * s);
+          int ah = (int)std::lround((g.sel.t - g.sel.b) * s);
           HBRUSH wh = CreateSolidBrush(th.canvasBg);
           HBRUSH acc = CreateSolidBrush(th.accent);
           for (int hx = 0; hx < 2; ++hx)
@@ -8107,30 +8518,63 @@ static LRESULT CALLBACK CanvasProc(HWND hw, UINT msg, WPARAM wp, LPARAM lp)
           double px = (pt.x - hi.x) / s;
           double py = ph - (pt.y - hi.y) / s;
           PageObject best;
+          const bool ctrl = (GetKeyState(VK_CONTROL) & 0x8000) != 0;
           if (HitTestObject(hi.page, px, py, best))
           {
-            g.sel.active = true;
-            g.sel.page = hi.page;
-            g.sel.index = best.index;
-            g.sel.type = best.type;
-            g.sel.l = best.l; g.sel.b = best.b; g.sel.r = best.r; g.sel.t = best.t;
-            g.editPage = FPDF_LoadPage(g.doc, g.sel.page);
-            g.editObj = g.editPage ? FPDFPage_GetObject(g.editPage, g.sel.index) : nullptr;
-            if (g.editObj)
+            const bool samePage = (g.sel.page == hi.page);
+            if (ctrl)
             {
-              g.selDrag = true;
-              g.selDragMoved = false;
-              g.dragLastX = px;
-              g.dragLastY = py;
-              // The object is transformed live during the drag, so the undo
-              // snapshot has to be taken before the first WM_MOUSEMOVE.
-              BeginEdit();
-              SetCapture(hw);
+              // Ctrl+click toggles membership; no drag, so a set can be built up.
+              if (!samePage) { g.sel.objects.clear(); }
+              g.sel.page = hi.page;
+              if (IsObjSelected(best.index))
+              {
+                g.sel.objects.erase(
+                    std::remove(g.sel.objects.begin(), g.sel.objects.end(), best.index),
+                    g.sel.objects.end());
+                if (!g.sel.objects.empty()) g.sel.index = g.sel.objects.back();
+                g.sel.active = !g.sel.objects.empty();
+              }
+              else
+              {
+                g.sel.objects.push_back(best.index);
+                g.sel.index = best.index;
+                g.sel.active = true;
+              }
+              if (g.sel.active) RefreshSelBounds();
+              g.selDrag = false;
+              if (g.editPage) { FPDF_ClosePage(g.editPage); g.editPage = nullptr; }
+              g.editObj = nullptr;
+            }
+            else
+            {
+              // Plain click: keep the whole set when pressing an already-selected
+              // member (so it can be dragged together), otherwise start fresh.
+              if (!samePage || !IsObjSelected(best.index))
+                g.sel.objects.assign(1, best.index);
+              g.sel.active = true;
+              g.sel.page = hi.page;
+              g.sel.index = best.index;
+              g.sel.type = best.type;
+              g.sel.l = best.l; g.sel.b = best.b; g.sel.r = best.r; g.sel.t = best.t;
+              g.editPage = FPDF_LoadPage(g.doc, g.sel.page);
+              g.editObj = g.editPage ? FPDFPage_GetObject(g.editPage, g.sel.index) : nullptr;
+              if (g.editObj)
+              {
+                g.selDrag = true;
+                g.selDragMoved = false;
+                g.dragLastX = px;
+                g.dragLastY = py;
+                // The objects are transformed live during the drag, so the undo
+                // snapshot has to be taken before the first WM_MOUSEMOVE.
+                BeginEdit();
+                SetCapture(hw);
+              }
             }
           }
           else
           {
-            g.sel.active = false;
+            if (!ctrl) ClearObjSel();
             g.selDrag = false;
           }
           g.selected = hi.page;
@@ -8183,6 +8627,7 @@ static LRESULT CALLBACK CanvasProc(HWND hw, UINT msg, WPARAM wp, LPARAM lp)
         g.sel.active = true;
         g.sel.page = hi.page;
         g.sel.index = best.index;
+        g.sel.objects.assign(1, best.index);
         g.sel.type = best.type;
         g.sel.l = best.l; g.sel.b = best.b; g.sel.r = best.r; g.sel.t = best.t;
         g.selected = hi.page;
@@ -8239,7 +8684,12 @@ static LRESULT CALLBACK CanvasProc(HWND hw, UINT msg, WPARAM wp, LPARAM lp)
       {
         if (g.editPage && g.editObj)
         {
-          FPDFPageObj_Transform(g.editObj, 1, 0, 0, 1, (float)dx, (float)dy);
+          // Move every object in the selection by the same delta.
+          for (int i : g.sel.objects)
+          {
+            FPDF_PAGEOBJECT o = FPDFPage_GetObject(g.editPage, i);
+            if (o) FPDFPageObj_Transform(o, 1, 0, 0, 1, (float)dx, (float)dy);
+          }
           g.selDragMoved = true;
           g.sel.l += (float)dx; g.sel.r += (float)dx;
           g.sel.b += (float)dy; g.sel.t += (float)dy;
@@ -8755,6 +9205,8 @@ static void BuildToolbar(HWND)
      L"Save to a new file name (Ctrl+Shift+S)"},
     {ID_META,         L"Properties", 82, 0, 0xE946, false,
      L"Edit the document metadata (title, author, subject, keywords)"},
+    {ID_ATTACHMENTS,  L"Attachments", 92, 0, 0xE723, false,
+     L"View the files embedded in this document"},
     {ID_IMPORT,       L"Import",     68, 0, 0xE8B5, false,
      L"Insert pages from another PDF into this one"},
     {ID_EXPORT_TEXT,  L"Export Text",80, 0, 0xE8C3, false,
@@ -10083,7 +10535,7 @@ static bool IsHandledCommand(int id)
   switch (id)
   {
     case ID_NEW: case ID_OPEN: case ID_SAVE: case ID_SAVEAS: case ID_SAVEENC:
-    case ID_IMPORT: case ID_MERGE_APPEND: case ID_COMBINE_NEW: case ID_COMPRESS_PDF: case ID_EDIT_TEXT: case ID_EXPORT_TEXT: case ID_EXPORT_CSV: case ID_WATERMARK: case ID_SIGN: case ID_META:
+    case ID_IMPORT: case ID_MERGE_APPEND: case ID_COMBINE_NEW: case ID_COMPRESS_PDF: case ID_EDIT_TEXT: case ID_EXPORT_TEXT: case ID_EXPORT_CSV: case ID_WATERMARK: case ID_SIGN: case ID_META: case ID_ATTACHMENTS:
     case ID_EXIT: case ID_ROTR: case ID_ROTL: case ID_DELETE: case ID_ADD:
     case ID_TOOL_SELECT: case ID_OBJ_EDIT: case ID_OBJ_DELETE:
     case ID_OBJ_RECOLOR: case ID_OBJ_FONT: case ID_ZOOM_IN: case ID_ZOOM_OUT: case ID_ZOOM100:
@@ -10141,7 +10593,9 @@ static void DoCommand(int id)
     case ID_ADD:    AddPage(); break;
     case ID_ROTL:   RotateSelectedPages(3); break;
     case ID_ROTR:   RotateSelectedPages(1); break;
-    case ID_SEL_ALL: SelectAllPages();
+    case ID_SEL_ALL:
+      if (g.toolSelect) { SelectAllObjects(); break; }
+      SelectAllPages();
       if (g.thumbs) InvalidateRect(g.thumbs, nullptr, TRUE);
       if (g.status) InvalidateRect(g.status, nullptr, TRUE);
       break;
@@ -10228,8 +10682,9 @@ static void DoCommand(int id)
     case ID_EXPORT_TEXT:  ExportTextAll(); break;
     case ID_EXPORT_CSV:   ExportCsvAll(); break;
     case ID_WATERMARK:    WatermarkCurrentDoc(); break;
-    case ID_SIGN:         SignDocument(); break;
-    case ID_META:         EditMetadata(); break;
+      case ID_SIGN:         SignDocument(); break;
+      case ID_META:         EditMetadata(); break;
+      case ID_ATTACHMENTS:  ShowAttachments(); break;
     case ID_PRINT:        PrintDoc(); break;
     case ID_PRINT_PREVIEW: PrintPreviewDialog(); break;
     case ID_PRINT_PDF:    PrintToPdf(); break;
@@ -10283,6 +10738,7 @@ static HMENU BuildMenu()
   addItem(file, ID_WATERMARK, L"Watermark...");
   addItem(file, ID_SIGN, L"Sign Document...");
   addItem(file, ID_META, L"Document Properties...");
+  addItem(file, ID_ATTACHMENTS, L"Attachments...");
   AppendMenuW(file, MF_SEPARATOR, 0, nullptr);
   addItem(file, ID_PRINT, L"Print...\tCtrl+P");
   addItem(file, ID_PRINT_PREVIEW, L"Print Preview\tCtrl+Shift+P");
@@ -15427,8 +15883,8 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int)
   SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
   PickCapPhrase();
   INITCOMMONCONTROLSEX iccex{sizeof(iccex),
-                             ICC_TREEVIEW_CLASSES | ICC_TAB_CLASSES |
-                             ICC_BAR_CLASSES | ICC_STANDARD_CLASSES};
+    ICC_TREEVIEW_CLASSES | ICC_TAB_CLASSES |
+    ICC_LISTVIEW_CLASSES | ICC_BAR_CLASSES | ICC_STANDARD_CLASSES};
   InitCommonControlsEx(&iccex);
 
   ApplyInitialThemePref();

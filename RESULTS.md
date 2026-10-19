@@ -1002,3 +1002,28 @@ Self-test: 465 passed, 0 failed.
 
 Self-test: 465 passed, 0 failed.
 
+## v0.12.19 - embedded attachments viewer + multi-select content objects (2026-10-19)
+- **Attachments...** (File menu and Document ribbon tab) lists the files embedded
+  in the document (the `/EmbeddedFiles` name tree) in a report-style list with
+  name, size, MIME type and description, via `FPDFDoc_GetAttachmentCount`,
+  `FPDFDoc_GetAttachment`, `FPDFAttachment_GetName`/`GetSubtype`/`GetDescription`
+  and `FPDFAttachment_GetFile`. **Save As...** writes the selected attachment to a
+  chosen path; **Open** (or a double-click) extracts it to the temp directory and
+  hands it to the shell. Documents with no attachments say so instead of opening
+  an empty list.
+- **Multi-select for content objects** (Select tool): Ctrl+click adds or removes
+  objects from the selection; the selection is kept as a set (`g.sel.objects`)
+  with a primary member that still drives the font controls and in-place text
+  editing. **Delete**, **Recolor** and the font family/size controls now apply to
+  the whole selection (recolor repaints every text/vector member in one edit;
+  the font controls restyle every text run). Dragging any selected member moves
+  the whole set. Every selected object gets its outline; only the primary shows
+  the corner handles. **Ctrl+A** with the Select tool armed selects every content
+  object on the current page (without the tool it still selects all pages).
+- Verified with PDFium: attachments survive a round-trip (add + `SetFile` + save,
+  reopen -> count 1, name `hello.txt`, 18-byte payload read back exactly). The
+  multi-select code follows the existing single-object edit/reload path and leaves
+  the 465-check self-test green.
+
+Self-test: 465 passed, 0 failed.
+
