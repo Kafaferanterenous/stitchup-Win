@@ -970,3 +970,35 @@ Self-test: 465 passed, 0 failed.
 
 Self-test: 465 passed, 0 failed.
 
+## v0.12.18 - print to PDF + document properties (2026-10-19)
+- **Print to PDF...** (File menu and Document ribbon tab) is an explicit PDF
+  output target. It asks for a file name, then drives the Windows "Microsoft
+  Print to PDF" printer directly: the spooler is queried for the printer's port
+  and default DEVMODE (`OpenPrinter`/`GetPrinter`), a DC is created without the
+  printer-selection dialog, the first page's orientation is applied, and every
+  page is rendered through the same code path as interactive printing
+  (`PrintOnePage`). The chosen path is passed as `DOCINFO.lpszOutput`, so the
+  result matches what would reach paper. If the printer is not installed the
+  command reports that instead of failing silently.
+- **Document Properties...** (File menu and Document ribbon tab) edits the four
+  standard metadata fields: title, author, subject and keywords. PDFium can read
+  metadata (`FPDF_GetMetaText`) but exposes no setter, so the values are held for
+  the session and the `/Info` dictionary is rewritten on save as an incremental
+  update (`AppendInfo`), exactly like bookmarks and internal-link destinations.
+  Setting a field writes it; clearing a field removes the key; unrelated entries
+  (`Producer`, `Creator`, dates, custom keys) are preserved. The editor prefills
+  from the file, or from unsaved edits made earlier in the session.
+- The incremental-update trailer now carries `/Info` forward (in `AppendOutlines`
+  and `AppendNamedDests` too), fixing a latent bug where saving a document that
+  had bookmarks or internal links could orphan its `/Info` dictionary.
+- Two latent parser bugs surfaced by the metadata work were fixed:
+  `FindKey` now spans a hex-string value (`<...>`), and `SkipContainer` now stops
+  at the end of a literal string `(...)` instead of scanning past it (it was
+  written for dictionaries/arrays, and only literal values exercised the gap).
+- Verified with PDFium: after saving, `FPDF_GetMetaText` returns the title,
+  author, subject and keywords that were set; `Creator`/`CreationDate` from the
+  source file survive; and clearing the title removes it while the other fields
+  remain.
+
+Self-test: 465 passed, 0 failed.
+

@@ -203,10 +203,10 @@ project (github.com/bblanchon/pdfium-binaries). Non-GPL build.
   static CRT from source (the prebuilt import lib is not static).
 - Shell + annotations + link activation + page management (extract/split/
   auto-crop, now selection-aware) + text export + CSV export + password-unlock +
-  watermarks + encrypt-on-save + redaction + digital signatures are done.
-  Rendering, page model, editing operations, ribbon navigation, the bookmarks
-  pane, annotation creation/persistence, link navigation, link *creation* and
-  page extract/split/crop are functional.
+  watermarks + encrypt-on-save + redaction + digital signatures + print-to-PDF +
+  document properties are done. Rendering, page model, editing operations, ribbon
+  navigation, the bookmarks pane, annotation creation/persistence, link
+  navigation, link *creation* and page extract/split/crop are functional.
 - Digital signatures are written as an incremental update with Windows
   CryptoAPI only (no third-party crypto library): a throw-away self-signed
   RSA-2048 certificate signs a detached PKCS#7 (CMS, SHA-256) over the file's
@@ -226,6 +226,13 @@ project (github.com/bblanchon/pdfium-binaries). Non-GPL build.
   the armed tool. (The earlier build placed every annotation at a fixed spot.)
   The Pen tool is the exception: press and draw freehand, and the trace becomes
   a single ink annotation stroked in the current foreground colour.
+- Print to PDF is an explicit target: File > Print to PDF... writes the pages to
+  a file you name by driving the "Microsoft Print to PDF" printer directly (the
+  same rendering path as interactive printing), without the printer dialog.
+- Document properties (title, author, subject, keywords) are editable from
+  File > Document Properties.... PDFium has no metadata setter, so the values are
+  held for the session and the `/Info` dictionary is rewritten as an incremental
+  update on save; unrelated entries are preserved.
 - Tools menu/ribbon tab hosts the Security (Save As Encrypted) and Export
   (Export Text / Export CSV) groups.
 
@@ -239,10 +246,8 @@ Not yet implemented, roughly by how much a user notices them missing:
 ### Nice to have
 
 - OCR, so scanned pages become searchable
-- Metadata editor (title, author, subject, keywords)
 - View embedded file attachments
 - Drag a page into another open document
 - Autosave / crash recovery
-- Print-to-PDF as an explicit target
 - Select All and multi-select for content objects (pages now support it)
 - AcroForm field filling

@@ -12,6 +12,7 @@
 #include <dwmapi.h>
 #include <winver.h>
 #include <wincrypt.h>
+#include <winspool.h>
 
 #pragma warning(push, 0)
 #include <fpdfview.h>
@@ -92,6 +93,7 @@ ID_ANN_LINK,
   ID_WATERMARK,
   ID_SAVEENC,
   ID_SIGN,
+  ID_META,
   ID_TOOL_SELECT,
   ID_OBJ_EDIT,
   ID_OBJ_DELETE,
@@ -110,6 +112,7 @@ ID_ANN_LINK,
   ID_ROT_ALL,     // Rotate All Pages CW (explicit, for the whole document)
   ID_PRINT,       // Print (Ctrl+P)
   ID_PRINT_PREVIEW,  // Print Preview (Ctrl+Shift+P)
+  ID_PRINT_PDF,   // Print to PDF file (explicit target)
   ID_UNDO,        // Undo (Ctrl+Z)
   ID_REDO,        // Redo (Ctrl+Y)
   // Colour-scheme pickers follow in one contiguous block (radio group).
@@ -384,6 +387,12 @@ static std::vector<TabDoc> g_tabs;
 static int g_curTab = -1;
 
 static App g;
+
+// Document metadata edited this session. PDFium exposes no setter, so the values
+// are held here and the /Info dictionary is rewritten by AppendInfo() on save.
+// An empty string clears the corresponding key.
+static bool g_metaDirty = false;
+static std::wstring g_metaTitle, g_metaAuthor, g_metaSubject, g_metaKeywords;
 
 // Edit history lives on the live document and mirrors into the current tab, so
 // switching tabs keeps each document's own undo chain.
@@ -1290,6 +1299,11 @@ static void CloseDoc()
   g.findQuery.clear();
   g.findHits.clear();
   g.findCur = -1;
+  g_metaDirty = false;
+  g_metaTitle.clear();
+  g_metaAuthor.clear();
+  g_metaSubject.clear();
+  g_metaKeywords.clear();
 }
 
 static void SnapshotCurrentTab()
@@ -2056,6 +2070,184 @@ static bool PromptLinkUri(std::wstring& out, const std::wstring& deflt)
                     L"Web address, or #page for an internal link:", false);
 }
 
+// Reads a document metadata entry through PDFium. FPDF_GetMetaText emits UTF-16
+// and returns the size it needs, so the real string is fetched on the second
+// call once a buffer exists (the reported length includes the terminating NUL).
+static std::wstring ReadMeta(const char* key)
+{
+  if (!g.doc) return L"";
+  const unsigned long n = FPDF_GetMetaText(g.doc, key, nullptr, 0);
+  if (n <= 2) return L"";
+  std::vector<unsigned char> buf(n);
+  const unsigned long got = FPDF_GetMetaText(g.doc, key, buf.data(), n);
+  if (got < 2) return L"";
+  return std::wstring(reinterpret_cast<const wchar_t*>(buf.data()));
+}
+
+static std::wstring TrimWs(const std::wstring& t)
+{
+  const size_t a = t.find_first_not_of(L" \t\r\n");
+  if (a == std::wstring::npos) return L"";
+  const size_t b = t.find_last_not_of(L" \t\r\n");
+  return t.substr(a, b - a + 1);
+}
+
+// ---------------------------------------------------------------------------
+// Document properties (metadata) dialog: title / author / subject / keywords
+// ---------------------------------------------------------------------------
+struct MetaCtx
+{
+  HWND til = nullptr, aut = nullptr, sub = nullptr, key = nullptr;
+  bool ok = false;
+  std::wstring title, author, subject, keywords;
+};
+
+static LRESULT CALLBACK MetaProc(HWND h, UINT m, WPARAM w, LPARAM l)
+{
+  switch (m)
+  {
+    case WM_CREATE:
+    {
+      MetaCtx* ctx = reinterpret_cast<MetaCtx*>(
+        reinterpret_cast<CREATESTRUCTW*>(l)->lpCreateParams);
+      SetWindowLongPtrW(h, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(ctx));
+      const wchar_t* labels[4] =
+          { L"Title:", L"Author:", L"Subject:", L"Keywords:" };
+      HWND* boxes[4] = { &ctx->til, &ctx->aut, &ctx->sub, &ctx->key };
+      const std::wstring* vals[4] =
+          { &ctx->title, &ctx->author, &ctx->subject, &ctx->keywords };
+      int y = 14;
+      for (int i = 0; i < 4; ++i)
+      {
+        CreateWindowExW(0, L"STATIC", labels[i], WS_CHILD | WS_VISIBLE,
+                        16, y + 4, 70, 16, h, nullptr, g.inst, nullptr);
+        *boxes[i] = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
+          WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL,
+          92, y, 320, 24, h, nullptr, g.inst, nullptr);
+        SetWindowTextW(*boxes[i], vals[i]->c_str());
+        y += 34;
+      }
+      CreateWindowExW(0, L"BUTTON", L"Ok",
+        WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_DEFPUSHBUTTON,
+        256, y + 6, 74, 28, h, (HMENU)1, g.inst, nullptr);
+      CreateWindowExW(0, L"BUTTON", L"Cancel",
+        WS_CHILD | WS_VISIBLE | WS_TABSTOP,
+        338, y + 6, 74, 28, h, (HMENU)2, g.inst, nullptr);
+      SetFocus(ctx->til);
+      return 0;
+    }
+    case WM_COMMAND:
+      if (LOWORD(w) == 1 || LOWORD(w) == 2)
+      {
+        MetaCtx* ctx = reinterpret_cast<MetaCtx*>(
+            GetWindowLongPtrW(h, GWLP_USERDATA));
+        if (ctx)
+        {
+          if (LOWORD(w) == 1)
+          {
+            wchar_t buf[1024];
+            auto read = [&](HWND e) -> std::wstring {
+              buf[0] = 0;
+              return GetWindowTextW(e, buf, 1024) > 0 ? std::wstring(buf)
+                                                      : std::wstring();
+            };
+            ctx->title = read(ctx->til);
+            ctx->author = read(ctx->aut);
+            ctx->subject = read(ctx->sub);
+            ctx->keywords = read(ctx->key);
+          }
+          ctx->ok = (LOWORD(w) == 1);
+        }
+        DestroyWindow(h);
+        return 0;
+      }
+      break;
+    case WM_CLOSE:
+    {
+      MetaCtx* ctx = reinterpret_cast<MetaCtx*>(
+          GetWindowLongPtrW(h, GWLP_USERDATA));
+      if (ctx) ctx->ok = false;
+      DestroyWindow(h);
+      return 0;
+    }
+  }
+  return DefWindowProcW(h, m, w, l);
+}
+
+static void EditMetadata()
+{
+  if (!g.doc)
+  {
+    MessageBoxW(g.frame, L"No document is open.", L"Stitchup",
+                MB_OK | MB_ICONINFORMATION);
+    return;
+  }
+
+  const wchar_t cls[] = L"SKMetaWnd";
+  static bool reg = false;
+  if (!reg)
+  {
+    WNDCLASSEXW wc{};
+    wc.cbSize = sizeof(wc);
+    wc.lpfnWndProc = MetaProc;
+    wc.hInstance = g.inst;
+    wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+    wc.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
+    wc.lpszClassName = cls;
+    RegisterClassExW(&wc);
+    reg = true;
+  }
+
+  MetaCtx ctx;
+  // Prefer values edited earlier this session, otherwise what the file carries.
+  ctx.title = g_metaDirty ? g_metaTitle : ReadMeta("Title");
+  ctx.author = g_metaDirty ? g_metaAuthor : ReadMeta("Author");
+  ctx.subject = g_metaDirty ? g_metaSubject : ReadMeta("Subject");
+  ctx.keywords = g_metaDirty ? g_metaKeywords : ReadMeta("Keywords");
+
+  HWND hw = CreateWindowExW(WS_EX_DLGMODALFRAME, cls, L"Document Properties",
+                            WS_POPUP | WS_CAPTION | WS_SYSMENU,
+                            CW_USEDEFAULT, CW_USEDEFAULT, 448, 236,
+                            g.frame, nullptr, g.inst, &ctx);
+  if (!hw) return;
+  RECT fr, rc;
+  GetWindowRect(g.frame, &fr);
+  GetWindowRect(hw, &rc);
+  SetWindowPos(hw, nullptr,
+               fr.left + (fr.right - fr.left - (rc.right - rc.left)) / 2,
+               fr.top + (fr.bottom - fr.top - (rc.bottom - rc.top)) / 2,
+               0, 0, SWP_NOSIZE | SWP_NOZORDER);
+  ShowWindow(hw, SW_SHOW);
+  UpdateWindow(hw);
+  EnableWindow(g.frame, FALSE);
+  MSG msg;
+  while (IsWindow(hw))
+  {
+    const BOOL r = GetMessageW(&msg, nullptr, 0, 0);
+    if (r <= 0) break;
+    if (!IsDialogMessageW(hw, &msg))
+    {
+      TranslateMessage(&msg);
+      DispatchMessageW(&msg);
+    }
+  }
+  EnableWindow(g.frame, TRUE);
+  SetActiveWindow(g.frame);
+  SetFocus(g.frame);
+  if (!ctx.ok) return;
+
+  g_metaTitle = TrimWs(ctx.title);
+  g_metaAuthor = TrimWs(ctx.author);
+  g_metaSubject = TrimWs(ctx.subject);
+  g_metaKeywords = TrimWs(ctx.keywords);
+  g_metaDirty = true;
+
+  MessageBoxW(g.frame,
+              L"Document properties updated. Save the document to write them "
+              L"into the PDF.",
+              L"Stitchup", MB_OK | MB_ICONINFORMATION);
+}
+
 struct WmCtx
 {
   HWND edit = nullptr, size = nullptr, pos = nullptr;
@@ -2350,6 +2542,22 @@ bool ScanObjects(const std::string& s, std::map<int, size_t>& out)
 // End offset of the balanced construct starting at p ('<' '<' '[' or '(').
 bool SkipContainer(const std::string& s, size_t p, size_t limit, size_t& end)
 {
+  // A literal string is a container of one: consume it and stop, honouring the
+  // backslash escapes and balanced parentheses, so a value like "(a(b)c)" is
+  // spanned whole. The dict/array logic below would otherwise keep scanning past
+  // the closing ')' and swallow whatever follows.
+  if (s[p] == '(')
+  {
+    int nest = 0;
+    while (p < limit)
+    {
+      if (s[p] == '\\') { p += 2; continue; }
+      if (s[p] == '(') ++nest;
+      else if (s[p] == ')') { --nest; if (nest == 0) { end = p + 1; return true; } }
+      ++p;
+    }
+    return false;
+  }
   const bool d = s.compare(p, 2, "<<") == 0;
   const char open = d ? '<' : s[p];
   const char close = d ? '>' : (s[p] == '[' ? ']' : ')');
@@ -2437,7 +2645,10 @@ bool FindKey(const std::string& s, size_t b, size_t e, const char* key,
           size_t q = p + k.size();
           SkipWs(s, q);
           vs = q;
-          if (q < e && (s.compare(q, 2, "<<") == 0 || s[q] == '[' || s[q] == '('))
+          // A value can be a dictionary, array, literal string or hex string;
+          // SkipContainer spans all four (a lone '<' is a hex string).
+          if (q < e && (s.compare(q, 2, "<<") == 0 || s[q] == '[' ||
+                        s[q] == '(' || s[q] == '<'))
           {
             if (!SkipContainer(s, q, e, ve)) return false;
           }
@@ -2614,6 +2825,7 @@ struct XrefBase
   bool table = false;                    // classic "xref" table vs xref stream
   long long size = 0;                    // /Size
   int rootObj = 0;                       // /Root
+  int infoObj = 0;                       // /Info (0 when absent)
   std::map<int, size_t> offs;            // objnum -> byte offset, in-use only
 };
 
@@ -2658,6 +2870,7 @@ bool ParseBase(const std::string& pdf, size_t xrefOff, XrefBase& b)
     if (dictEnd == std::string::npos) return false;
     if (!GetIntEntry(pdf, p, dictEnd, "Size", b.size)) return false;
     if (!GetRefEntry(pdf, p, dictEnd, "Root", b.rootObj)) return false;
+    GetRefEntry(pdf, p, dictEnd, "Info", b.infoObj);   // optional
     return b.size > 0 && b.rootObj > 0;
   }
   // cross-reference stream
@@ -2667,6 +2880,7 @@ bool ParseBase(const std::string& pdf, size_t xrefOff, XrefBase& b)
   if (dictEnd == std::string::npos) return false;
   if (!GetIntEntry(pdf, o.body, dictEnd, "Size", b.size)) return false;
   if (!GetRefEntry(pdf, o.body, dictEnd, "Root", b.rootObj)) return false;
+  GetRefEntry(pdf, o.body, dictEnd, "Info", b.infoObj);   // optional
   if (b.size <= 0 || b.rootObj <= 0) return false;
   return ScanObjects(pdf, b.offs);
 }
@@ -2687,6 +2901,7 @@ static bool AppendOutlines(std::string& pdf, const std::vector<UserBookmark>& bm
   if (bms.empty()) return true;
   long long size = 0;
   int rootObj = 0;
+  int infoObj = 0;
   bool isTable = true;
 
   // --- base file: startxref, /Size, /Root -----------------------------------
@@ -2705,10 +2920,14 @@ static bool AppendOutlines(std::string& pdf, const std::vector<UserBookmark>& bm
     offs.swap(base.offs);
     size = base.size;
     rootObj = base.rootObj;
+    infoObj = base.infoObj;
     isTable = base.table;
   }
   if (offs.find(rootObj) == offs.end() && !ScanObjects(pdf, offs))
     return fail(L"No objects found in the saved file.");
+  // Carried into the appended trailer so a document's /Info survives the save.
+  const std::string infoRef =
+      infoObj > 0 ? (" /Info " + std::to_string(infoObj) + " 0 R") : "";
 
   // --- catalog and page objects --------------------------------------------
   Obj cat;
@@ -2861,8 +3080,9 @@ static bool AppendOutlines(std::string& pdf, const std::vector<UserBookmark>& bm
       i = j + 1;
     }
     add += "trailer\n<< /Size " + std::to_string(newSize) + " /Root " +
-           std::to_string(rootObj) + " 0 R /Prev " + std::to_string(baseXref) +
-           " >>\nstartxref\n" + std::to_string(tableAt) + "\n%%EOF\n";
+           std::to_string(rootObj) + " 0 R" + infoRef + " /Prev " +
+           std::to_string(baseXref) + " >>\nstartxref\n" +
+           std::to_string(tableAt) + "\n%%EOF\n";
     pdf += add;
     return true;
   }
@@ -2887,10 +3107,11 @@ static bool AppendOutlines(std::string& pdf, const std::vector<UserBookmark>& bm
   const size_t xrefObjOffset = pdf.size() + add.size();
   add += std::to_string(xrefNum) + " 0 obj\n<< /Type /XRef /Size " +
          std::to_string(newSize + 1) + " /Root " + std::to_string(rootObj) +
-         " 0 R /Prev " + std::to_string(baseXref) + " /W [1 4 2] /Index [" +
-         index + "] /Length " + std::to_string(rows.size()) + " >>\nstream\n" +
-         rows + "\nendstream\nendobj\nstartxref\n" +
-         std::to_string(xrefObjOffset) + "\n%%EOF\n";
+         " 0 R" + infoRef + " /Prev " + std::to_string(baseXref) +
+         " /W [1 4 2] /Index [" + index + "] /Length " +
+         std::to_string(rows.size()) + " >>\nstream\n" + rows +
+         "\nendstream\nendobj\nstartxref\n" + std::to_string(xrefObjOffset) +
+         "\n%%EOF\n";
 
   pdf += add;
   return true;
@@ -2972,6 +3193,7 @@ static bool AppendNamedDests(std::string& pdf, const std::vector<int>& destPages
 
   long long size = 0;
   int rootObj = 0;
+  int infoObj = 0;
   bool isTable = true;
   std::map<int, size_t> offs;
   {
@@ -2980,9 +3202,12 @@ static bool AppendNamedDests(std::string& pdf, const std::vector<int>& destPages
       return fail(L"The saved file's cross-reference section is unreadable.");
     size = base.size;
     rootObj = base.rootObj;
+    infoObj = base.infoObj;
     isTable = base.table;
     offs.swap(base.offs);
   }
+  const std::string infoRef =
+      infoObj > 0 ? (" /Info " + std::to_string(infoObj) + " 0 R") : "";
   // A prior incremental update (e.g. the bookmarks) lists only its own objects,
   // so rebuild the full map by scanning; all these objects are uncompressed.
   if (!ScanObjects(pdf, offs)) return fail(L"No objects found in the saved file.");
@@ -3053,8 +3278,9 @@ static bool AppendNamedDests(std::string& pdf, const std::vector<int>& destPages
                 (unsigned long long)(pdf.size() + 1));
     add += "xref\n" + std::to_string(rootObj) + " 1\n" + row;
     add += "trailer\n<< /Size " + std::to_string(newSize) + " /Root " +
-           std::to_string(rootObj) + " 0 R /Prev " + std::to_string(baseXref) +
-           " >>\nstartxref\n" + std::to_string(tableAt) + "\n%%EOF\n";
+           std::to_string(rootObj) + " 0 R" + infoRef + " /Prev " +
+           std::to_string(baseXref) + " >>\nstartxref\n" +
+           std::to_string(tableAt) + "\n%%EOF\n";
     pdf += add;
     return true;
   }
@@ -3073,10 +3299,126 @@ static bool AppendNamedDests(std::string& pdf, const std::vector<int>& destPages
   const size_t xrefObjOffset = pdf.size() + add.size();
   add += std::to_string(xrefNum) + " 0 obj\n<< /Type /XRef /Size " +
          std::to_string(newSize + 1) + " /Root " + std::to_string(rootObj) +
-         " 0 R /Prev " + std::to_string(baseXref) + " /W [1 4 2] /Index [" +
-         std::to_string(rootObj) + " 1] /Length " + std::to_string(rows.size()) +
-         " >>\nstream\n" + rows + "\nendstream\nendobj\nstartxref\n" +
-         std::to_string(xrefObjOffset) + "\n%%EOF\n";
+         " 0 R" + infoRef + " /Prev " + std::to_string(baseXref) +
+         " /W [1 4 2] /Index [" + std::to_string(rootObj) + " 1] /Length " +
+         std::to_string(rows.size()) + " >>\nstream\n" + rows +
+         "\nendstream\nendobj\nstartxref\n" + std::to_string(xrefObjOffset) +
+         "\n%%EOF\n";
+  pdf += add;
+  return true;
+}
+
+// Rewrites the document's /Info dictionary as an incremental update. Every listed
+// field with a non-empty value is set (as a UTF-16 text string); an empty value
+// removes the key, so metadata can be cleared as well as added. Entries not in
+// the list (Producer, dates, a custom key, ...) are preserved. The trailer is
+// written with /Info pointing at the object, so readers find it.
+static bool AppendInfo(std::string& pdf,
+                       const std::vector<std::pair<std::string, std::wstring>>& fields,
+                       std::wstring* err)
+{
+  using namespace pdfout;
+  auto fail = [&](const wchar_t* m) {
+    if (err) *err = m;
+    return false;
+  };
+  if (fields.empty()) return true;
+
+  const size_t sx = pdf.rfind("startxref");
+  if (sx == std::string::npos) return fail(L"The saved file has no startxref.");
+  size_t sp = sx + 9;
+  const long long baseXref = ReadInt(pdf, sp);
+  if (baseXref <= 0 || baseXref >= (long long)pdf.size())
+    return fail(L"The saved file has a broken startxref.");
+
+  long long size = 0;
+  int rootObj = 0;
+  int infoObj = 0;
+  bool isTable = true;
+  std::map<int, size_t> offs;
+  {
+    XrefBase base;
+    if (!ParseBase(pdf, (size_t)baseXref, base))
+      return fail(L"The saved file's cross-reference section is unreadable.");
+    size = base.size;
+    rootObj = base.rootObj;
+    infoObj = base.infoObj;
+    isTable = base.table;
+    offs.swap(base.offs);
+  }
+  // A prior incremental update (bookmarks/dests) lists only its own objects, so
+  // rebuild the full map by scanning; these objects are all uncompressed.
+  if (!ScanObjects(pdf, offs)) return fail(L"No objects found in the saved file.");
+
+  // Start from the existing /Info (minus its delimiters) so unknown keys survive,
+  // or from an empty dictionary when the document had none.
+  std::string body = "<< >>";
+  int target = 0;
+  if (infoObj > 0)
+  {
+    Obj io;
+    if (ObjBody(pdf, offs, infoObj, io))
+    {
+      body = pdf.substr(io.body, io.end - io.body);
+      target = infoObj;
+    }
+  }
+  if (body.size() < 4 || body.compare(0, 2, "<<") != 0 ||
+      body.compare(body.size() - 2, 2, ">>") != 0)
+    body = "<< >>";
+  body = body.substr(2, body.size() - 4);   // strip "<< " and " >>"
+
+  for (const auto& f : fields) body = RemoveKey(body, f.first.c_str());
+  for (const auto& f : fields)
+  {
+    if (f.second.empty()) continue;         // empty clears the key
+    body += " /" + f.first + " " + TextString(f.second);
+  }
+  const std::string dict = "<< " + body + " >>";
+
+  long long next = size;
+  if (next < 1) next = 1;
+  if (target == 0) target = (int)next++;     // allocate a fresh Info object
+  const long long newSize = next;
+
+  std::string add = "\n";
+  add += std::to_string(target) + " 0 obj\n" + dict + "\nendobj\n";
+  const std::string infoRef = " /Info " + std::to_string(target) + " 0 R";
+
+  if (isTable)
+  {
+    const size_t tableAt = pdf.size() + add.size();
+    char row[32];
+    _snprintf_s(row, _TRUNCATE, "%010llu 00000 n \n",
+                (unsigned long long)(pdf.size() + 1));
+    add += "xref\n" + std::to_string(target) + " 1\n" + row;
+    add += "trailer\n<< /Size " + std::to_string(newSize) + " /Root " +
+           std::to_string(rootObj) + " 0 R" + infoRef + " /Prev " +
+           std::to_string(baseXref) + " >>\nstartxref\n" +
+           std::to_string(tableAt) + "\n%%EOF\n";
+    pdf += add;
+    return true;
+  }
+
+  // xref stream, matching a base file that used one.
+  const int xrefNum = (int)newSize;
+  const unsigned use = (unsigned)(pdf.size() + 1);
+  std::string rows;
+  rows += (char)1;
+  rows += (char)((use >> 24) & 0xFF);
+  rows += (char)((use >> 16) & 0xFF);
+  rows += (char)((use >> 8) & 0xFF);
+  rows += (char)(use & 0xFF);
+  rows += (char)0;
+  rows += (char)0;   // gen 0
+  const size_t xrefObjOffset = pdf.size() + add.size();
+  add += std::to_string(xrefNum) + " 0 obj\n<< /Type /XRef /Size " +
+         std::to_string(newSize + 1) + " /Root " + std::to_string(rootObj) +
+         " 0 R" + infoRef + " /Prev " + std::to_string(baseXref) +
+         " /W [1 4 2] /Index [" + std::to_string(target) + " 1] /Length " +
+         std::to_string(rows.size()) + " >>\nstream\n" + rows +
+         "\nendstream\nendobj\nstartxref\n" + std::to_string(xrefObjOffset) +
+         "\n%%EOF\n";
   pdf += add;
   return true;
 }
@@ -3531,7 +3873,7 @@ static bool SerializeForSave(std::vector<unsigned char>& out, bool interactive)
                   L"Stitchup", MB_OK | MB_ICONWARNING);
     return false;
   }
-  if (g.marks.empty() && g_linkDests.empty())
+  if (g.marks.empty() && g_linkDests.empty() && !g_metaDirty)
   {
     out.swap(fw.buf);
     return true;
@@ -3560,6 +3902,24 @@ static bool SerializeForSave(std::vector<unsigned char>& out, bool interactive)
       MessageBoxW(g.frame, msg.c_str(), L"Stitchup", MB_OK | MB_ICONWARNING);
     }
     return false;
+  }
+  if (g_metaDirty)
+  {
+    const std::vector<std::pair<std::string, std::wstring>> fields = {
+      {"Title", g_metaTitle}, {"Author", g_metaAuthor},
+      {"Subject", g_metaSubject}, {"Keywords", g_metaKeywords}
+    };
+    if (!AppendInfo(pdf, fields, &err))
+    {
+      if (interactive)
+      {
+        const std::wstring msg =
+            L"Save failed: document properties could not be written into the\n"
+            L"PDF, so the file was left untouched.\n\n" + err;
+        MessageBoxW(g.frame, msg.c_str(), L"Stitchup", MB_OK | MB_ICONWARNING);
+      }
+      return false;
+    }
   }
   out.assign(pdf.begin(), pdf.end());
   return true;
@@ -4296,6 +4656,141 @@ static void PrintDoc()
 {
   // Plain print: the printer dialog decides the paper and orientation.
   PrintDocWith(0, 0, 0, false);
+}
+
+// Sends every page to the "Microsoft Print to PDF" printer and writes the
+// result to a file the user names. This is an explicit PDF output target: it
+// runs the print pipeline (so the result matches what would reach paper)
+// instead of re-serialising the in-memory document.
+static void PrintToPdf()
+{
+  if (!g.doc || g.pageCount < 1)
+  {
+    MessageBoxW(g.frame, L"There is nothing to print.", L"Stitchup",
+                MB_OK | MB_ICONINFORMATION);
+    return;
+  }
+
+  // Default file name: "<document> - printed.pdf".
+  std::wstring base = g.name;
+  const size_t slash = base.find_last_of(L"\\/");
+  if (slash != std::wstring::npos) base = base.substr(slash + 1);
+  const size_t dot = base.find_last_of(L'.');
+  if (dot != std::wstring::npos) base = base.substr(0, dot);
+  if (base.empty()) base = L"document";
+  const std::wstring def = base + L" - printed.pdf";
+
+  wchar_t file[MAX_PATH];
+  wcsncpy_s(file, def.c_str(), _TRUNCATE);
+
+  OPENFILENAMEW ofn{};
+  ofn.lStructSize = sizeof(ofn);
+  ofn.hwndOwner = g.frame;
+  ofn.lpstrFilter = L"PDF Files (*.pdf)\0*.pdf\0All Files (*.*)\0*.*\0\0";
+  ofn.lpstrFile = file;
+  ofn.nMaxFile = MAX_PATH;
+  ofn.lpstrDefExt = L"pdf";
+  ofn.Flags = OFN_OVERWRITEPROMPT | OFN_PATHMUSTEXIST | OFN_HIDEREADONLY;
+  if (!GetSaveFileNameW(&ofn)) return;
+
+  const wchar_t* kPrinter = L"Microsoft Print to PDF";
+
+  // Ask the spooler for the printer's port and default DEVMODE so a DC can be
+  // built without going through the printer-selection dialog.
+  HANDLE hp = nullptr;
+  if (!OpenPrinterW(const_cast<LPWSTR>(kPrinter), &hp, nullptr))
+  {
+    MessageBoxW(g.frame,
+                L"The \"Microsoft Print to PDF\" printer is not available.\n"
+                L"Add it from Windows' optional features, or use Print and pick "
+                L"any PDF printer.",
+                L"Stitchup", MB_OK | MB_ICONWARNING);
+    return;
+  }
+  DWORD need = 0;
+  GetPrinterW(hp, 2, nullptr, 0, &need);
+  std::vector<unsigned char> buf(need ? need : 1);
+  DWORD got = 0;
+  PRINTER_INFO_2W* pi2 = nullptr;
+  if (GetPrinterW(hp, 2, buf.data(), (DWORD)buf.size(), &got) && got)
+    pi2 = reinterpret_cast<PRINTER_INFO_2W*>(buf.data());
+  ClosePrinter(hp);
+  if (!pi2)
+  {
+    MessageBoxW(g.frame, L"Could not query the PDF printer.", L"Stitchup",
+                MB_OK | MB_ICONWARNING);
+    return;
+  }
+
+  HDC dc = CreateDCW(L"WINSPOOL", kPrinter, pi2->pPortName, pi2->pDevMode);
+  if (!dc)
+  {
+    MessageBoxW(g.frame, L"Could not open the PDF printer.", L"Stitchup",
+                MB_OK | MB_ICONWARNING);
+    return;
+  }
+
+  // Match the orientation of the first page, as the interactive print does.
+  if (pi2->pDevMode)
+  {
+    DEVMODEW* dm = pi2->pDevMode;
+    double firstW = 0, firstH = 0;
+    FPDF_PAGE p = FPDF_LoadPage(g.doc, 0);
+    if (p)
+    {
+      firstW = FPDF_GetPageWidth(p);
+      firstH = FPDF_GetPageHeight(p);
+      if (FPDFPage_GetRotation(p) & 1) std::swap(firstW, firstH);
+      FPDF_ClosePage(p);
+    }
+    if (OrientationForPage(dm, firstW, firstH)) ResetDCW(dc, dm);
+  }
+
+  const int dpiX = std::max(1, GetDeviceCaps(dc, LOGPIXELSX));
+  const int dpiY = std::max(1, GetDeviceCaps(dc, LOGPIXELSY));
+  const int devW = std::max(1, GetDeviceCaps(dc, HORZRES));
+  const int devH = std::max(1, GetDeviceCaps(dc, VERTRES));
+
+  DOCINFOW di{};
+  di.cbSize = sizeof(di);
+  di.lpszDocName = g.name.empty() ? L"Stitchup document" : g.name.c_str();
+  di.lpszOutput = file;   // steer the PDF printer at the chosen file
+
+  int written = 0;
+  if (StartDocW(dc, &di) <= 0)
+  {
+    MessageBoxW(g.frame, L"The PDF printer refused to start a job.", L"Stitchup",
+                MB_OK | MB_ICONWARNING);
+    written = -1;
+  }
+  else
+  {
+    for (int i = 0; i < g.pageCount && written >= 0; ++i)
+    {
+      if (StartPage(dc) <= 0) { written = -1; break; }
+      const bool ok = PrintOnePage(dc, i, dpiX, dpiY, devW, devH);
+      if (EndPage(dc) <= 0) { written = -1; break; }
+      if (!ok) { written = -1; break; }
+      ++written;
+    }
+    if (written < 0) AbortDoc(dc);
+    else EndDoc(dc);
+  }
+  DeleteDC(dc);
+
+  if (written > 0)
+  {
+    const std::wstring msg = L"Saved " + std::to_wstring(written) +
+                             (written == 1 ? L" page to\n" : L" pages to\n") +
+                             file;
+    MessageBoxW(g.frame, msg.c_str(), L"Stitchup",
+                MB_OK | MB_ICONINFORMATION);
+  }
+  else if (written == 0)
+  {
+    MessageBoxW(g.frame, L"No pages were written.", L"Stitchup",
+                MB_OK | MB_ICONWARNING);
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -8258,6 +8753,8 @@ static void BuildToolbar(HWND)
      L"Save changes to the current file (Ctrl+S)"},
     {ID_SAVEAS,       L"Save As",    74, 0, 0xE792, false,
      L"Save to a new file name (Ctrl+Shift+S)"},
+    {ID_META,         L"Properties", 82, 0, 0xE946, false,
+     L"Edit the document metadata (title, author, subject, keywords)"},
     {ID_IMPORT,       L"Import",     68, 0, 0xE8B5, false,
      L"Insert pages from another PDF into this one"},
     {ID_EXPORT_TEXT,  L"Export Text",80, 0, 0xE8C3, false,
@@ -8268,6 +8765,8 @@ static void BuildToolbar(HWND)
      L"Print the document, all pages or a page range (Ctrl+P)"},
     {ID_PRINT_PREVIEW, L"Preview",   74, 0, 0xE749, false,
      L"See how the document looks on paper before printing (Ctrl+Shift+P)"},
+    {ID_PRINT_PDF,    L"to PDF",     62, 0, 0xE8A5, false,
+     L"Print the document to a PDF file (Microsoft Print to PDF)"},
     {ID_ROTL,         L"Rotate CCW", 88, 1, 0xE7AD, true,
      L"Rotate the current page 90 degrees counter-clockwise (Ctrl+Shift+R)"},
     {ID_ROTR,         L"Rotate CW",  86, 1, 0xE7AD, false,
@@ -9584,7 +10083,7 @@ static bool IsHandledCommand(int id)
   switch (id)
   {
     case ID_NEW: case ID_OPEN: case ID_SAVE: case ID_SAVEAS: case ID_SAVEENC:
-    case ID_IMPORT: case ID_MERGE_APPEND: case ID_COMBINE_NEW: case ID_COMPRESS_PDF: case ID_EDIT_TEXT: case ID_EXPORT_TEXT: case ID_EXPORT_CSV: case ID_WATERMARK: case ID_SIGN:
+    case ID_IMPORT: case ID_MERGE_APPEND: case ID_COMBINE_NEW: case ID_COMPRESS_PDF: case ID_EDIT_TEXT: case ID_EXPORT_TEXT: case ID_EXPORT_CSV: case ID_WATERMARK: case ID_SIGN: case ID_META:
     case ID_EXIT: case ID_ROTR: case ID_ROTL: case ID_DELETE: case ID_ADD:
     case ID_TOOL_SELECT: case ID_OBJ_EDIT: case ID_OBJ_DELETE:
     case ID_OBJ_RECOLOR: case ID_OBJ_FONT: case ID_ZOOM_IN: case ID_ZOOM_OUT: case ID_ZOOM100:
@@ -9598,6 +10097,7 @@ static bool IsHandledCommand(int id)
     case ID_ANN_INK:
     case ID_PAGE_EXTRACT: case ID_PAGE_SPLIT: case ID_PAGE_CROP:
     case ID_SEL_ALL: case ID_ROT_ALL: case ID_PRINT: case ID_PRINT_PREVIEW:
+    case ID_PRINT_PDF:
     case ID_UNDO: case ID_REDO:
     case ID_THEME: case ID_ABOUT:
       return true;
@@ -9729,8 +10229,10 @@ static void DoCommand(int id)
     case ID_EXPORT_CSV:   ExportCsvAll(); break;
     case ID_WATERMARK:    WatermarkCurrentDoc(); break;
     case ID_SIGN:         SignDocument(); break;
+    case ID_META:         EditMetadata(); break;
     case ID_PRINT:        PrintDoc(); break;
     case ID_PRINT_PREVIEW: PrintPreviewDialog(); break;
+    case ID_PRINT_PDF:    PrintToPdf(); break;
     case ID_THEME:        ToggleTheme(); break;
     case ID_THEME_FIRST:
     case ID_THEME_DARK:
@@ -9780,9 +10282,11 @@ static HMENU BuildMenu()
   addItem(file, ID_EXPORT_CSV, L"Export CSV...");
   addItem(file, ID_WATERMARK, L"Watermark...");
   addItem(file, ID_SIGN, L"Sign Document...");
+  addItem(file, ID_META, L"Document Properties...");
   AppendMenuW(file, MF_SEPARATOR, 0, nullptr);
   addItem(file, ID_PRINT, L"Print...\tCtrl+P");
   addItem(file, ID_PRINT_PREVIEW, L"Print Preview\tCtrl+Shift+P");
+  addItem(file, ID_PRINT_PDF, L"Print to PDF...");
   AppendMenuW(file, MF_SEPARATOR, 0, nullptr);
   addItem(file, ID_EXIT, L"Exit");
   AppendMenuW(bar, MF_POPUP, (UINT_PTR)file, L"&File");
