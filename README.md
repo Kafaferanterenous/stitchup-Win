@@ -263,13 +263,10 @@ Not yet implemented, roughly by how much a user notices them missing:
 
 ### Nice to have
 
-1. Export → RTF — **100% done** — difficulty **20%**
-2. Export → TXT — **100% done** — difficulty **5%**
-3. Export → Images (JPG / PNG) — **100% done** — difficulty **15%**
-4. Export → DOCX — **0% done**, difficulty **30%**
-5. Export → ODF / ODT — **0% done**, difficulty **30%**
-6. Autosave / crash recovery — **0% done**, difficulty **35%**
-7. AcroForm field filling (interactive fields) — **0% done**, difficulty **45%**
-8. OCR (searchable scans) — **0% done**, difficulty **90%**
+1. Export → DOCX — **0% done**, difficulty **30%**
+2. Export → ODF / ODT — **0% done**, difficulty **30%**
+3. Autosave / crash recovery — **0% done**, difficulty **35%**
+4. AcroForm field filling (interactive fields) — **0% done**, difficulty **45%**
+5. OCR (searchable scans) — **0% done**, difficulty **90%**
   (Legacy `.doc` is an OLE compound file and is not produced natively; RTF is the
   usual stand-in.)
