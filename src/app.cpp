@@ -4835,6 +4835,7 @@ static bool SaveDocTo(const std::wstring& target)
 }
 
 static void SaveInPlace();
+static void ClearRecovery();   // autosave / crash recovery (defined below)
 
 static void SaveAs()
 {
@@ -4858,6 +4859,7 @@ static void SaveAs()
     std::wstring f = file;
     g.path = f;
     g.dirty = false;
+    ClearRecovery();   // the work is safe on disk now
     size_t p = f.find_last_of(L"\\/");
     g.name = (p == std::wstring::npos) ? f : f.substr(p + 1);
     SetWindowTextW(g.frame, kAppTitle);
@@ -4919,6 +4921,7 @@ static void SaveInPlace()
     return;
   }
   g.dirty = false;
+  ClearRecovery();   // the work is safe on disk now
   ReloadCurrentInPlace(target);
   g.marks.clear();   // they are in the file now, and the reload reads them back
   g.bmDirty = true;
@@ -4927,6 +4930,269 @@ static void SaveInPlace()
   if (g.canvas) InvalidateRect(g.canvas, nullptr, TRUE);
   if (g.thumbs) InvalidateRect(g.thumbs, nullptr, TRUE);
   InvalidateRect(g.status, nullptr, TRUE);
+}
+
+// ---------------------------------------------------------------------------
+// Autosave / crash recovery
+//
+// Every dirty tab is periodically serialized into a private recovery folder
+// under %LOCALAPPDATA%\Stitchup\Recovery. The snapshots survive a crash or a
+// force-kill, and the next launch offers to reopen them as unsaved tabs. A clean
+// exit (or a successful save) removes them. The folder is never touched by the
+// self-test, which returns before the message loop starts.
+// ---------------------------------------------------------------------------
+static const UINT_PTR TIMER_AUTOSAVE = 0xA5u;
+static const UINT kAutoSaveMs = 30000u;   // snapshot cadence
+
+static std::wstring RecoveryDir()
+{
+  wchar_t base[MAX_PATH] = L"";
+  const DWORD n = GetEnvironmentVariableW(L"LOCALAPPDATA", base, MAX_PATH);
+  if (n == 0 || n >= (DWORD)MAX_PATH) GetTempPathW(MAX_PATH, base);  // fallback
+  std::wstring root = std::wstring(base) + L"\\Stitchup";
+  CreateDirectoryW(root.c_str(), nullptr);
+  std::wstring dir = root + L"\\Recovery";
+  CreateDirectoryW(dir.c_str(), nullptr);
+  return dir;
+}
+
+static std::wstring WideFromUtf8(const std::string& s)
+{
+  if (s.empty()) return std::wstring();
+  const int n = MultiByteToWideChar(CP_UTF8, 0, s.data(), (int)s.size(),
+                                    nullptr, 0);
+  std::wstring w(n, L'\0');
+  MultiByteToWideChar(CP_UTF8, 0, s.data(), (int)s.size(), &w[0], n);
+  return w;
+}
+
+static bool ReadFileBytes(const std::wstring& path, std::string& out)
+{
+  FILE* f = nullptr;
+  if (_wfopen_s(&f, path.c_str(), L"rb") != 0) return false;
+  fseek(f, 0, SEEK_END);
+  const long sz = ftell(f);
+  fseek(f, 0, SEEK_SET);
+  if (sz < 0) { fclose(f); return false; }
+  out.assign((size_t)sz, '\0');
+  const size_t got = sz ? fread(&out[0], 1, (size_t)sz, f) : 0;
+  fclose(f);
+  out.resize(got);
+  return true;
+}
+
+// Write bytes to `target` atomically (tmp + replace), so a crash mid-write can
+// never leave a half-written snapshot behind.
+static bool WriteFileBytes(const std::wstring& target,
+                           const std::vector<unsigned char>& buf)
+{
+  std::wstring tmp = target + L".tmp";
+  FILE* f = nullptr;
+  if (_wfopen_s(&f, tmp.c_str(), L"wb") != 0) return false;
+  const bool ok = fwrite(buf.data(), 1, buf.size(), f) == buf.size();
+  fclose(f);
+  if (!ok) { DeleteFileW(tmp.c_str()); return false; }
+  return MoveFileExW(tmp.c_str(), target.c_str(),
+                     MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) != 0;
+}
+
+static void ClearRecovery()
+{
+  const std::wstring dir = RecoveryDir();
+  DeleteFileW((dir + L"\\recovery.ini").c_str());
+  WIN32_FIND_DATAW fd{};
+  const std::wstring pat = dir + L"\\rec_*.pdf";
+  HANDLE h = FindFirstFileW(pat.c_str(), &fd);
+  if (h != INVALID_HANDLE_VALUE)
+  {
+    do { DeleteFileW((dir + L"\\" + fd.cFileName).c_str()); }
+    while (FindNextFileW(h, &fd));
+    FindClose(h);
+  }
+}
+
+// Serialize a document to memory. The live document also folds in any pending
+// bookmarks / internal links / metadata edits, so the snapshot keeps them too.
+static bool SerializeRecovery(FPDF_DOCUMENT d, std::vector<unsigned char>& out)
+{
+  if (!d) return false;
+  if (d == g.doc) return SerializeForSave(out, false);
+  FileWriter fw{};
+  fw.buf.reserve(65536);
+  fw.base.version = 1;
+  fw.base.WriteBlock = [](FPDF_FILEWRITE* self, const void* data,
+                          unsigned long size) -> int
+  {
+    FileWriter* f = reinterpret_cast<FileWriter*>(self);
+    const unsigned char* p = static_cast<const unsigned char*>(data);
+    f->buf.insert(f->buf.end(), p, p + size);
+    return 1;
+  };
+  if (!FPDF_SaveAsCopy(d, &fw.base, FPDF_NO_INCREMENTAL)) return false;
+  out.swap(fw.buf);
+  return true;
+}
+
+static void AutoSaveSnapshot()
+{
+  // Fold the live document's state (dirty/undo/path) back into its tab first.
+  if (g_curTab >= 0 && g_curTab < (int)g_tabs.size()) SnapshotCurrentTab();
+  std::vector<int> dirty;
+  for (int i = 0; i < (int)g_tabs.size(); ++i)
+    if (g_tabs[i].dirty) dirty.push_back(i);
+
+  // Drop the previous generation first so a shrinking tab set leaves no orphans.
+  ClearRecovery();
+  if (dirty.empty()) return;
+
+  const std::wstring dir = RecoveryDir();
+  const std::wstring tag = std::to_wstring(GetCurrentProcessId());
+  std::string recs;
+  int written = 0;
+  for (int i : dirty)
+  {
+    std::vector<unsigned char> buf;
+    if (!SerializeRecovery(g_tabs[i].doc, buf) || buf.empty()) continue;
+    const std::wstring fname =
+        L"rec_" + tag + L"_" + std::to_wstring(written) + L".pdf";
+    if (!WriteFileBytes(dir + L"\\" + fname, buf)) continue;
+    const std::string idx = std::to_string(written);
+    recs += "file" + idx + "=" + Utf8(fname) + "\n";
+    recs += "path" + idx + "=" + Utf8(g_tabs[i].path) + "\n";
+    recs += "name" + idx + "=" + Utf8(g_tabs[i].name) + "\n";
+    ++written;
+  }
+  if (written == 0) { ClearRecovery(); return; }
+
+  const std::string manifest =
+      "count=" + std::to_string(written) + "\n" + recs;
+  FILE* f = nullptr;
+  if (_wfopen_s(&f, (dir + L"\\recovery.ini").c_str(), L"wb") == 0)
+  {
+    fwrite(manifest.data(), 1, manifest.size(), f);
+    fflush(f);
+    fclose(f);
+  }
+}
+
+static void AutoSaveTick()
+{
+  if (g.thumbDrag || g.selDrag || g.annDrag || g.editPage) return;  // mid-gesture
+  bool anyDirty = g.dirty;
+  for (const TabDoc& t : g_tabs)
+    if (t.dirty) { anyDirty = true; break; }
+  if (!anyDirty) { ClearRecovery(); return; }
+  AutoSaveSnapshot();
+}
+
+// Reopen a snapshot held in memory as an unsaved tab. `origPath` (when known) is
+// restored so a later Ctrl+S writes the recovered work back to the real file.
+static bool RecoverAddTab(const std::vector<unsigned char>& bytes,
+                          const std::wstring& origPath,
+                          const std::wstring& dispName)
+{
+  if (bytes.empty()) return false;
+  FPDF_DOCUMENT d =
+      FPDF_LoadMemDocument(bytes.data(), (int)bytes.size(), nullptr);
+  if (!d) return false;
+  SnapshotCurrentTab();
+  g.doc = d;
+  g.path = origPath;
+  g.name = dispName;
+  g.bmDirty = true;
+  g.undo.clear();
+  g.redo.clear();
+  TabDoc nd;
+  nd.doc = d;
+  nd.path = origPath;
+  nd.name = dispName;
+  nd.pageCount = FPDF_GetPageCount(d);
+  nd.selected = 0;
+  nd.dirty = true;
+  g_tabs.push_back(nd);
+  g_curTab = (int)g_tabs.size() - 1;
+  g.dirty = true;
+  SetWindowTextW(g.frame, kAppTitle);
+  RefreshState();
+  FitWidth();
+  g.scrollX = g.scrollY = 0;
+  InvalidateRect(g.canvas, nullptr, TRUE);
+  InvalidateRect(g.thumbs, nullptr, TRUE);
+  InvalidateRect(g.status, nullptr, TRUE);
+  RefreshTabBar();
+  return true;
+}
+
+// Called once at startup: if the last run left snapshots behind, offer to reopen
+// them. The snapshots are read into memory and deleted before PDFium touches
+// them, so nothing is left locked open in this session.
+static void RecoverLastSession()
+{
+  const std::wstring dir = RecoveryDir();
+  const std::wstring ini = dir + L"\\recovery.ini";
+  std::string text;
+  if (!ReadFileBytes(ini, text)) return;
+
+  std::map<std::string, std::string> kv;
+  size_t pos = 0;
+  while (pos < text.size())
+  {
+    size_t nl = text.find('\n', pos);
+    std::string line =
+        text.substr(pos, nl == std::string::npos ? std::string::npos : nl - pos);
+    if (!line.empty() && line.back() == '\r') line.pop_back();
+    const size_t eq = line.find('=');
+    if (eq != std::string::npos) kv[line.substr(0, eq)] = line.substr(eq + 1);
+    if (nl == std::string::npos) break;
+    pos = nl + 1;
+  }
+  int count = 0;
+  auto it = kv.find("count");
+  if (it != kv.end()) count = atoi(it->second.c_str());
+  if (count > 1000) count = 1000;   // guard a corrupt manifest
+  if (count <= 0) { ClearRecovery(); return; }
+
+  const std::wstring msg =
+      L"Stitchup did not shut down cleanly last time.\n\nRecover " +
+      std::to_wstring(count) +
+      (count == 1 ? L" unsaved document? " : L" unsaved documents? ") +
+      L"The recovered copies open as unsaved tabs.";
+  if (MessageBoxW(g.frame, msg.c_str(), L"Recover unsaved work",
+                  MB_YESNO | MB_ICONQUESTION) != IDYES)
+  {
+    ClearRecovery();
+    return;
+  }
+
+  int recovered = 0;
+  for (int i = 0; i < count; ++i)
+  {
+    const std::string idx = std::to_string(i);
+    auto fit = kv.find("file" + idx);
+    if (fit == kv.end()) continue;
+    const std::wstring file = dir + L"\\" + WideFromUtf8(fit->second);
+    std::string bytes;
+    if (!ReadFileBytes(file, bytes) || bytes.empty()) continue;
+    DeleteFileW(file.c_str());   // in memory now; unlink so nothing stays locked
+
+    std::wstring origPath, dispName;
+    auto pit = kv.find("path" + idx);
+    if (pit != kv.end()) origPath = WideFromUtf8(pit->second);
+    auto nit = kv.find("name" + idx);
+    if (nit != kv.end()) dispName = WideFromUtf8(nit->second);
+    if (dispName.empty())
+    {
+      const size_t s = origPath.find_last_of(L"\\/");
+      dispName = (s == std::wstring::npos) ? origPath : origPath.substr(s + 1);
+    }
+    if (dispName.empty()) dispName = L"Untitled";
+    dispName += L" (recovered)";
+
+    const std::vector<unsigned char> buf(bytes.begin(), bytes.end());
+    if (RecoverAddTab(buf, origPath, dispName)) ++recovered;
+  }
+  DeleteFileW(ini.c_str());   // no re-prompt; snapshots are gone
+  if (recovered == 0) ClearRecovery();
 }
 
 // Signs the open document and writes the signed copy to a file the user picks.
@@ -12059,8 +12325,12 @@ static LRESULT CALLBACK FrameProc(HWND hw, UINT msg, WPARAM wp, LPARAM lp)
                                  nullptr);
       DragAcceptFiles(hw, TRUE);
       SetFocus(hw);
+      SetTimer(hw, TIMER_AUTOSAVE, kAutoSaveMs, nullptr);
       break;
     }
+    case WM_TIMER:
+      if (wp == TIMER_AUTOSAVE) { AutoSaveTick(); return 0; }
+      break;
     case WM_MOUSEWHEEL:
       // The frame is the focus window at startup and after clicking a
       // thumbnail, so without this the wheel was swallowed here entirely.
@@ -12265,6 +12535,7 @@ static LRESULT CALLBACK FrameProc(HWND hw, UINT msg, WPARAM wp, LPARAM lp)
         if (r == IDCANCEL) return 0;
         if (r == IDYES) DoCommand(ID_SAVE);
       }
+      ClearRecovery();   // clean exit: nothing to recover next launch
       break;
     }
     case WM_DESTROY:
@@ -16722,6 +16993,9 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int)
   ShowWindow(frame, SW_SHOW);
   UpdateWindow(frame);
 
+  // Offer to reopen anything the previous run left unsaved (crash recovery).
+  RecoverLastSession();
+
   MSG msg{};
   while (GetMessageW(&msg, nullptr, 0, 0) > 0)
   {
@@ -16732,6 +17006,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int)
   for (TabDoc& t : g_tabs)
     if (t.doc) FPDF_CloseDocument(t.doc);
   g_tabs.clear();
+  ClearRecovery();   // reached only via a normal shutdown
   FPDF_DestroyLibrary();
   DeleteObject(g.font);
   if (g.iconFont) DeleteObject(g.iconFont);

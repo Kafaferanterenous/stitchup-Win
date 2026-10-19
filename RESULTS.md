@@ -1124,3 +1124,26 @@ Self-test: 465 passed, 0 failed.
 
 Self-test: 465 passed, 0 failed.
 
+## v0.12.26 - autosave / crash recovery (2026-10-19)
+- A 30 s `SetTimer` snapshots every dirty tab into
+  `%LOCALAPPDATA%\Stitchup\Recovery`: a `recovery.ini` manifest (UTF-8) plus
+  `rec_<pid>_<n>.pdf` snapshots written atomically (tmp + replace). The live
+  document is serialized with `SerializeForSave` so pending bookmarks / internal
+  links / metadata edits are captured too; background tabs use `FPDF_SaveAsCopy`.
+  Gestures in flight (thumbnail/object/annotation drag) skip the tick.
+- Startup `RecoverLastSession()` reads the manifest, loads each snapshot into
+  memory (`FPDF_LoadMemDocument`) and unlinks it *before* PDFium opens it, then
+  reopens the work as dirty "… (recovered)" tabs whose `path` is the original, so
+  a later Ctrl+S writes back to the real file. Nothing is left file-locked.
+- `ClearRecovery()` runs after a successful save and on clean exit, so a normal
+  shutdown never leaves a stale recovery prompt. Snapshots carry a per-process
+  name tag, so a recovering session can never collide with the snapshots it just
+  reopened.
+- Verified with a standalone probe against `Test1.pdf`: serialize (75,904 bytes,
+  5 pages) -> write snapshot + manifest -> reparse manifest (UTF-8 round-trip of a
+  non-ASCII path + name) -> reload snapshot from memory -> pages still 5. PASS.
+  Probe removed.
+- Self-test unchanged at 465 (no new headless checks), exit 0.
+
+Self-test: 465 passed, 0 failed.
+

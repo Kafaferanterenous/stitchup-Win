@@ -208,8 +208,8 @@ project (github.com/bblanchon/pdfium-binaries). Non-GPL build.
   auto-crop, now selection-aware) + text export + CSV export + password-unlock +
   watermarks + encrypt-on-save + redaction + digital signatures + print-to-PDF +
   document properties + moving pages between open documents + page image export
-  + RTF/DOCX/ODT text export are done. Rendering, page model, editing operations,
-  ribbon
+  + RTF/DOCX/ODT text export + autosave/crash recovery are done. Rendering, page
+  model, editing operations, ribbon
   navigation, the bookmarks pane, annotation creation/persistence, link
   navigation, link *creation* and page extract/split/crop are functional.
 - Digital signatures are written as an incremental update with Windows
@@ -262,6 +262,12 @@ project (github.com/bblanchon/pdfium-binaries). Non-GPL build.
   and `content.xml`), so LibreOffice/OpenOffice can open it.
 - Tools menu/ribbon tab hosts the Security (Save As Encrypted) and Export
   (Export Text / Export CSV / Images / RTF / DOCX / ODT) groups.
+- Autosave / crash recovery: every dirty tab is serialized every 30 s into
+  `%LOCALAPPDATA%\Stitchup\Recovery` (a `recovery.ini` manifest plus
+  `rec_<pid>_<n>.pdf` snapshots). If the app is killed or crashes, the next launch
+  offers to reopen the unsaved work as dirty tabs; a clean exit or a successful
+  save removes the snapshots. The snapshot is read back into memory and unlinked
+  before PDFium opens it, so nothing stays locked.
 
 ### Remaining goals
 
@@ -272,6 +278,5 @@ Not yet implemented, roughly by how much a user notices them missing:
 
 ### Nice to have
 
-1. Autosave / crash recovery — **0% done**, difficulty **35%**
-2. AcroForm field filling (interactive fields) — **0% done**, difficulty **45%**
-3. OCR (searchable scans) — **0% done**, difficulty **90%**
+1. AcroForm field filling (interactive fields) — **0% done**, difficulty **45%**
+2. OCR (searchable scans) — **0% done**, difficulty **90%**
