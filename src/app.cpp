@@ -97,6 +97,7 @@ ID_ANN_LINK,
   ID_EXPORT_IMG,   // Export page images (JPG / PNG)
   ID_EXPORT_RTF,   // Export RTF
   ID_EXPORT_DOCX,  // Export DOCX
+  ID_EXPORT_ODT,   // Export ODT (OpenDocument)
   ID_THEME,
   ID_WATERMARK,
   ID_SAVEENC,
@@ -2329,6 +2330,118 @@ static void ExportDocxAll()
                   L"Export DOCX", MB_OK | MB_ICONINFORMATION);
     else
       MessageBoxW(g.frame, L"Export failed.", L"Export DOCX", MB_OK | MB_ICONERROR);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Export ODT (OpenDocument Text; same STORE-only ZIP, mimetype must come first)
+// ---------------------------------------------------------------------------
+// ODF requires the `mimetype` entry to be the very first, stored with no extra
+// field, so a reader can sniff the type from the leading bytes of the file.
+// BuildZip already writes STORE with no extra field, so order is all that matters.
+static std::string BuildOdtPackage(FPDF_DOCUMENT d)
+{
+  std::wstring body;
+  const int np = d ? FPDF_GetPageCount(d) : 0;
+  for (int i = 0; i < np; ++i)
+  {
+    FPDF_PAGE p = FPDF_LoadPage(d, i);
+    if (!p) continue;
+    std::wstring t = PageTextRaw(p);
+    FPDF_ClosePage(p);
+    if (i > 0) body += L"<text:p text:break-before=\"page\"/>";
+    size_t pos = 0;
+    while (pos < t.size())
+    {
+      size_t nl = t.find_first_of(L"\r\n", pos);
+      std::wstring line = t.substr(pos, nl == std::wstring::npos ? std::wstring::npos
+                                                                : nl - pos);
+      body += L"<text:p>";
+      body += XmlEscape(line);
+      body += L"</text:p>";
+      if (nl == std::wstring::npos) break;
+      pos = nl;
+      while (pos < t.size() && (t[pos] == L'\r' || t[pos] == L'\n')) ++pos;
+    }
+  }
+
+  static const std::string kMimetype = "application/vnd.oasis.opendocument.text";
+  static const std::string kManifest =
+      "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
+      "<manifest:manifest "
+      "xmlns:manifest=\"urn:oasis:names:tc:opendocument:xmlns:manifest:1.0\" "
+      "manifest:version=\"1.2\">"
+      "<manifest:file-entry manifest:full-path=\"/\" "
+      "manifest:media-type=\"application/vnd.oasis.opendocument.text\"/>"
+      "<manifest:file-entry manifest:full-path=\"content.xml\" "
+      "manifest:media-type=\"text/xml\"/></manifest:manifest>";
+
+  std::string content =
+      "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
+      "<office:document-content "
+      "xmlns:office=\"urn:oasis:names:tc:opendocument:xmlns:office:1.0\" "
+      "xmlns:text=\"urn:oasis:names:tc:opendocument:xmlns:text:1.0\" "
+      "office:version=\"1.2\"><office:body><office:text>";
+  content += WideToUtf8(body);
+  content += "</office:text></office:body></office:document-content>";
+
+  // mimetype MUST be first (and STORE, no extra field - BuildZip guarantees both).
+  std::vector<std::pair<std::string, std::string>> entries = {
+      {"mimetype", kMimetype},
+      {"META-INF/manifest.xml", kManifest},
+      {"content.xml", content},
+  };
+  const std::vector<unsigned char> zip = BuildZip(entries);
+  return std::string((const char*)zip.data(), zip.size());
+}
+
+static bool ExportOdtToFile(FPDF_DOCUMENT d, const std::wstring& target)
+{
+  if (!d) return false;
+  const std::string pkg = BuildOdtPackage(d);
+  if (pkg.size() < 4) return false;
+  FILE* f = nullptr;
+  if (_wfopen_s(&f, target.c_str(), L"wb") != 0) return false;
+  const bool ok = fwrite(pkg.data(), 1, pkg.size(), f) == pkg.size();
+  fclose(f);
+  return ok;
+}
+
+static void ExportOdtAll()
+{
+  if (!g.doc)
+  {
+    MessageBoxW(g.frame, L"No document open.", L"Export ODT",
+                MB_OK | MB_ICONINFORMATION);
+    return;
+  }
+  if (DocTextRaw(g.doc).empty())
+  {
+    MessageBoxW(g.frame, L"No extractable text in this document.",
+                L"Export ODT", MB_OK | MB_ICONINFORMATION);
+    return;
+  }
+  std::wstring target = g.path;
+  const size_t dot = target.find_last_of(L'.');
+  if (dot != std::wstring::npos) target.resize(dot);
+  target += L".odt";
+  wchar_t buf[MAX_PATH];
+  wcscpy_s(buf, target.c_str());
+  OPENFILENAMEW ofn{};
+  ofn.lStructSize = sizeof(ofn);
+  ofn.hwndOwner = g.frame;
+  ofn.lpstrFilter = L"OpenDocument Text (*.odt)\0*.odt\0All Files\0*.*\0\0";
+  ofn.lpstrDefExt = L"odt";
+  ofn.lpstrFile = buf;
+  ofn.nMaxFile = MAX_PATH;
+  ofn.Flags = OFN_OVERWRITEPROMPT | OFN_PATHMUSTEXIST;
+  if (GetSaveFileNameW(&ofn))
+  {
+    if (ExportOdtToFile(g.doc, buf))
+      MessageBoxW(g.frame, (std::wstring(L"Exported ODT to:\n") + buf).c_str(),
+                  L"Export ODT", MB_OK | MB_ICONINFORMATION);
+    else
+      MessageBoxW(g.frame, L"Export failed.", L"Export ODT", MB_OK | MB_ICONERROR);
   }
 }
 
@@ -9827,6 +9940,8 @@ static void BuildToolbar(HWND)
      L"Write the document text out to an RTF file"},
     {ID_EXPORT_DOCX,  L"DOCX",       62, 0, 0xE8A3, false,
      L"Write the document text out to a Word .docx file"},
+    {ID_EXPORT_ODT,   L"ODT",        54, 0, 0xE8A1, false,
+     L"Write the document text out to an OpenDocument .odt file"},
     {ID_PRINT,        L"Print",      62, 0, 0xE749, false,
      L"Print the document, all pages or a page range (Ctrl+P)"},
     {ID_PRINT_PREVIEW, L"Preview",   74, 0, 0xE749, false,
@@ -11149,7 +11264,7 @@ static bool IsHandledCommand(int id)
   switch (id)
   {
     case ID_NEW: case ID_OPEN: case ID_SAVE: case ID_SAVEAS: case ID_SAVEENC:
-    case ID_IMPORT: case ID_MERGE_APPEND: case ID_COMBINE_NEW: case ID_COMPRESS_PDF: case ID_EDIT_TEXT: case ID_EXPORT_TEXT: case ID_EXPORT_CSV: case ID_EXPORT_IMG: case ID_EXPORT_RTF: case ID_EXPORT_DOCX: case ID_WATERMARK: case ID_SIGN: case ID_META: case ID_ATTACHMENTS:
+    case ID_IMPORT: case ID_MERGE_APPEND: case ID_COMBINE_NEW: case ID_COMPRESS_PDF: case ID_EDIT_TEXT: case ID_EXPORT_TEXT: case ID_EXPORT_CSV: case ID_EXPORT_IMG: case ID_EXPORT_RTF: case ID_EXPORT_DOCX: case ID_EXPORT_ODT: case ID_WATERMARK: case ID_SIGN: case ID_META: case ID_ATTACHMENTS:
     case ID_EXIT: case ID_ROTR: case ID_ROTL: case ID_DELETE: case ID_ADD:
     case ID_TOOL_SELECT: case ID_OBJ_EDIT: case ID_OBJ_DELETE:
     case ID_OBJ_RECOLOR: case ID_OBJ_FONT: case ID_ZOOM_IN: case ID_ZOOM_OUT: case ID_ZOOM100:
@@ -11298,6 +11413,7 @@ static void DoCommand(int id)
     case ID_EXPORT_IMG:   ExportImagesAll(); break;
     case ID_EXPORT_RTF:   ExportRtfAll(); break;
     case ID_EXPORT_DOCX:  ExportDocxAll(); break;
+    case ID_EXPORT_ODT:   ExportOdtAll(); break;
     case ID_WATERMARK:    WatermarkCurrentDoc(); break;
       case ID_SIGN:         SignDocument(); break;
       case ID_META:         EditMetadata(); break;
@@ -11355,6 +11471,7 @@ static HMENU BuildMenu()
   addItem(file, ID_EXPORT_IMG, L"Export Images...");
   addItem(file, ID_EXPORT_RTF, L"Export RTF...");
   addItem(file, ID_EXPORT_DOCX, L"Export DOCX...");
+  addItem(file, ID_EXPORT_ODT, L"Export ODT...");
   addItem(file, ID_WATERMARK, L"Watermark...");
   addItem(file, ID_SIGN, L"Sign Document...");
   addItem(file, ID_META, L"Document Properties...");

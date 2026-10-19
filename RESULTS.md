@@ -1095,3 +1095,20 @@ Self-test: 465 passed, 0 failed.
 
 Self-test: 465 passed, 0 failed.
 
+## v0.12.24 - export text to ODT (2026-10-19)
+- **File > Export ODT...** writes an OpenDocument Text file containing the
+  document's extracted text (`PageTextRaw`/`DocTextRaw`). Each line becomes a
+  `<text:p>`, and pages are separated with `<text:p text:break-before="page"/>`.
+- Reuses the hand-rolled STORE-only ZIP writer from DOCX. The `mimetype` entry is
+  written first and stored uncompressed (no extra field), as the ODF spec requires
+  for type sniffing, followed by `META-INF/manifest.xml` and `content.xml`.
+- Verified end-to-end against `Test1.pdf`: the first local file header is
+  `mimetype`, method `0` (STORE), extra-length `0`, containing exactly
+  `application/vnd.oasis.opendocument.text` (39 bytes uncompressed = 39 stored).
+  Opened with .NET `ZipArchive` (validates every CRC32) — both XML parts parse as
+  well-formed; `content.xml` held 151 paragraphs and 4 page breaks (5 pages).
+  Probe removed.
+- Self-test unchanged at 465 (no new headless checks), exit 0.
+
+Self-test: 465 passed, 0 failed.
+
