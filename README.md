@@ -208,7 +208,7 @@ project (github.com/bblanchon/pdfium-binaries). Non-GPL build.
   auto-crop, now selection-aware) + text export + CSV export + password-unlock +
   watermarks + encrypt-on-save + redaction + digital signatures + print-to-PDF +
   document properties + moving pages between open documents + page image export
-  are done. Rendering, page model, editing operations, ribbon
+  + RTF text export are done. Rendering, page model, editing operations, ribbon
   navigation, the bookmarks pane, annotation creation/persistence, link
   navigation, link *creation* and page extract/split/crop are functional.
 - Digital signatures are written as an incremental update with Windows
@@ -249,8 +249,10 @@ project (github.com/bblanchon/pdfium-binaries). Non-GPL build.
   it (`name-1.jpg`, `name-2.jpg`, ... for multi-page documents). Rendering goes
   straight to a 32bpp BGRA buffer and GDI+ does the encoding, so no third-party
   image library is needed.
+- Text can be exported as RTF (File > Export RTF...): each page's raw text is
+  written into a plain RTF document, with `\page` and `\par` separators.
 - Tools menu/ribbon tab hosts the Security (Save As Encrypted) and Export
-  (Export Text / Export CSV / Images) groups.
+  (Export Text / Export CSV / Images / RTF) groups.
 
 ### Remaining goals
 
@@ -269,8 +271,8 @@ Not yet implemented, roughly by how much a user notices them missing:
     `[Content_Types].xml` and `word/document.xml`
   - ODF / ODT — the same ZIP writer with an uncompressed `mimetype` first entry
     and a `content.xml`
-  - RTF — a plain text-run writer
   - TXT — already covered by Export Text
-  - Images (JPG / PNG) — done, see Export Images above
+  - Images (JPG / PNG) — done
+  - RTF — done
   (Legacy `.doc` is an OLE compound file and is not produced natively; RTF is the
   usual stand-in.)

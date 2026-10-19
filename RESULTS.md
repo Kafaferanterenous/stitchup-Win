@@ -1065,3 +1065,16 @@ Self-test: 465 passed, 0 failed.
 
 Self-test: 465 passed, 0 failed.
 
+## v0.12.22 - export text to RTF (2026-10-19)
+- **File > Export RTF...** writes each page's extracted text (`FPDFText_GetText`)
+  into an RTF document. Control characters are escaped, non-ASCII code units are
+  emitted as `\uN?`, newlines become `\par`, tabs `\tab`, and `\page` separates
+  pages. A minimal `\fonttbl` (Calibri) and standard RTF prolog are included.
+- Reuses existing `PageTextRaw`/`DocTextRaw` to detect empty documents and to
+  collect text, avoiding duplicate PDFium text-extraction code.
+- Menu, ribbon (Document tab, glyph `0xE8A2`) and command routing
+  (`ID_EXPORT_RTF`, `IsHandledCommand`, `DoCommand`) wired in.
+- Self-test unchanged at 465, exit 0.
+
+Self-test: 465 passed, 0 failed.
+
