@@ -34,7 +34,7 @@ file(TO_CMAKE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/resources/app.ico"
 configure_file(resources/app.rc.in resources/app.rc @ONLY)
 set(STITCHUP_RC "${CMAKE_CURRENT_BINARY_DIR}/resources/app.rc")
 
-add_executable(Stitchup WIN32 src/app.cpp ${STITCHUP_RC})
+add_executable(Stitchup WIN32 src/app.cpp src/ocr.cpp ${STITCHUP_RC})
 target_compile_definitions(Stitchup PRIVATE
                            STITCHUP_VERSION=L"${STITCHUP_VERSION}")
 target_include_directories(Stitchup PRIVATE src ${PDFIUM_DIR}/include)
