@@ -315,4 +315,4 @@ Not yet implemented, roughly by how much a user notices them missing:
 
 ### Nice to have
 
-1. OCR (searchable scans) — **0% done**, difficulty **90%**
+1. OCR (searchable scans, invisible text layer) — **done (text-only export)**, difficulty **90%**
