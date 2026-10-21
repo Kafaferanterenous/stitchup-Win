@@ -32,6 +32,13 @@ if errorlevel 1 (
   echo ERROR: could not update dist\pdfium.dll
   exit /b 1
 )
+rem Regenerate the bundled user guide from the current build so help.pdf can
+rem never drift from the feature set the exe actually ships.
+"dist\Stitchup.exe" --make-help "dist\help.pdf"
+if errorlevel 1 (
+  echo ERROR: could not generate dist\help.pdf
+  exit /b 1
+)
 echo.
-echo Built: dist\Stitchup.exe + dist\pdfium.dll  (portable PDF editor)
+echo Built: dist\Stitchup.exe + dist\pdfium.dll + dist\help.pdf  (portable PDF editor)
 start "" "dist\Stitchup.exe" --self-test

@@ -28,6 +28,8 @@
 #include <fpdf_attachment.h>
 #include <fpdf_transformpage.h>
 #include <fpdf_text.h>
+#include <fpdf_formfill.h>
+#include <fpdf_fwlevent.h>
 #pragma warning(pop)
 
 #include <cstdio>
@@ -68,6 +70,8 @@ enum
   ID_PREV,
   ID_NEXT,
   ID_ABOUT,
+  ID_HELP_GUIDE,         // Help > User Guide (opens help.pdf)
+  ID_SETTINGS,           // File > Settings... (recovery-snapshot interval)
   ID_EXIT,
   ID_TAB_FIRST,          // one ribbon tab per tool group, contiguous block
   ID_TAB_DOCUMENT = ID_TAB_FIRST,
@@ -128,7 +132,6 @@ ID_ANN_LINK,
   // Colour-scheme pickers follow in one contiguous block (radio group).
   ID_THEME_FIRST,
   ID_THEME_LIGHT = ID_THEME_FIRST,
-  ID_THEME_DARK,
   ID_THEME_DARKBLUE,
   ID_THEME_NAVY,
   ID_THEME_BLUE,
@@ -349,6 +352,13 @@ struct App
   std::vector<FindHit> findHits;
   int findCur = -1;
 
+  // AcroForm field filling (interactive form). The form-fill environment ties a
+  // document to PDFium's widget handling; it lives as long as the document and
+  // mirrors into TabDoc alongside g.doc. `formFocus` is the page that currently
+  // owns keyboard focus (-1 when none), so keystrokes reach the focused field.
+  FPDF_FORMHANDLE form = nullptr;
+  int formFocus = -1;
+
   FPDF_PAGE editPage = nullptr;   // page kept open during a live object drag
   FPDF_PAGEOBJECT editObj = nullptr;
   bool selDrag = false;
@@ -383,6 +393,7 @@ struct App
 struct TabDoc
 {
   FPDF_DOCUMENT doc = nullptr;
+  FPDF_FORMHANDLE form = nullptr;   // form-fill environment for `doc`
   std::wstring path;
   std::wstring name;
   bool dirty = false;
@@ -420,13 +431,13 @@ static void UpdateColorSwatches();
 static void InsertShapeCurrent(ShapeKind kind, FS_RECTF rc);
 
 // ---------------------------------------------------------------------------
-// Themes - named colour schemes (light / dark / dark blue / pastel /
-// high-contrast / Windows XP / macOS), each with a matching title bar.
+// Themes - named colour schemes (light / dark blue / darker navy / blue /
+// pastel / high-contrast / two pastel variants), each with a matching title
+// bar. The XP/Mac caption styles back the "Pastel 2"/"Pastel 3" schemes.
 // ---------------------------------------------------------------------------
 enum ThemeId
 {
   THEME_LIGHT = 0,
-  THEME_DARK,
   THEME_DARKBLUE,
   THEME_NAVY,
   THEME_BLUE,
@@ -484,6 +495,9 @@ struct UiTheme
 
 static int g_themeId = THEME_LIGHT;
 static HMENU g_themeMenu = nullptr;   // "Colour Scheme" popup, for check marks
+// Crash-recovery snapshot interval in seconds; 0 disables snapshots entirely.
+// Persisted in the registry as "RecoverSecs" (File > Settings...).
+static int g_recoverSecs = 30;
 // Easter egg: one quip per run, shown in the middle of the title bar.
 static std::wstring g_capPhrase;
 
@@ -541,41 +555,6 @@ static const UiTheme kThemes[THEME_COUNT] = {
     /* macGlyph   */ RGB(0x00, 0x00, 0x00),
     /* capStyle   */ CAP_SYS,
     /* dark       */ false
-    },
-    // ---- Dark: neutral charcoal ---
-    {
-    /* ribbonBg   */ RGB(0x20, 0x21, 0x24),
-    /* card       */ RGB(0x2A, 0x2C, 0x30),
-    /* cardBorder */ RGB(0x3A, 0x3D, 0x43),
-    /* accent     */ RGB(0x4C, 0x9A, 0xFF),
-    /* accentDeep */ RGB(0x1E, 0x6F, 0xC9),
-    /* text       */ RGB(0xE8, 0xEA, 0xED),
-    /* textDim    */ RGB(0xA6, 0xAC, 0xB4),
-    /* btnHover   */ RGB(0x33, 0x37, 0x3D),
-    /* btnDown    */ RGB(0x3D, 0x44, 0x4D),
-    /* btnBorder  */ RGB(0x3A, 0x3D, 0x43),
-    /* thumbBg    */ RGB(0x23, 0x25, 0x29),
-    /* canvasBg   */ RGB(0x1A, 0x1C, 0x1F),
-    /* pageFrame  */ RGB(0x6A, 0x70, 0x79),
-    /* split      */ RGB(0x2E, 0x31, 0x36),
-    /* statusBg   */ RGB(0x15, 0x17, 0x1A),
-    /* statusTxt  */ RGB(0xC9, 0xCE, 0xD6),
-    /* treeBg     */ RGB(0x23, 0x25, 0x29),
-    /* treeTxt    */ RGB(0xE0, 0xE3, 0xE8),
-    /* emptyHint  */ RGB(0x8A, 0x91, 0x9A),
-    /* capTop     */ RGB(0x2B, 0x2E, 0x33),
-    /* capBottom  */ RGB(0x20, 0x21, 0x24),
-    /* capText    */ RGB(0xE8, 0xEA, 0xED),
-    /* capLine    */ RGB(0x39, 0x3D, 0x43),
-    /* capBtn     */ RGB(0x3D, 0x41, 0x48),
-    /* capBtnHover */ RGB(0x4A, 0x4F, 0x57),
-    /* capGlyph   */ RGB(0xE6, 0xE8, 0xEC),
-    /* macRed     */ RGB(0xFF, 0x5F, 0x57),
-    /* macYellow  */ RGB(0xFE, 0xBC, 0x2E),
-    /* macGreen   */ RGB(0x28, 0xC8, 0x40),
-    /* macGlyph   */ RGB(0x00, 0x00, 0x00),
-    /* capStyle   */ CAP_SYS,
-    /* dark       */ true
     },
     // ---- Dark blue: deep navy with bright blue accents ---
     {
@@ -860,9 +839,9 @@ static const UiTheme kThemes[THEME_COUNT] = {
 };
 
 static const wchar_t* kThemeNames[THEME_COUNT] = {
-    L"Light Grey", L"Dark", L"Dark Blue", L"Darker Navy", L"Blue", L"Pastel",
+    L"Light Grey", L"Dark Blue", L"Darker Navy", L"Blue", L"Pastel",
     L"High Contrast (Dark)", L"High Contrast (Light)",
-    L"Windows XP", L"macOS"};
+    L"Pastel 2", L"Pastel 3"};
 
 static const UiTheme& ThemeNow() { return kThemes[g_themeId]; }
 static bool ThemeIsDark() { return kThemes[g_themeId].dark; }
@@ -951,7 +930,7 @@ static void SetTheme(int id, bool persist)
 // Ctrl+D: quick toggle between the light and dark schemes.
 static void ToggleTheme()
 {
-  SetTheme(ThemeIsDark() ? THEME_LIGHT : THEME_DARK, true);
+  SetTheme(ThemeIsDark() ? THEME_LIGHT : THEME_DARKBLUE, true);
 }
 
 static void ApplyInitialThemePref()
@@ -966,7 +945,49 @@ static void ApplyInitialThemePref()
       g_themeId = (int)v;
     else if (RegQueryValueExW(key, L"Dark", nullptr, nullptr, (LPBYTE)&legacy,
                               &lsz) == ERROR_SUCCESS && legacy)
-      g_themeId = THEME_DARK;   // migrate the old light/dark pref
+      g_themeId = THEME_DARKBLUE;   // migrate the old light/dark pref
+    RegCloseKey(key);
+  }
+}
+
+static void ClearRecovery();   // autosave / crash recovery (defined below)
+
+// Recovery-snapshot interval: read the persisted preference and (re)arm the
+// autosave timer. A value of 0 means "Off" - kill the timer, leave no snapshots.
+static void ApplyRecoveryInterval()
+{
+  if (!g.frame) return;
+  KillTimer(g.frame, 0xA5u /*TIMER_AUTOSAVE*/);
+  if (g_recoverSecs > 0)
+    SetTimer(g.frame, 0xA5u /*TIMER_AUTOSAVE*/,
+             (UINT)g_recoverSecs * 1000u, nullptr);
+  else
+    ClearRecovery();   // Off: don't leave a stale snapshot set behind
+}
+
+static void LoadRecoveryPref()
+{
+  HKEY key = nullptr;
+  if (RegOpenKeyExW(HKEY_CURRENT_USER, L"Software\\StitchupPDFEditor", 0,
+                    KEY_QUERY_VALUE, &key) == ERROR_SUCCESS)
+  {
+    DWORD v = 0, sz = sizeof(v);
+    if (RegQueryValueExW(key, L"RecoverSecs", nullptr, nullptr, (LPBYTE)&v, &sz)
+          == ERROR_SUCCESS)
+      g_recoverSecs = (int)v;
+    RegCloseKey(key);
+  }
+}
+
+static void PersistRecoveryPref()
+{
+  HKEY key = nullptr;
+  if (RegCreateKeyExW(HKEY_CURRENT_USER, L"Software\\StitchupPDFEditor", 0,
+                      nullptr, 0, KEY_SET_VALUE, nullptr, &key, nullptr)
+      == ERROR_SUCCESS)
+  {
+    DWORD v = (DWORD)g_recoverSecs;
+    RegSetValueExW(key, L"RecoverSecs", 0, REG_DWORD, (const BYTE*)&v, sizeof(v));
     RegCloseKey(key);
   }
 }
@@ -1136,6 +1157,13 @@ static HBITMAP RenderPageBitmapInto(FPDF_PAGE p, int w, int h)
 
   FPDF_RenderPageBitmap(fb, p, 0, 0, w, h, 0,
                         FPDF_ANNOT | FPDF_LCD_TEXT);
+  // Widget annotations (form fields) and popups are drawn by the form-fill
+  // module on top of the static page content.
+  if (g.form)
+  {
+    FORM_OnAfterLoadPage(p, g.form);
+    FPDF_FFLDraw(g.form, fb, p, 0, 0, w, h, 0, FPDF_ANNOT);
+  }
   FPDFBitmap_Destroy(fb);
   return hb;
 }
@@ -1290,6 +1318,12 @@ static void SelectAllPages()
 
 static void CloseDoc()
 {
+  if (g.form)
+  {
+    FPDFDOC_ExitFormFillEnvironment(g.form);
+    g.form = nullptr;
+    g.formFocus = -1;
+  }
   if (g.doc)
   {
     FPDF_CloseDocument(g.doc);
@@ -1325,6 +1359,7 @@ static void SnapshotCurrentTab()
   if (g_curTab < 0 || g_curTab >= (int)g_tabs.size()) return;
   TabDoc& t = g_tabs[g_curTab];
   t.doc = g.doc;
+  t.form = g.form;
   t.path = g.path;
   t.name = g.name;
   t.dirty = g.dirty;
@@ -1361,6 +1396,8 @@ static void RestoreTab(int i)
   g_curTab = i;
   const TabDoc& t = g_tabs[i];
   g.doc = t.doc;
+  g.form = t.form;
+  g.formFocus = -1;
   g.path = t.path;
   g.name = t.name;
   g.dirty = t.dirty;
@@ -1392,7 +1429,14 @@ static void CloseTab(int i)
   // Take ownership of the document we are about to drop, then remove the entry
   // so nothing else can reach it.
   FPDF_DOCUMENT closed = g_tabs[i].doc;
+  FPDF_FORMHANDLE closedForm = g_tabs[i].form;
   g_tabs.erase(g_tabs.begin() + i);
+  // The form-fill environment must be torn down before the document it wraps.
+  if (closedForm)
+  {
+    FPDFDOC_ExitFormFillEnvironment(closedForm);
+    if (g.form == closedForm) { g.form = nullptr; g.formFocus = -1; }
+  }
 
   if (g_tabs.empty())
   {
@@ -1582,6 +1626,109 @@ static FPDF_DOCUMENT LoadWithPassword(const std::wstring& file, const wchar_t* p
   return FPDF_LoadDocument(Utf8(file).c_str(), nullptr);
 }
 
+// ---------------------------------------------------------------------------
+// AcroForm field filling
+// ---------------------------------------------------------------------------
+// PDFium drives interactive widgets through a per-document form-fill
+// environment. The callbacks below are the minimal set PDFium requires for
+// AcroForm (non-XFA) handling: invalidation, cursor, timers and the clock.
+// They act on the single document the app has focused, which is exactly the
+// document the environment is attached to.
+
+static void FormInvalidateCallback(FPDF_FORMFILLINFO* info, FPDF_PAGE page,
+                                   double left, double top, double right,
+                                   double bottom)
+{
+  (void)info; (void)page; (void)left; (void)top; (void)right; (void)bottom;
+  if (g.canvas) InvalidateRect(g.canvas, nullptr, FALSE);
+}
+
+static void FormSetCursorCallback(FPDF_FORMFILLINFO* info, int cursor_type)
+{
+  (void)info;
+  LPCWSTR name = IDC_ARROW;
+  switch (cursor_type)
+  {
+    case FXCT_ARROW:  name = IDC_ARROW;  break;
+    case FXCT_NESW:   name = IDC_SIZENESW; break;
+    case FXCT_NWSE:   name = IDC_SIZENWSE; break;
+    case FXCT_VBEAM:  name = IDC_IBEAM;  break;
+    case FXCT_HBEAM:  name = IDC_SIZEWE; break;
+    case FXCT_HAND:   name = IDC_HAND;   break;
+    default:          name = IDC_ARROW;  break;
+  }
+  SetCursor(LoadCursorW(nullptr, name));
+}
+
+static int FormSetTimerCallback(FPDF_FORMFILLINFO* info, int elapse,
+                                TimerCallback func)
+{
+  (void)info;
+  return (int)SetTimer(g.frame, (UINT_PTR)func, (UINT)elapse, nullptr);
+}
+
+static void FormKillTimerCallback(FPDF_FORMFILLINFO* info, int id)
+{
+  (void)info;
+  if (g.frame) KillTimer(g.frame, (UINT_PTR)id);
+}
+
+static FPDF_SYSTEMTIME FormGetLocalTimeCallback(FPDF_FORMFILLINFO* info)
+{
+  (void)info;
+  SYSTEMTIME st;
+  GetLocalTime(&st);
+  FPDF_SYSTEMTIME out{};
+  out.wYear = st.wYear;
+  out.wMonth = st.wMonth;
+  out.wDayOfWeek = st.wDayOfWeek;
+  out.wDay = st.wDay;
+  out.wHour = st.wHour;
+  out.wMinute = st.wMinute;
+  out.wSecond = st.wSecond;
+  out.wMilliseconds = st.wMilliseconds;
+  return out;
+}
+
+// (Re)build the form-fill environment for `d`. Any previous environment for the
+// live document is torn down first. The callback struct is static because PDFium
+// keeps the pointer for the life of the environment.
+static void InitFormEnv(FPDF_DOCUMENT d)
+{
+  static FPDF_FORMFILLINFO s_info{};
+  s_info.version = 1;
+  s_info.xfa_disabled = 0;
+  s_info.FFI_Invalidate = FormInvalidateCallback;
+  s_info.FFI_SetCursor = FormSetCursorCallback;
+  s_info.FFI_SetTimer = FormSetTimerCallback;
+  s_info.FFI_KillTimer = FormKillTimerCallback;
+  s_info.FFI_GetLocalTime = FormGetLocalTimeCallback;
+  if (!d)
+  {
+    if (g.form) { FPDFDOC_ExitFormFillEnvironment(g.form); g.form = nullptr; }
+    g.formFocus = -1;
+    return;
+  }
+  if (g.form && g.doc == d) return;   // already attached
+  if (g.form) { FPDFDOC_ExitFormFillEnvironment(g.form); }
+  g.form = FPDFDOC_InitFormFillEnvironment(d, &s_info);
+  g.formFocus = -1;
+  if (g.form)
+  {
+    // A soft blue tint over editable fields, as readers conventionally show.
+    FPDF_SetFormFieldHighlightColor(g.form, FPDF_FORMFIELD_UNKNOWN, 0x00B0E0FF);
+    FPDF_SetFormFieldHighlightAlpha(g.form, 40);
+  }
+}
+
+// A page must be announced to the form-fill module before its widgets accept
+// mouse/keyboard input; PDFium marks the page view valid here. Without it
+// hit-testing works but typing is silently rejected.
+static void FormEnsurePage(FPDF_PAGE p)
+{
+  if (g.form && p) FORM_OnAfterLoadPage(p, g.form);
+}
+
 static void LoadDoc(const std::wstring& file)
 {
   FPDF_DOCUMENT d = LoadWithPassword(file, nullptr);
@@ -1618,8 +1765,10 @@ static void LoadDoc(const std::wstring& file)
   g.name = (p == std::wstring::npos) ? file : file.substr(p + 1);
   g.undo.clear();
   g.redo.clear();
+  InitFormEnv(d);
   TabDoc nd;
   nd.doc = d;
+  nd.form = g.form;
   nd.path = g.path;
   nd.name = g.name;
   nd.pageCount = FPDF_GetPageCount(d);
@@ -1649,8 +1798,10 @@ static void NewDoc()
   g.dirty = false;
   g.undo.clear();
   g.redo.clear();
+  InitFormEnv(g.doc);
   TabDoc nd;
   nd.doc = g.doc;
+  nd.form = g.form;
   nd.pageCount = FPDF_GetPageCount(g.doc);
   g.pageCount = nd.pageCount;
   g.selected = 0;
@@ -1665,6 +1816,59 @@ static void NewDoc()
   InvalidateRect(g.thumbs, nullptr, TRUE);
   RefreshTabBar();
   SetFocus(g.frame);
+}
+
+// Path of help.pdf, which ships next to the executable. Returns an empty string
+// when the module path cannot be determined.
+static std::wstring HelpGuidePath()
+{
+  std::wstring exe(MAX_PATH, L'\0');
+  DWORD n = GetModuleFileNameW(nullptr, &exe[0], (DWORD)exe.size());
+  if (n == 0 || n >= exe.size()) return std::wstring();
+  exe.resize(n);
+  const size_t slash = exe.find_last_of(L"\\/");
+  if (slash == std::wstring::npos) return std::wstring();
+  return exe.substr(0, slash + 1) + L"help.pdf";
+}
+
+// Help > User Guide (F1): open the bundled help.pdf as a document. When the
+// file is missing (e.g. a loose copy of the exe) say so instead of failing
+// silently.
+static void OpenHelpGuide()
+{
+  const std::wstring help = HelpGuidePath();
+  if (help.empty() || GetFileAttributesW(help.c_str()) == INVALID_FILE_ATTRIBUTES)
+  {
+    MessageBoxW(g.frame,
+                L"The user guide (help.pdf) was not found next to the\n"
+                L"application. It ships with the portable package.",
+                L"Stitchup", MB_OK | MB_ICONINFORMATION);
+    return;
+  }
+  LoadDoc(help);
+}
+
+// First run: show the guide once so new users land on the feature tour. A
+// registry flag records that it has been shown.
+static void MaybeOpenHelpOnFirstRun()
+{
+  HKEY key = nullptr;
+  if (RegCreateKeyExW(HKEY_CURRENT_USER, L"Software\\StitchupPDFEditor", 0,
+                      nullptr, 0, KEY_QUERY_VALUE | KEY_SET_VALUE, nullptr,
+                      &key, nullptr) != ERROR_SUCCESS)
+    return;
+  DWORD shown = 0, sz = sizeof(shown);
+  const bool seen = RegQueryValueExW(key, L"HelpShown", nullptr, nullptr,
+                                     (LPBYTE)&shown, &sz) == ERROR_SUCCESS;
+  if (!seen)
+  {
+    DWORD one = 1;
+    RegSetValueExW(key, L"HelpShown", 0, REG_DWORD, (const BYTE*)&one, sizeof(one));
+    RegCloseKey(key);
+    OpenHelpGuide();
+    return;
+  }
+  RegCloseKey(key);
 }
 
 static bool DocToFile(FPDF_DOCUMENT d, const std::wstring& target)
@@ -3315,6 +3519,144 @@ static void WatermarkCurrentDoc()
 }
 
 // ---------------------------------------------------------------------------
+// Settings dialog (File > Settings...)
+// ---------------------------------------------------------------------------
+// Only the crash-recovery snapshot interval is configurable today. The chosen
+// value is stored in the registry and applied immediately (0 = Off).
+static const int kRecoverChoices[] = {0, 30, 60, 300};   // Off / 30s / 1min / 5min
+
+struct SetCtx
+{
+  HWND combo = nullptr;
+  bool ok = false;
+  int sel = 1;   // index into kRecoverChoices; default 30s
+};
+
+static LRESULT CALLBACK SetProc(HWND h, UINT m, WPARAM w, LPARAM l)
+{
+  switch (m)
+  {
+    case WM_CREATE:
+    {
+      SetCtx* ctx = reinterpret_cast<SetCtx*>(
+        reinterpret_cast<CREATESTRUCTW*>(l)->lpCreateParams);
+      SetWindowLongPtrW(h, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(ctx));
+      CreateWindowExW(0, L"STATIC", L"Crash recovery snapshots:",
+                      WS_CHILD | WS_VISIBLE, 16, 16, 280, 16, h, nullptr,
+                      g.inst, nullptr);
+      ctx->combo = CreateWindowExW(0, L"COMBOBOX", L"",
+                                   WS_CHILD | WS_VISIBLE | WS_TABSTOP | CBS_DROPDOWNLIST,
+                                   16, 36, 200, 160, h, nullptr, g.inst, nullptr);
+      SendMessageW(ctx->combo, CB_ADDSTRING, 0, (LPARAM)L"Off");
+      SendMessageW(ctx->combo, CB_ADDSTRING, 0, (LPARAM)L"Every 30 seconds");
+      SendMessageW(ctx->combo, CB_ADDSTRING, 0, (LPARAM)L"Every 1 minute");
+      SendMessageW(ctx->combo, CB_ADDSTRING, 0, (LPARAM)L"Every 5 minutes");
+      SendMessageW(ctx->combo, CB_SETCURSEL, ctx->sel, 0);
+      CreateWindowExW(0, L"STATIC",
+                      L"Snapshots are written to a private recovery folder and\n"
+                      L"never overwrite your file. They are only offered back\n"
+                      L"after a crash; saving or closing normally discards them.",
+                      WS_CHILD | WS_VISIBLE, 16, 66, 320, 52, h, nullptr,
+                      g.inst, nullptr);
+      CreateWindowExW(0, L"BUTTON", L"Ok",
+                      WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_DEFPUSHBUTTON,
+                      180, 126, 74, 28, h, (HMENU)1, g.inst, nullptr);
+      CreateWindowExW(0, L"BUTTON", L"Cancel",
+                      WS_CHILD | WS_VISIBLE | WS_TABSTOP,
+                      262, 126, 74, 28, h, (HMENU)2, g.inst, nullptr);
+      SetFocus(ctx->combo);
+      return 0;
+    }
+    case WM_COMMAND:
+      if (LOWORD(w) == 1 || LOWORD(w) == 2)
+      {
+        SetCtx* ctx = reinterpret_cast<SetCtx*>(
+          GetWindowLongPtrW(h, GWLP_USERDATA));
+        if (ctx)
+        {
+          if (LOWORD(w) == 1)
+          {
+            ctx->sel = (int)SendMessageW(ctx->combo, CB_GETCURSEL, 0, 0);
+            if (ctx->sel < 0 || ctx->sel > 3) ctx->sel = 1;
+          }
+          ctx->ok = (LOWORD(w) == 1);
+        }
+        DestroyWindow(h);
+        return 0;
+      }
+      break;
+    case WM_CLOSE:
+    {
+      SetCtx* ctx = reinterpret_cast<SetCtx*>(
+        GetWindowLongPtrW(h, GWLP_USERDATA));
+      if (ctx) ctx->ok = false;
+      DestroyWindow(h);
+      return 0;
+    }
+    case WM_CTLCOLORSTATIC:
+      return (LRESULT)(HBRUSH)(COLOR_BTNFACE + 1);
+  }
+  return DefWindowProcW(h, m, w, l);
+}
+
+static void SettingsDialog()
+{
+  const wchar_t cls[] = L"SKSetWnd";
+  static bool reg = false;
+  if (!reg)
+  {
+    WNDCLASSEXW wc{};
+    wc.cbSize = sizeof(wc);
+    wc.lpfnWndProc = SetProc;
+    wc.hInstance = g.inst;
+    wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+    wc.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
+    wc.lpszClassName = cls;
+    RegisterClassExW(&wc);
+    reg = true;
+  }
+  SetCtx ctx;
+  // Seed the combo from the current preference (fall back to 30 s).
+  ctx.sel = 1;
+  for (int i = 0; i < 4; ++i)
+    if (kRecoverChoices[i] == g_recoverSecs) ctx.sel = i;
+  HWND hw = CreateWindowExW(WS_EX_DLGMODALFRAME, cls, L"Settings",
+                            WS_POPUP | WS_CAPTION | WS_SYSMENU,
+                            CW_USEDEFAULT, CW_USEDEFAULT, 372, 206,
+                            g.frame, nullptr, g.inst, &ctx);
+  if (!hw) return;
+  RECT fr, rc;
+  GetWindowRect(g.frame, &fr);
+  GetWindowRect(hw, &rc);
+  SetWindowPos(hw, nullptr,
+               fr.left + (fr.right - fr.left - (rc.right - rc.left)) / 2,
+               fr.top + (fr.bottom - fr.top - (rc.bottom - rc.top)) / 2,
+               0, 0, SWP_NOSIZE | SWP_NOZORDER);
+  ShowWindow(hw, SW_SHOW);
+  UpdateWindow(hw);
+  HWND owner = g.frame;
+  EnableWindow(owner, FALSE);
+  MSG msg;
+  while (IsWindow(hw))
+  {
+    const BOOL r = GetMessageW(&msg, nullptr, 0, 0);
+    if (r <= 0) break;
+    if (!IsDialogMessageW(hw, &msg))
+    {
+      TranslateMessage(&msg);
+      DispatchMessageW(&msg);
+    }
+  }
+  EnableWindow(owner, TRUE);
+  SetActiveWindow(owner);
+  SetFocus(owner);
+  if (!ctx.ok) return;
+  g_recoverSecs = kRecoverChoices[ctx.sel];
+  PersistRecoveryPref();
+  ApplyRecoveryInterval();
+}
+
+// ---------------------------------------------------------------------------
 // PDF outline (bookmark) writer
 // ---------------------------------------------------------------------------
 // pdfium exposes no API for creating outlines, so user bookmarks are appended to
@@ -4875,17 +5217,20 @@ static void ReloadCurrentInPlace(const std::wstring& target)
 {
   FPDF_DOCUMENT d = LoadWithPassword(target, nullptr);
   if (!d) return;
+  if (g.form) { FPDFDOC_ExitFormFillEnvironment(g.form); g.form = nullptr; g.formFocus = -1; }
   if (g.doc) FPDF_CloseDocument(g.doc);
   g.doc = d;
   g.path = target;
   size_t p = target.find_last_of(L"\\/");
   g.name = (p == std::wstring::npos) ? target : target.substr(p + 1);
   g.pageCount = FPDF_GetPageCount(d);
+  InitFormEnv(d);
   if (g.selected >= g.pageCount) g.selected = g.pageCount > 0 ? g.pageCount - 1 : 0;
   if (g_curTab >= 0 && g_curTab < (int)g_tabs.size())
   {
     TabDoc& t = g_tabs[g_curTab];
     t.doc = d;
+    t.form = g.form;
     t.path = g.path;
     t.name = g.name;
     t.pageCount = g.pageCount;
@@ -4942,7 +5287,6 @@ static void SaveInPlace()
 // self-test, which returns before the message loop starts.
 // ---------------------------------------------------------------------------
 static const UINT_PTR TIMER_AUTOSAVE = 0xA5u;
-static const UINT kAutoSaveMs = 30000u;   // snapshot cadence
 
 static std::wstring RecoveryDir()
 {
@@ -9339,6 +9683,25 @@ static void AddUserBookmark(int page, bool atView)
   }
 }
 
+// Convert a canvas-client point to PDF user space for `hi.page`. PDF y grows
+// upward from the page bottom, hence the flip; `s` is screen px per point.
+static void CanvasPtToPdf(const HitInfo& hi, POINT pt, double& px, double& py)
+{
+  const double s = g.zoom;
+  px = (pt.x - hi.x) / s;
+  py = PageH(hi.page) - (pt.y - hi.y) / s;
+}
+
+// Current keyboard/mouse modifier mask in FWL_* form for the form-fill API.
+static int FormModifier()
+{
+  int m = 0;
+  if (GetKeyState(VK_SHIFT) & 0x8000) m |= FWL_EVENTFLAG_ShiftKey;
+  if (GetKeyState(VK_CONTROL) & 0x8000) m |= FWL_EVENTFLAG_ControlKey;
+  if (GetKeyState(VK_MENU) & 0x8000) m |= FWL_EVENTFLAG_AltKey;
+  return m;
+}
+
 static LRESULT CALLBACK CanvasProc(HWND hw, UINT msg, WPARAM wp, LPARAM lp)
 {
   switch (msg)
@@ -9434,6 +9797,27 @@ static LRESULT CALLBACK CanvasProc(HWND hw, UINT msg, WPARAM wp, LPARAM lp)
           FPDF_PAGE page = FPDF_LoadPage(g.doc, hi.page);
           if (page)
           {
+            // Form widgets advertise their own cursor: text fields want an
+            // I-beam, others (buttons, checkboxes) a pointing hand.
+            if (g.form)
+            {
+              const double s = g.zoom;
+              const float ph = PageH(hi.page);
+              const double px = (cur.x - hi.x) / s;
+              const double py = ph - (cur.y - hi.y) / s;
+              const int ftype = FPDFPage_HasFormFieldAtPoint(g.form, page, px, py);
+              if (ftype >= 0)
+              {
+                LPCWSTR idc = IDC_HAND;
+                if (ftype == FPDF_FORMFIELD_TEXTFIELD ||
+                    ftype == FPDF_FORMFIELD_COMBOBOX ||
+                    ftype == FPDF_FORMFIELD_LISTBOX)
+                  idc = IDC_IBEAM;
+                SetCursor(LoadCursorW(nullptr, idc));
+                FPDF_ClosePage(page);
+                return TRUE;
+              }
+            }
             FPDF_LINK link = nullptr;
             bool over = GetLinkAtDevice(page, cur, link);
             FPDF_ClosePage(page);
@@ -9485,6 +9869,30 @@ static LRESULT CALLBACK CanvasProc(HWND hw, UINT msg, WPARAM wp, LPARAM lp)
       HitInfo hi;
       if (HitPage(pt, hi))
       {
+        // AcroForm fields get first refusal: a click on a widget focuses it and
+        // starts PDFium's own editing, before the select/annotate tools see it.
+        if (g.form && !g.annTool && g.shapeTool == SHAPE_NONE && !g.toolSelect)
+        {
+          FPDF_PAGE fp = FPDF_LoadPage(g.doc, hi.page);
+          if (fp)
+          {
+            FormEnsurePage(fp);
+            double fx, fy;
+            CanvasPtToPdf(hi, pt, fx, fy);
+            if (FPDFPage_HasFormFieldAtPoint(g.form, fp, fx, fy) >= 0)
+            {
+              g.formFocus = hi.page;
+              FORM_OnLButtonDown(g.form, fp, FormModifier(), fx, fy);
+              FPDF_ClosePage(fp);
+              DropPageBitmapCaches(hi.page);
+              g.selected = hi.page;
+              InvalidateRect(hw, nullptr, FALSE);
+              InvalidateRect(g.status, nullptr, TRUE);
+              return 0;
+            }
+            FPDF_ClosePage(fp);
+          }
+        }
         if (g.annTool || g.shapeTool != SHAPE_NONE)
         {
           // Begin a drag-to-draw annotation / shape on the page under the
@@ -9599,6 +10007,31 @@ static LRESULT CALLBACK CanvasProc(HWND hw, UINT msg, WPARAM wp, LPARAM lp)
       POINT pt{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
       HitInfo hi;
       if (!HitPage(pt, hi)) return 0;
+      // A double-click inside a form field selects a word there instead of
+      // entering content-object text edit mode.
+      if (g.form && !g.annTool && g.shapeTool == SHAPE_NONE && !g.toolSelect)
+      {
+        FPDF_PAGE fp = FPDF_LoadPage(g.doc, hi.page);
+        if (fp)
+        {
+          FormEnsurePage(fp);
+          double fx, fy;
+          CanvasPtToPdf(hi, pt, fx, fy);
+          if (FPDFPage_HasFormFieldAtPoint(g.form, fp, fx, fy) >= 0)
+          {
+            g.formFocus = hi.page;
+            FORM_OnLButtonDown(g.form, fp, FormModifier(), fx, fy);
+            FORM_OnLButtonUp(g.form, fp, FormModifier(), fx, fy);
+            FORM_OnLButtonDoubleClick(g.form, fp, FormModifier(), fx, fy);
+            FPDF_ClosePage(fp);
+            DropPageBitmapCaches(hi.page);
+            g.selected = hi.page;
+            InvalidateRect(hw, nullptr, FALSE);
+            return 0;
+          }
+          FPDF_ClosePage(fp);
+        }
+      }
       const double s = g.zoom;
       const float ph = PageH(hi.page);
       double px = (pt.x - hi.x) / s;
@@ -9643,6 +10076,26 @@ static LRESULT CALLBACK CanvasProc(HWND hw, UINT msg, WPARAM wp, LPARAM lp)
     }
     case WM_MOUSEMOVE:
     {
+      // Track the pointer for a focused form field so the caret follows and any
+      // hover highlight updates. Only when a field actually holds focus.
+      if (g.form && g.formFocus >= 0 && !g.annDrag && !g.selDrag)
+      {
+        POINT pt{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
+        HitInfo hi;
+        if (HitPage(pt, hi) && hi.page == g.formFocus)
+        {
+          FPDF_PAGE fp = FPDF_LoadPage(g.doc, hi.page);
+          if (fp)
+          {
+            FormEnsurePage(fp);
+            double fx, fy;
+            CanvasPtToPdf(hi, pt, fx, fy);
+            FORM_OnMouseMove(g.form, fp, FormModifier(), fx, fy);
+            FPDF_ClosePage(fp);
+            return 0;
+          }
+        }
+      }
       if (g.annDrag && GetCapture() == hw)
       {
         g.annCur = POINT{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
@@ -9690,6 +10143,41 @@ static LRESULT CALLBACK CanvasProc(HWND hw, UINT msg, WPARAM wp, LPARAM lp)
     }
     case WM_LBUTTONUP:
     {
+      // Release a form field the button-down focused (drag-select inside a text
+      // field, checkbox/radio clicks, combobox pop-ups).
+      if (g.form && g.formFocus >= 0 && !g.annDrag && !g.selDrag)
+      {
+        POINT pt{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
+        HitInfo hi;
+        if (HitPage(pt, hi))
+        {
+          FPDF_PAGE fp = FPDF_LoadPage(g.doc, hi.page);
+          if (fp)
+          {
+            FormEnsurePage(fp);
+            double fx, fy;
+            CanvasPtToPdf(hi, pt, fx, fy);
+            FORM_OnLButtonUp(g.form, fp, FormModifier(), fx, fy);
+            // Clicking away from any widget drops focus (commits the edit);
+            // clicking inside one keeps it focused for continued typing.
+            if (FPDFPage_HasFormFieldAtPoint(g.form, fp, fx, fy) < 0)
+            {
+              FORM_ForceToKillFocus(g.form);
+              g.formFocus = -1;
+            }
+            else
+            {
+              FORM_OnFocus(g.form, fp, FormModifier(), fx, fy);
+            }
+            FPDF_ClosePage(fp);
+            DropPageBitmapCaches(hi.page);
+            g.dirty = true;
+            InvalidateRect(hw, nullptr, FALSE);
+            InvalidateRect(g.status, nullptr, TRUE);
+            return 0;
+          }
+        }
+      }
       if (g.annDrag)
       {
         ReleaseCapture();
@@ -11546,7 +12034,7 @@ static bool IsHandledCommand(int id)
     case ID_SEL_ALL: case ID_ROT_ALL: case ID_PRINT: case ID_PRINT_PREVIEW:
     case ID_PRINT_PDF:
     case ID_UNDO: case ID_REDO:
-    case ID_THEME: case ID_ABOUT:
+    case ID_THEME: case ID_ABOUT: case ID_HELP_GUIDE: case ID_SETTINGS:
       return true;
     default:
       // Contiguous radio blocks.
@@ -11689,7 +12177,6 @@ static void DoCommand(int id)
     case ID_PRINT_PDF:    PrintToPdf(); break;
     case ID_THEME:        ToggleTheme(); break;
     case ID_THEME_FIRST:
-    case ID_THEME_DARK:
     case ID_THEME_DARKBLUE:
     case ID_THEME_NAVY:
     case ID_THEME_BLUE:
@@ -11699,6 +12186,12 @@ static void DoCommand(int id)
     case ID_THEME_XP:
     case ID_THEME_MAC:
       SetTheme(id - ID_THEME_FIRST, true);
+      break;
+    case ID_SETTINGS:
+      SettingsDialog();
+      break;
+    case ID_HELP_GUIDE:
+      OpenHelpGuide();
       break;
     case ID_ABOUT:
       MessageBoxW(g.frame, kAboutText, L"About Stitchup",
@@ -11732,12 +12225,6 @@ static HMENU BuildMenu()
   addItem(file, ID_MERGE_APPEND, L"Merge PDFs...");
   addItem(file, ID_COMBINE_NEW, L"Combine into New...");
   addItem(file, ID_COMPRESS_PDF, L"Compress PDF...");
-  addItem(file, ID_EXPORT_TEXT, L"Export Text...");
-  addItem(file, ID_EXPORT_CSV, L"Export CSV...");
-  addItem(file, ID_EXPORT_IMG, L"Export Images...");
-  addItem(file, ID_EXPORT_RTF, L"Export RTF...");
-  addItem(file, ID_EXPORT_DOCX, L"Export DOCX...");
-  addItem(file, ID_EXPORT_ODT, L"Export ODT...");
   addItem(file, ID_WATERMARK, L"Watermark...");
   addItem(file, ID_SIGN, L"Sign Document...");
   addItem(file, ID_META, L"Document Properties...");
@@ -11747,8 +12234,19 @@ static HMENU BuildMenu()
   addItem(file, ID_PRINT_PREVIEW, L"Print Preview\tCtrl+Shift+P");
   addItem(file, ID_PRINT_PDF, L"Print to PDF...");
   AppendMenuW(file, MF_SEPARATOR, 0, nullptr);
+  addItem(file, ID_SETTINGS, L"Settings...");
   addItem(file, ID_EXIT, L"Exit");
   AppendMenuW(bar, MF_POPUP, (UINT_PTR)file, L"&File");
+
+  // Exports live in their own top-level menu so the File menu stays compact.
+  HMENU exp = CreatePopupMenu();
+  addItem(exp, ID_EXPORT_TEXT, L"Text...");
+  addItem(exp, ID_EXPORT_CSV, L"CSV...");
+  addItem(exp, ID_EXPORT_IMG, L"Images (JPG / PNG)...");
+  addItem(exp, ID_EXPORT_RTF, L"RTF...");
+  addItem(exp, ID_EXPORT_DOCX, L"DOCX...");
+  addItem(exp, ID_EXPORT_ODT, L"ODT...");
+  AppendMenuW(bar, MF_POPUP, (UINT_PTR)exp, L"E&xport");
 
   HMENU edit = CreatePopupMenu();
   addItem(edit, ID_UNDO, L"Undo\tCtrl+Z");
@@ -11821,6 +12319,8 @@ addItem(annotate, ID_ANN_INK, L"Pen");
   AppendMenuW(bar, MF_POPUP, (UINT_PTR)ribbon, L"Ta&bs");
 
   HMENU help = CreatePopupMenu();
+  addItem(help, ID_HELP_GUIDE, L"User Guide\tF1");
+  AppendMenuW(help, MF_SEPARATOR, 0, nullptr);
   addItem(help, ID_ABOUT, L"About");
   AppendMenuW(bar, MF_POPUP, (UINT_PTR)help, L"&Help");
   return bar;
@@ -12325,7 +12825,7 @@ static LRESULT CALLBACK FrameProc(HWND hw, UINT msg, WPARAM wp, LPARAM lp)
                                  nullptr);
       DragAcceptFiles(hw, TRUE);
       SetFocus(hw);
-      SetTimer(hw, TIMER_AUTOSAVE, kAutoSaveMs, nullptr);
+      ApplyRecoveryInterval();   // honours the saved Off / 30s / 1min / 5min
       break;
     }
     case WM_TIMER:
@@ -12408,6 +12908,31 @@ static LRESULT CALLBACK FrameProc(HWND hw, UINT msg, WPARAM wp, LPARAM lp)
       bool ctrl = (GetKeyState(VK_CONTROL) & 0x8000) != 0;
       bool shift = (GetKeyState(VK_SHIFT) & 0x8000) != 0;
       int vk = (int)wp;
+      // A focused AcroForm field swallows keystrokes (its own caret/undo/edit
+      // model runs inside PDFium). Escape drops focus; the rest are forwarded.
+      if (g.form && g.formFocus >= 0 && g.formFocus < g.pageCount && !g.sel.textEditing)
+      {
+        FPDF_PAGE fp = FPDF_LoadPage(g.doc, g.formFocus);
+        if (fp)
+        {
+          FormEnsurePage(fp);
+          if (vk == VK_ESCAPE)
+          {
+            const int pg = g.formFocus;
+            FORM_ForceToKillFocus(g.form);
+            g.formFocus = -1;
+            FPDF_ClosePage(fp);
+            DropPageBitmapCaches(pg);
+            if (g.canvas) InvalidateRect(g.canvas, nullptr, FALSE);
+            return 0;
+          }
+          FORM_OnKeyDown(g.form, fp, vk, FormModifier());
+          FPDF_ClosePage(fp);
+          DropPageBitmapCaches(g.formFocus);
+          if (g.canvas) InvalidateRect(g.canvas, nullptr, TRUE);
+          return 0;
+        }
+      }
       if (g.sel.textEditing)
       {
         const int n = (int)g.sel.textEditBuf.size();
@@ -12499,6 +13024,7 @@ static LRESULT CALLBACK FrameProc(HWND hw, UINT msg, WPARAM wp, LPARAM lp)
       {
         switch (vk)
         {
+          case VK_F1: DoCommand(ID_HELP_GUIDE); return 0;
           case VK_F3: DoCommand(shift ? ID_FIND_PREV : ID_FIND_NEXT); return 0;
           case VK_F5: DoCommand(ID_SPREAD); return 0;
           case VK_F8: DoCommand(ID_SIDEBAR); return 0;
@@ -12510,6 +13036,22 @@ static LRESULT CALLBACK FrameProc(HWND hw, UINT msg, WPARAM wp, LPARAM lp)
     }
     case WM_CHAR:
     {
+      // A focused form field receives the typed character (PDFium builds the
+      // text, handles the caret and fires value changes).
+      if (g.form && g.formFocus >= 0 && g.formFocus < g.pageCount && !g.sel.textEditing)
+      {
+        FPDF_PAGE fp = FPDF_LoadPage(g.doc, g.formFocus);
+        if (fp)
+        {
+          FormEnsurePage(fp);
+          FORM_OnChar(g.form, fp, (int)wp, FormModifier());
+          FPDF_ClosePage(fp);
+          DropPageBitmapCaches(g.formFocus);
+          g.dirty = true;
+          if (g.canvas) InvalidateRect(g.canvas, nullptr, TRUE);
+          return 0;
+        }
+      }
       // Live in-place text editing: printable characters append to the buffer.
       if (g.sel.textEditing)
       {
@@ -16573,6 +17115,165 @@ static bool DemoMode(const std::wstring& outPath, int pages)
   return true;
 }
 
+// Wrap one logical paragraph to `wrapW` pt at `pt` size, returning the
+// space-broken lines (no embedded newlines here; the caller joins them).
+static std::vector<std::wstring> HelpWrap(const std::wstring& text, double pt,
+                                          double wrapW)
+{
+  std::vector<std::wstring> out;
+  const double perChar = pt * 0.5;  // Helvetica average advance, good enough
+  const size_t maxChars = wrapW > 0 ? (size_t)(wrapW / perChar) : text.size();
+  std::wstring rest = text;
+  while (rest.size() > maxChars)
+  {
+    size_t cut = rest.rfind(L' ', maxChars);
+    if (cut == std::wstring::npos || cut < 8) cut = maxChars;
+    out.push_back(rest.substr(0, cut));
+    rest = rest.substr(cut);
+    while (!rest.empty() && rest[0] == L' ') rest.erase(0, 1);
+  }
+  out.push_back(rest);
+  return out;
+}
+
+// Draw a run of logical lines from (x, yTop) downward. Each logical line is
+// emitted as ONE text object with internal "\r\n" breaks so PDFium applies its
+// own font-metric line spacing; lines are separated by `gap` extra points.
+// Returns the y after the last line (the baseline of the next free row).
+static double HelpAddText(FPDF_DOCUMENT doc, FPDF_PAGE p,
+                          const std::vector<std::wstring>& lines,
+                          double x, double yTop, double gap, double wrapW,
+                          FPDF_FONT font, bool bold)
+{
+  const double pt = bold ? 11.5 : 10.0;
+  double y = yTop;
+  for (const std::wstring& line : lines)
+  {
+    std::vector<std::wstring> wrapped = HelpWrap(line, pt, wrapW);
+    std::wstring joined;
+    for (size_t i = 0; i < wrapped.size(); ++i)
+    {
+      if (i) joined += L"\r\n";
+      joined += wrapped[i];
+    }
+    FPDF_PAGEOBJECT o = FPDFPageObj_CreateTextObj(doc, font, (float)pt);
+    if (o)
+    {
+      FPDFText_SetText(o, (FPDF_WIDESTRING)joined.c_str());
+      FPDFPageObj_Transform(o, 1, 0, 0, 1, x, y);
+      FPDFPage_InsertObject(p, o);
+    }
+    // Advance by PDFium's line height for each wrapped row plus the row gap.
+    y -= wrapped.size() * pt * 1.2 + gap;
+  }
+  return y;
+}
+
+// Generate help.pdf: a multi-page user guide describing the editor.
+static bool HelpMode(const std::wstring& outPath)
+{
+  FPDF_InitLibrary();
+  FPDF_DOCUMENT d = FPDF_CreateNewDocument();
+  if (!d) return false;
+  FPDF_FONT font = FPDFText_LoadStandardFont(d, "Helvetica");
+  FPDF_FONT bold = FPDFText_LoadStandardFont(d, "Helvetica-Bold");
+
+  struct Section { const wchar_t* title; std::vector<std::wstring> lines; };
+  std::vector<std::wstring> body;
+  auto H = [&](const wchar_t* s){ body.push_back(std::wstring(L"\x01") + s); };
+
+  H(L"1. Getting started");
+  body.push_back(L"Open a PDF with File > Open (Ctrl+O), or drag a file onto the window.");
+  body.push_back(L"Pages appear as thumbnails in the left pane; click one to jump to it.");
+  body.push_back(L"Use the View menu or Ctrl+Mouse wheel to zoom; two-page spread is F5.");
+  H(L"2. Pages");
+  body.push_back(L"Pages menu: insert, delete (Del), rotate (Ctrl+R / Ctrl+Shift+R),");
+  body.push_back(L"reorder by dragging thumbnails, extract, split, crop, and merge.");
+  body.push_back(L"Select multiple pages by Ctrl-clicking thumbnails, then act on the set.");
+  body.push_back(L"Move pages between open documents by dragging a thumbnail to another tab.");
+  H(L"3. Annotate");
+  body.push_back(L"The Annotate tab adds highlights, underlines, sticky notes, freehand ink,");
+  body.push_back(L"shapes (rectangle, ellipse, arrow, line) and stamps. Click for a default");
+  body.push_back(L"size or drag to size an annotation. Stamps are also under Security.");
+  H(L"4. Content");
+  body.push_back(L"Select / Move lets you pick a content object and drag it. Double-click a");
+  body.push_back(L"text run to edit it in place; the Content tab hosts the font family, size,");
+  body.push_back(L"and the foreground/background colour swatches.");
+  H(L"5. Forms (AcroForm)");
+  body.push_back(L"Click a text field and type; click checkboxes and radios to toggle them.");
+  body.push_back(L"Filled values are saved with the document. Tab moves between fields.");
+  H(L"6. Security and signing");
+  body.push_back(L"File > Sign Document adds a digital signature (Windows certificate store).");
+  body.push_back(L"File > Save As Encrypted sets a password. Security tab hosts stamps/watermarks.");
+  H(L"7. Export");
+  body.push_back(L"The Export menu writes Text, CSV, Images (JPG/PNG), RTF, DOCX and ODT.");
+  body.push_back(L"Exports cover the whole document or the current selection.");
+  H(L"8. Printing and properties");
+  body.push_back(L"File > Print (Ctrl+P), Print Preview, and Print to PDF via any printer.");
+  body.push_back(L"File > Document Properties edits Title, Author, Subject and Keywords.");
+  H(L"9. Attachments");
+  body.push_back(L"File > Attachments lists files embedded inside the PDF and lets you open");
+  body.push_back(L"or save them. (This is not email; it views the PDF's own attachments.)");
+  H(L"10. Tabs, help and shortcuts");
+  body.push_back(L"Each document opens in a tab (Ctrl+T new, Ctrl+Tab switch, Ctrl+W close).");
+  body.push_back(L"Reopen unsaved work after a crash from the recovery prompt on launch.");
+  body.push_back(L"Help > User Guide (F1) reopens this guide. Help > About shows shortcuts.");
+
+  // Lay the guide out over pages, ~44 lines per page at 10pt.
+  const int perPage = 34;
+  int pageCount = (int)((body.size() + perPage - 1) / perPage);
+  if (pageCount < 1) pageCount = 1;
+  for (int pg = 0; pg < pageCount; ++pg)
+  {
+    FPDF_PAGE p = FPDFPage_New(d, pg, 612.0, 792.0);
+    if (!p) continue;
+    double y = 742.0;
+    if (pg == 0)
+    {
+      FPDF_PAGEOBJECT t = FPDFPageObj_CreateTextObj(d, bold, 20.0f);
+      if (t) { FPDFText_SetText(t, (FPDF_WIDESTRING)L"Stitchup PDF Editor - User Guide");
+               FPDFPageObj_Transform(t, 1, 0, 0, 1, 54, y); FPDFPage_InsertObject(p, t); }
+      y -= 30.0;
+      FPDF_PAGEOBJECT s = FPDFPageObj_CreateTextObj(d, font, 11.0f);
+      if (s) { FPDFText_SetText(s, (FPDF_WIDESTRING)L"This guide ships with the app and opens on first run (Help > User Guide, F1).");
+               FPDFPageObj_Transform(s, 1, 0, 0, 1, 54, y); FPDFPage_InsertObject(p, s); }
+      y -= 24.0;
+    }
+    const int from = pg * perPage;
+    const int to = std::min((int)body.size(), from + perPage);
+    for (int i = from; i < to; ++i)
+    {
+      const std::wstring& ln = body[i];
+      bool head = !ln.empty() && ln[0] == L'\x01';
+      std::vector<std::wstring> one{ head ? ln.substr(1) : ln };
+      if (head) y -= 8.0;
+      y = HelpAddText(d, p, one, 54.0, y, head ? 6.0 : 2.0, 500.0,
+                      head ? bold : font, head);
+    }
+    FPDFPage_GenerateContent(p);
+    FPDF_ClosePage(p);
+  }
+
+  FileWriter fw{};
+  fw.base.version = 1;
+  fw.base.WriteBlock = [](FPDF_FILEWRITE* self, const void* data, unsigned long size) -> int
+  {
+    FileWriter* f = reinterpret_cast<FileWriter*>(self);
+    const unsigned char* p = static_cast<const unsigned char*>(data);
+    f->buf.insert(f->buf.end(), p, p + size);
+    return 1;
+  };
+  bool ok = FPDF_SaveAsCopy(d, &fw.base, FPDF_NO_INCREMENTAL);
+  FPDF_CloseDocument(d);
+  FPDF_DestroyLibrary();
+  if (!ok) return false;
+  FILE* fp = nullptr;
+  if (_wfopen_s(&fp, outPath.c_str(), L"wb") != 0) return false;
+  bool written = fwrite(fw.buf.data(), 1, fw.buf.size(), fp) == fw.buf.size();
+  fclose(fp);
+  return written;
+}
+
 static std::vector<std::wstring> GetArgs()
 {
   int n = 0;
@@ -16863,6 +17564,12 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int)
     bool ok = DemoMode(args[2], pages);
     return ok ? 0 : 1;
   }
+  if (args.size() >= 2 && args[1] == L"--make-help")
+  {
+    if (args.size() < 3) return 2;
+    bool ok = HelpMode(args[2]);
+    return ok ? 0 : 1;
+  }
   if (HasArg("--self-test"))
   {
     std::wstring cwd(MAX_PATH, L'\0');
@@ -16884,6 +17591,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int)
   InitCommonControlsEx(&iccex);
 
   ApplyInitialThemePref();
+  LoadRecoveryPref();
 
   HWND hidden = CreateWindowExW(0, L"STATIC", L"", WS_POPUP, 0, 0, 0, 0,
                                 nullptr, nullptr, inst, nullptr);
@@ -16995,6 +17703,10 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int)
 
   // Offer to reopen anything the previous run left unsaved (crash recovery).
   RecoverLastSession();
+
+  // On the very first launch show the bundled guide so new users see a live
+  // demo document. Skipped when a file was given on the command line.
+  if (openFile.empty()) MaybeOpenHelpOnFirstRun();
 
   MSG msg{};
   while (GetMessageW(&msg, nullptr, 0, 0) > 0)
