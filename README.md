@@ -111,7 +111,16 @@ Produces `dist\Stitchup.exe` + `dist\pdfium.dll` + `dist\help.pdf`.
   Colour Scheme submenu (View > Colour Scheme) with Light Grey, Dark Blue,
   Darker Navy, Blue, Pastel, High Contrast (Dark), High Contrast (Light),
   Pastel 2 and Pastel 3; `Ctrl+D` flips between Light Grey and Dark Blue, and
-  the choice is remembered between runs
+  the choice is remembered between runs. Documents open fit-to-width, and a
+  Fit Page / Fit Width view keeps filling the canvas as the window is resized or
+  the navigation pane (F8) is toggled. `Ctrl`+wheel zooms about the top of the
+  view and the scroll offsets stay clamped to the document, so the page can never
+  drift off-screen where it cannot be recovered
+- Large documents stay responsive: page sizes are memoised, so the layout pass
+  that walks every page on each paint and scroll no longer re-opens each page
+  through PDFium (a 400-page document measured ~9× faster layout)
+- The ribbon Save button is tinted red while the document has unsaved changes and
+  returns to normal once saved - a visible prompt with no modal dialog
 - Modern flat UI: flat ribbon (hover/pressed states, accent brand strip,
   labelled group cards), Segoe UI text, embedded multi-size app icon (a
   parchment scroll with an inked quill), and nine selectable colour schemes
@@ -126,9 +135,9 @@ Produces `dist\Stitchup.exe` + `dist\pdfium.dll` + `dist\help.pdf`.
 - Export menu: Text, CSV, Images (JPG/PNG), RTF, DOCX and ODT exports live in
   their own top-level Export menu so the File menu stays compact
 - Settings (File > Settings...): choose how often crash-recovery snapshots are
-  taken (Off, 30 s, 1 min, 5 min); the choice is stored in the registry. Saving
-  your edits is always explicit - snapshots only feed the post-crash reopen
-  prompt and never overwrite the file
+  taken (Off, 30 s, 1 min, 5 min; **Off by default**); the choice is stored in the
+  registry. Saving your edits is always explicit - snapshots only feed the
+  post-crash reopen prompt and never overwrite the file
 - Bookmarks pane lists the PDF outline (nested); clicking a bookmark jumps to
   its page
 - Find (Edit > Find... / Find Next / Find Previous, `Ctrl+F` / `F3` /
@@ -157,7 +166,9 @@ Produces `dist\Stitchup.exe` + `dist\pdfium.dll` + `dist\help.pdf`.
   drag to move it, Ctrl+Del (or Menu > Delete Selected Object) to remove it,
   RecColor to recolor the fill, or Edit Text (double-click) to replace the text
   run; edits persist through Save and reload (4 object tests added). Ctrl+click
-  adds or removes objects from the selection, Ctrl+A (with the Select tool armed)
+  adds or removes objects from the selection, drag a rubber-band (marquee) box on
+  empty space to select every object it touches (hold Ctrl to add to the current
+  selection instead of replacing it), Ctrl+A (with the Select tool armed)
   selects every object on the page, and Delete / ReColor / the font controls then
   act on the whole set; dragging any selected object moves them together
 - Double-clicking a line of text enters edit mode on it: the run is selected and
@@ -229,7 +240,8 @@ project (github.com/bblanchon/pdfium-binaries). Non-GPL build.
   watermarks + encrypt-on-save + redaction + digital signatures + print-to-PDF +
   document properties + moving pages between open documents + page image export
   + RTF/DOCX/ODT text export + autosave/crash recovery + AcroForm field filling
-  + the bundled user guide are done. Rendering, page
+  + the bundled user guide + fit-to-width tracking, layout caching, marquee
+  object selection and the unsaved-changes Save tint are done. Rendering, page
   model, editing operations, ribbon
   navigation, the bookmarks pane, annotation creation/persistence, link
   navigation, link *creation* and page extract/split/crop are functional.

@@ -1,4 +1,4 @@
-# RESULTS - Project 027: Stitchup PDF Editor
+﻿# RESULTS - Project 027: Stitchup PDF Editor
 
 ## Goal
 
@@ -126,7 +126,7 @@ GUI verification (programmatic, window handles + messages):
   to the destination page (vertical scroll position went 0 -> 690 in one step);
   hovering a link region shows the hand cursor (IDC_HAND via WM_SETCURSOR).
 - Page management (Home > Pages group has Extract/Split/Auto-Crop buttons with
-  IDs 4030/4031/4032 — verified present): Extract opens the Save dialog for the
+  IDs 4030/4031/4032 â€” verified present): Extract opens the Save dialog for the
   current page; Split wrote `linked3 - split - page 1..3.pdf` (one 1-page file
   per page) from a 3-page document and confirmed the result in a message box;
   each output is a valid %PDF (page 1 carries its two link annotations).
@@ -290,21 +290,21 @@ Tiled placements; verified end-to-end through the saved file's content
 streams). Encrypt-on-save now done (File > Save As Encrypted writes a
 PDF revision 3 / 128-bit RC4 password-protected copy with user + optional
 owner passwords; verified end-to-end, including reopening the encrypted file
-against the bundled PDFium with the correct password). Phase C COMPLETE —
+against the bundled PDFium with the correct password). Phase C COMPLETE â€”
 no remaining feature milestones.
 Self-test 185/185. v0.8.1 released (private) with the post-v0.8.0 fixes:
 thumbnails render in step with the page list and scroll correctly, canvas and
 thumbnails repaint without flicker, the two-page spread fits the viewport, the
 Home/View/Tools tab strip is merged into the menu bar (Home / Tools / Sidebar
 top-level items between View and Help), and the app ships a new scroll-and-quill
-icon. User verdict pending — open `dist\Stitchup.exe file.pdf` and try
+icon. User verdict pending â€” open `dist\Stitchup.exe file.pdf` and try
 Home > Annotate, click any PDF link, Home > Pages (Extract / Split /
 Auto-Crop), File > Export Text / Export CSV / Watermark / Save As Encrypted,
 open a password-protected PDF, and the new view extras: File > New Tab (Ctrl+T),
 File > Close / Next / Previous Tab, View > Two-Page Spread (F5), View >
 Sidebar / Sidebar menu (F8), and the Home / Tools ribbon-switch menus.
 
-## Latest — v0.10.0: link creation (2026-10-01)
+## Latest â€” v0.10.0: link creation (2026-10-01)
 
 - The earlier roadmap note ("link *creation* needs a newer PDFium") was wrong:
   a hyperlink is a `/Link` annotation, and the bundled `chromium/8057` DLL
@@ -1084,11 +1084,11 @@ Self-test: 465 passed, 0 failed.
   of `<w:p>` paragraphs (one per line), with a `<w:br w:type="page"/>` separator
   between pages.
 - Built without any third-party ZIP or Office library: a hand-rolled, STORE-only
-  ZIP writer (`BuildZip` with `ZipCrc32`) packages three entries —
+  ZIP writer (`BuildZip` with `ZipCrc32`) packages three entries â€”
   `[Content_Types].xml`, `_rels/.rels` and `word/document.xml`. Text is
   XML-escaped and encoded as UTF-8 so non-ASCII content survives intact.
 - Verified end-to-end against `Test1.pdf`: opened with .NET `ZipArchive` (which
-  validates the CRC32 of every entry) — all three parts present, and each `.xml`
+  validates the CRC32 of every entry) â€” all three parts present, and each `.xml`
   part parses as well-formed XML. The extracted `word/document.xml` contained
   151 paragraphs and 4 page breaks (matching 5 pages). Probe removed.
 - Self-test unchanged at 465 (no new headless checks), exit 0.
@@ -1105,7 +1105,7 @@ Self-test: 465 passed, 0 failed.
 - Verified end-to-end against `Test1.pdf`: the first local file header is
   `mimetype`, method `0` (STORE), extra-length `0`, containing exactly
   `application/vnd.oasis.opendocument.text` (39 bytes uncompressed = 39 stored).
-  Opened with .NET `ZipArchive` (validates every CRC32) — both XML parts parse as
+  Opened with .NET `ZipArchive` (validates every CRC32) â€” both XML parts parse as
   well-formed; `content.xml` held 151 paragraphs and 4 page breaks (5 pages).
   Probe removed.
 - Self-test unchanged at 465 (no new headless checks), exit 0.
@@ -1133,7 +1133,7 @@ Self-test: 465 passed, 0 failed.
   Gestures in flight (thumbnail/object/annotation drag) skip the tick.
 - Startup `RecoverLastSession()` reads the manifest, loads each snapshot into
   memory (`FPDF_LoadMemDocument`) and unlinks it *before* PDFium opens it, then
-  reopens the work as dirty "… (recovered)" tabs whose `path` is the original, so
+  reopens the work as dirty "â€¦ (recovered)" tabs whose `path` is the original, so
   a later Ctrl+S writes back to the real file. Nothing is left file-locked.
 - `ClearRecovery()` runs after a successful save and on clean exit, so a normal
   shutdown never leaves a stale recovery prompt. Snapshots carry a per-process
@@ -1174,6 +1174,34 @@ Self-test: 465 passed, 0 failed.
   no overlap/crowding).
 - GitHub README screenshot added (`docs/screenshot.jpg`), README/release notes
   refreshed.
+- Self-test unchanged at 465 (no new headless checks), exit 0.
+
+Self-test: 465 passed, 0 failed.
+
+## v0.12.28 - Fit-to-width tracking, layout cache, marquee select, Save tint (2026-10-21)
+- Zoom/scroll recovery ("Ctrl+wheel sent the page far left and it could not be
+  recovered"): UpdateScrollbars() now clamps g.scrollX/g.scrollY to
+  [0, content - client] (forced to 0 when the content fits), the scroll-bar
+  handlers clamp to the real max, and Ctrl+wheel zoom resets X and keeps/clamps
+  Y. The page can no longer drift off-screen.
+- Fit-to-width tracking: opening a document fits it to the canvas width, and a
+  Fit Page / Fit Width view keeps filling the canvas as the window is resized
+  (WM_SIZE) or the navigation pane is toggled (F8), preserving the vertical
+  position. New g.fitWidth flag set by FitPage/FitWidth and cleared by a manual
+  ZoomTo.
+- Large-document speed: page sizes are memoised (g.pageSizeCache, cleared
+  whenever the page set changes via RefreshState). Previously PageW/PageH
+  called FPDF_LoadPage/FPDF_ClosePage on every page on every paint and
+  scroll. A standalone probe measured the per-paint layout walk ~9x faster
+  (400-page doc: 106.1 ms -> 11.7 ms for 200 walks). Probe removed.
+- Rubber-band (marquee) selection: with the Select tool armed, a drag on empty
+  space selects every content object its rectangle touches; Ctrl keeps the
+  existing selection and adds. Tracked in canvas pixels, converted to PDF space
+  on release; Esc/tool change cancels. Ctrl+click already toggles membership.
+- Save button tints red while the document has unsaved changes and returns to
+  normal once saved (new Btn.warn), no modal dialog.
+- Crash-recovery snapshot default changed to **Off** (registry RecoverSecs
+  default 0; Settings combo defaults to "Off").
 - Self-test unchanged at 465 (no new headless checks), exit 0.
 
 Self-test: 465 passed, 0 failed.

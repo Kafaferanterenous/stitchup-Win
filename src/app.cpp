@@ -226,6 +226,7 @@ struct Btn
   bool mirror = false;   // draw the glyph flipped (counter-clockwise arrows)
   bool swatch = false;   // paint a colour chip instead of an icon glyph
   COLORREF swColor = 0;  // chip colour when swatch is set
+  bool warn = false;     // unsaved-changes prompt: red-tinted glow
 };
 
 struct PageCache
@@ -306,6 +307,7 @@ struct App
   std::vector<UndoEntry> redo;   // undone edits, reapplied by Redo
   bool showSidebar = false;  // hidden until the user asks for it (View / F8)
   bool spread = false;  // two-page side-by-side layout
+  bool fitWidth = false; // zoom tracks the canvas width (Fit Page / Fit Width)
 
   struct GroupBox
   {
@@ -321,6 +323,10 @@ struct App
 
   std::map<int, PageCache> canvasCache;
   std::map<int, HBITMAP> thumbCache;
+  // Page dimensions in PDF points, keyed by page index. LoadPage/GetPageWidth is
+  // surprisingly costly, and LayoutPages needs every page's size on every paint
+  // and scroll, so sizes are memoised and cleared whenever the page set changes.
+  std::map<int, std::pair<float, float>> pageSizeCache;
 
   bool thumbDrag = false;
   int dragPage = -1;
@@ -364,6 +370,13 @@ struct App
   bool selDrag = false;
   bool selDragMoved = false;
   double dragLastX = 0, dragLastY = 0;
+  // Rubber-band selection (Select tool, pressed on empty space): the box is
+  // tracked in canvas-client pixels and every object it intersects is selected
+  // on release. Ctrl keeps the existing selection and adds to it.
+  bool marquee = false;
+  bool marqueeAdd = false;
+  int marqueePage = -1;
+  POINT marqueeStart{};
 
   // Drag-to-draw annotation placement. When annTool is set the next left-drag
   // on a page defines the annotation rectangle; annDrag is true between the
@@ -496,8 +509,9 @@ struct UiTheme
 static int g_themeId = THEME_LIGHT;
 static HMENU g_themeMenu = nullptr;   // "Colour Scheme" popup, for check marks
 // Crash-recovery snapshot interval in seconds; 0 disables snapshots entirely.
-// Persisted in the registry as "RecoverSecs" (File > Settings...).
-static int g_recoverSecs = 30;
+// Persisted in the registry as "RecoverSecs" (File > Settings...). Off by
+// default so no background writes happen unless the user asks for them.
+static int g_recoverSecs = 0;
 // Easter egg: one quip per run, shown in the middle of the title bar.
 static std::wstring g_capPhrase;
 
@@ -1018,21 +1032,27 @@ static void CheckLib()
 
 static int ZoomKey() { return (int)(g.zoom * 1000.0 + 0.5); }
 
-static float PageW(int i)
+struct PageSize { float w, h; };
+static PageSize& PageSizeOf(int i)
 {
+  auto it = g.pageSizeCache.find(i);
+  if (it != g.pageSizeCache.end()) return reinterpret_cast<PageSize&>(it->second);
   FPDF_PAGE p = FPDF_LoadPage(g.doc, i);
-  float w = p ? FPDF_GetPageWidthF(p) : 0.0f;
-  if (p) FPDF_ClosePage(p);
-  return w;
+  PageSize sz{0.0f, 0.0f};
+  if (p)
+  {
+    sz.w = FPDF_GetPageWidthF(p);
+    sz.h = FPDF_GetPageHeightF(p);
+    FPDF_ClosePage(p);
+  }
+  auto ins = g.pageSizeCache.emplace(i, std::make_pair(sz.w, sz.h));
+  return reinterpret_cast<PageSize&>(ins.first->second);
 }
 
-static float PageH(int i)
-{
-  FPDF_PAGE p = FPDF_LoadPage(g.doc, i);
-  float h = p ? FPDF_GetPageHeightF(p) : 0.0f;
-  if (p) FPDF_ClosePage(p);
-  return h;
-}
+static float PageW(int i) { return PageSizeOf(i).w; }
+static float PageH(int i) { return PageSizeOf(i).h; }
+
+static void ClearPageSizeCache() { g.pageSizeCache.clear(); }
 
 static double MaxPageW()
 {
@@ -1340,6 +1360,7 @@ static void CloseDoc()
   g.dirty = false;
   g.bmDirty = true;
   if (g.annDrag) { ReleaseCapture(); g.annDrag = false; }
+  if (g.marquee) { ReleaseCapture(); g.marquee = false; }
   g.annTool = 0;
   g.annPage = -1;
   g.findQuery.clear();
@@ -1504,6 +1525,25 @@ static void RefreshTabBar()
   InvalidateRect(g.tabbar, nullptr, TRUE);
 }
 
+// Red tint on the Save button while the document has unsaved changes, so the
+// prompt to save is visible without a modal. Called whenever g.dirty changes.
+static void RefreshDirtyIndicators()
+{
+  for (HWND h : g.ribbonBtns)
+  {
+    if (GetWindowLongPtrW(h, GWLP_ID) != ID_SAVE) continue;
+    Btn* b = reinterpret_cast<Btn*>(GetWindowLongPtrW(h, GWLP_USERDATA));
+    if (!b) continue;
+    const bool want = g.dirty;
+    if (b->warn != want)
+    {
+      b->warn = want;
+      b->swColor = want ? RGB(255, 224, 224) : 0;
+      InvalidateRect(h, nullptr, TRUE);
+    }
+  }
+}
+
 static void RefreshState()
 {
   SnapshotCurrentTab();
@@ -1515,8 +1555,10 @@ static void RefreshState()
     g_tabs[g_curTab].pageCount = g.pageCount;
   ClearCanvasCache();
   ClearThumbCache();
+  ClearPageSizeCache();
   s_thumbFollowed = -1;
   ResetThumbScroll();
+  RefreshDirtyIndicators();
   if (g.status) InvalidateRect(g.status, nullptr, TRUE);
 }
 
@@ -3616,8 +3658,8 @@ static void SettingsDialog()
     reg = true;
   }
   SetCtx ctx;
-  // Seed the combo from the current preference (fall back to 30 s).
-  ctx.sel = 1;
+  // Seed the combo from the current preference (default is Off).
+  ctx.sel = 0;
   for (int i = 0; i < 4; ++i)
     if (kRecoverChoices[i] == g_recoverSecs) ctx.sel = i;
   HWND hw = CreateWindowExW(WS_EX_DLGMODALFRAME, cls, L"Settings",
@@ -7340,19 +7382,29 @@ static void UpdateScrollbars()
   contentW = std::max(contentW, 24);
   contentH = std::max(contentH, 24);
 
+  // The layout already centres the pages inside the client area, so scrolling
+  // is only ever needed by the amount the content overflows. Clamp to
+  // [0, content - client] on each axis - using the scrollbar's nMax-1 left a
+  // stale offset behind when zooming out, which slid the page off to the left
+  // with no way back. When nothing overflows the offset is forced to 0.
+  const int maxScrollX = std::max(0, contentW - cw);
+  const int maxScrollY = std::max(0, contentH - ch);
+  if (g.scrollX < 0) g.scrollX = 0;
+  if (g.scrollY < 0) g.scrollY = 0;
+  if (g.scrollX > maxScrollX) g.scrollX = maxScrollX;
+  if (g.scrollY > maxScrollY) g.scrollY = maxScrollY;
+
   SCROLLINFO si{};
   si.cbSize = sizeof(si);
   si.fMask = SIF_RANGE | SIF_PAGE | SIF_POS;
   si.nMin = 0;
   si.nMax = std::max(cw, contentW);
   si.nPage = cw;
-  if (g.scrollX > si.nMax - 1) g.scrollX = si.nMax - 1;
   si.nPos = g.scrollX;
   SetScrollInfo(g.canvas, SB_HORZ, &si, TRUE);
 
   si.nMax = std::max(ch, contentH);
   si.nPage = ch;
-  if (g.scrollY > si.nMax - 1) g.scrollY = si.nMax - 1;
   si.nPos = g.scrollY;
   SetScrollInfo(g.canvas, SB_VERT, &si, TRUE);
   inUpdate = false;
@@ -7648,6 +7700,10 @@ static void HandleWheel(WPARAM wp, LPARAM lp)
     const double f = (d > 0) ? 1.25 : 0.8;
     if (f <= 0.0) return;
     g.zoom = std::max(0.1, std::min(8.0, g.zoom * f));
+    // The page is horizontally centred by the layout, so any horizontal offset
+    // from the previous zoom only shoves it off-screen; re-centre it. Vertical
+    // position is kept (clamped) so the reader stays near the same spot.
+    g.scrollX = 0;
     ClearCanvasCache();
     UpdateScrollbars();
     if (g.canvas) InvalidateRect(g.canvas, nullptr, TRUE);
@@ -8220,7 +8276,12 @@ static void RefreshSelBounds()
 static void SetToolSelect(bool on)
 {
   g.toolSelect = on;
-  if (!on) { g.sel.active = false; g.sel.objects.clear(); }
+  if (!on)
+  {
+    if (g.marquee) { ReleaseCapture(); g.marquee = false; }
+    g.sel.active = false;
+    g.sel.objects.clear();
+  }
   for (HWND h : g.ribbonBtns)
   {
     if (GetWindowLongPtrW(h, GWLP_ID) == ID_TOOL_SELECT)
@@ -8268,6 +8329,49 @@ static void SelectAllObjects()
   RefreshSelBounds();
   ClearCanvasCache();
   if (g.canvas) InvalidateRect(g.canvas, nullptr, TRUE);
+  if (g.status) InvalidateRect(g.status, nullptr, TRUE);
+  UpdateFontControls();
+  SyncColorControls();
+}
+
+// Rubber-band selection: select every painted object on `pi` whose bounds
+// intersect the PDF-space rectangle [x0,y0]-[x1,y1]. When `add` is true the
+// hits are added to the current set (Ctrl-drag); otherwise they replace it.
+static void SelectObjectsInRect(int pi, double x0, double y0, double x1, double y1,
+                                bool add)
+{
+  if (!g.doc || pi < 0 || pi >= g.pageCount) return;
+  if (x0 > x1) std::swap(x0, x1);
+  if (y0 > y1) std::swap(y0, y1);
+  std::vector<int> hits;
+  for (const PageObject& po : ListPageObjects(pi))
+  {
+    if (!po.isPainted()) continue;
+    // Rectangle overlap (touching counts as a hit).
+    if (po.r < x0 || po.l > x1 || po.t < y0 || po.b > y1) continue;
+    hits.push_back(po.index);
+  }
+  if (!add || g.sel.page != pi)
+  {
+    g.sel.objects.clear();
+    g.sel.page = pi;
+  }
+  for (int idx : hits)
+    if (!IsObjSelected(idx)) g.sel.objects.push_back(idx);
+  if (g.sel.objects.empty())
+  {
+    g.sel.active = false;
+  }
+  else
+  {
+    g.sel.index = g.sel.objects.back();
+    g.sel.active = true;
+    RefreshSelBounds();
+  }
+  g.selected = pi;
+  ClearCanvasCache();
+  if (g.canvas) InvalidateRect(g.canvas, nullptr, TRUE);
+  if (g.thumbs) InvalidateRect(g.thumbs, nullptr, FALSE);
   if (g.status) InvalidateRect(g.status, nullptr, TRUE);
   UpdateFontControls();
   SyncColorControls();
@@ -9601,6 +9705,21 @@ static void CanvasPaint(HDC dc, int cw, int ch)
     SelectObject(dc, oldPen);
     DeleteObject(pen);
   }
+  // Rubber-band selection box (Select tool on empty space).
+  if (g.marquee)
+  {
+    RECT br{std::min(g.marqueeStart.x, g.annCur.x),
+            std::min(g.marqueeStart.y, g.annCur.y),
+            std::max(g.marqueeStart.x, g.annCur.x),
+            std::max(g.marqueeStart.y, g.annCur.y)};
+    HPEN pen = CreatePen(PS_DOT, 1, th.accent);
+    HGDIOBJ oldPen = SelectObject(dc, pen);
+    HGDIOBJ oldBr = SelectObject(dc, GetStockObject(NULL_BRUSH));
+    Rectangle(dc, br.left, br.top, br.right, br.bottom);
+    SelectObject(dc, oldBr);
+    SelectObject(dc, oldPen);
+    DeleteObject(pen);
+  }
 }
 
 struct HitInfo
@@ -9750,7 +9869,11 @@ static LRESULT CALLBACK CanvasProc(HWND hw, UINT msg, WPARAM wp, LPARAM lp)
         case SB_TOP:  pos = si.nMin; break;
         case SB_BOTTOM: pos = si.nMax; break;
       }
-      pos = std::max(si.nMin, std::min((int)si.nMax, pos));
+      // Clamp to the true scrollable range (max - page), not the raw range, so
+      // the view can never be pushed past the content into empty space.
+      const int lastPos = std::max((int)si.nMin,
+                                   (int)si.nMax - (int)si.nPage + 1);
+      pos = std::max(si.nMin, std::min(lastPos, pos));
       si.nPos = pos;
       si.fMask = SIF_POS;
       SetScrollInfo(hw, bar, &si, TRUE);
@@ -9969,8 +10092,15 @@ static LRESULT CALLBACK CanvasProc(HWND hw, UINT msg, WPARAM wp, LPARAM lp)
           }
           else
           {
+            // Pressed on empty space: begin a rubber-band selection. Ctrl means
+            // "add to the current set"; a plain drag starts fresh.
             if (!ctrl) ClearObjSel();
             g.selDrag = false;
+            g.marquee = true;
+            g.marqueeAdd = ctrl;
+            g.marqueePage = hi.page;
+            g.marqueeStart = pt;
+            SetCapture(hw);
           }
           g.selected = hi.page;
           ClearCanvasCache();
@@ -10095,6 +10225,12 @@ static LRESULT CALLBACK CanvasProc(HWND hw, UINT msg, WPARAM wp, LPARAM lp)
             return 0;
           }
         }
+      }
+      if (g.marquee && GetCapture() == hw)
+      {
+        g.annCur = POINT{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
+        InvalidateRect(hw, nullptr, FALSE);
+        return 0;
       }
       if (g.annDrag && GetCapture() == hw)
       {
@@ -10248,6 +10384,34 @@ static LRESULT CALLBACK CanvasProc(HWND hw, UINT msg, WPARAM wp, LPARAM lp)
         SetCursor(LoadCursorW(nullptr, IDC_ARROW));
         InvalidateRect(hw, nullptr, TRUE);
         InvalidateRect(g.status, nullptr, TRUE);
+        return 0;
+      }
+      if (g.marquee && GetCapture() == hw)
+      {
+        ReleaseCapture();
+        const bool add = g.marqueeAdd;
+        const int mpage = g.marqueePage;
+        const POINT a = g.marqueeStart;
+        const POINT b = POINT{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
+        g.marquee = false;
+        g.marqueeAdd = false;
+        g.marqueePage = -1;
+        if (add && mpage >= 0) g.sel.page = mpage;
+        HitInfo ha, hb;
+        if (HitPage(a, ha) && HitPage(b, hb) && ha.page == hb.page)
+        {
+          const double s = g.zoom;
+          const float ph = PageH(ha.page);
+          const double x0 = (a.x - ha.x) / s;
+          const double y0 = ph - (a.y - ha.y) / s;
+          const double x1 = (b.x - hb.x) / s;
+          const double y1 = ph - (b.y - hb.y) / s;
+          if (std::abs(b.x - a.x) >= 4 || std::abs(b.y - a.y) >= 4)
+            SelectObjectsInRect(ha.page, x0, y0, x1, y1, add);
+        }
+        InvalidateRect(hw, nullptr, TRUE);
+        UpdateFontControls();
+        SyncColorControls();
         return 0;
       }
       if (!(g.toolSelect && g.selDrag)) break;
@@ -10485,7 +10649,21 @@ static void BtnPaint(HWND hw)
   else
   {
     BOOL active = b->hover || b->down;
-    if (!b->hover && !b->down)
+    if (b->warn && !active)
+    {
+      // Unsaved-changes prompt: a soft red field behind the whole button plus a red
+      // frame, so Save visibly calls out without a modal dialog.
+      HBRUSH fill = CreateSolidBrush(b->swColor);
+      HPEN pen = CreatePen(PS_SOLID, 2, RGB(200, 40, 40));
+      HBRUSH wasb = (HBRUSH)SelectObject(dc, fill);
+      HPEN wasp = (HPEN)SelectObject(dc, pen);
+      RoundRect(dc, rc.left, rc.top, rc.right, rc.bottom, R, R);
+      SelectObject(dc, wasb);
+      SelectObject(dc, wasp);
+      DeleteObject(fill);
+      DeleteObject(pen);
+    }
+    else if (!b->hover && !b->down)
     {
       HBRUSH bg = CreateSolidBrush(th.card);
       FillRect(dc, &rc, bg);
@@ -10504,8 +10682,10 @@ static void BtnPaint(HWND hw)
       DeleteObject(pen);
     }
     SetBkMode(dc, TRANSPARENT);
-    const COLORREF fg = b->down ? th.accent : th.text;
-    const COLORREF back = active ? (b->down ? th.btnDown : th.btnHover) : th.card;
+    COLORREF fg = b->down ? th.accent : th.text;
+    if (b->warn && !active) fg = RGB(170, 20, 20);
+    const COLORREF back = active ? (b->down ? th.btnDown : th.btnHover)
+                                 : (b->warn ? b->swColor : th.card);
     HFONT wf = (HFONT)SelectObject(dc, g.font);
     if (b->swatch)
     {
@@ -10906,8 +11086,9 @@ static void SwitchRibbonTab(int tab)
 // ---------------------------------------------------------------------------
 // Main frame / keyboard / commands
 // ---------------------------------------------------------------------------
-static void ZoomTo(double z, bool)
+static void ZoomTo(double z, bool fit)
 {
+  g.fitWidth = fit;
   g.zoom = std::max(0.1, std::min(8.0, z));
   ClearCanvasCache();
   UpdateScrollbars();
@@ -11990,6 +12171,16 @@ static void ToggleSidebar()
   RECT cr{};
   GetClientRect(g.frame, &cr);
   RelayoutPanes(cr.right - cr.left, cr.bottom - cr.top);
+  // The canvas just changed width: keep the page filling the new width instead of
+  // leaving it clipped, and keep the vertical position where it was.
+  if (g.doc && g.fitWidth)
+  {
+    const int top = g.scrollY;
+    FitWidth();
+    g.scrollY = top;
+    UpdateScrollbars();
+    InvalidateRect(g.canvas, nullptr, TRUE);
+  }
 }
 
 static void ToggleSpread()
@@ -12896,6 +13087,16 @@ static LRESULT CALLBACK FrameProc(HWND hw, UINT msg, WPARAM wp, LPARAM lp)
     {
       int w = LOWORD(lp), h = HIWORD(lp);
       if (g.toolbar) RelayoutPanes(w, h);
+      // Keep a Fit Page / Fit Width view filling the canvas as the window resizes
+      // instead of leaving the page letterboxed or clipped.
+      if (g.doc && g.fitWidth && g.canvas && !IsIconic(g.frame))
+      {
+        const int top = g.scrollY;
+        FitWidth();
+        g.scrollY = top;
+        UpdateScrollbars();
+        InvalidateRect(g.canvas, nullptr, TRUE);
+      }
       LayoutCaption(g.frame);
       InvalidateCaption();
       return 0;
@@ -13870,9 +14071,10 @@ static bool SwapDocumentTo(const UndoEntry& from, std::vector<UndoEntry>& toOthe
   // The swap rebuilds the document (like ReorderPagesTo), so outgoing handles
   // die with CloseDoc() below and any live edit/annot state must be dropped
   // first - the same bookkeeping a page reorder has to do.
-  if (g.annDrag || g.selDrag) ReleaseCapture();
+  if (g.annDrag || g.selDrag || g.marquee) ReleaseCapture();
   g.annTool = 0;
   g.annDrag = false;
+  g.marquee = false;
   g.annPage = -1;
   g.sel.active = false;
   g.selDrag = false;
@@ -14081,9 +14283,10 @@ static void CombineNew()
     return;
   }
 
-  if (g.annDrag || g.selDrag) ReleaseCapture();
+  if (g.annDrag || g.selDrag || g.marquee) ReleaseCapture();
   g.annTool = 0;
   g.annDrag = false;
+  g.marquee = false;
   g.annPage = -1;
   g.sel.active = false;
   g.selDrag = false;
